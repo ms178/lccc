@@ -4140,9 +4140,16 @@ pub(crate) fn run_passes(
             && !pass_disabled(&disabled, "carry")
             && !pass_disabled(&disabled, "limb_unroll")
         {
+            // Ahead of it, the borrows that a double-word difference is
+            // read for become the joins the matcher knows
+            // (`carry_chain::borrow_reads`): the loop is then one the split
+            // recognises, and its copies are ones the rounds that follow
+            // leave alone.
             let n = timed_pass!(
                 "limb_unroll",
-                run_on_visited(module, &dirty, &mut changed, limb_unroll::run)
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    carry_chain::borrow_reads(func, !dis.dce) + limb_unroll::run(func)
+                })
             );
             cur_pass_changes[10] += n;
             total_changes += n;

@@ -58,6 +58,10 @@
 //! is the profit test. Any counted loop could be split this way, and for
 //! most it buys only the loop overhead; here it shortens the recurrence.
 //! A loop with two adders a trip is left alone (somebody unrolled it).
+//! (The borrow that a source reads out of the high half of a double-word
+//! difference is made the join that matcher knows just ahead of this pass,
+//! by `carry_chain::borrow_reads`: the loop is one to split, and its
+//! copies are ones the rounds that follow leave as they are.)
 //!
 //! And nothing but the limb in a trip ([`only_a_limb`]): the loads, the
 //! stores, the addresses they go through, and the steps of the counter and
@@ -875,7 +879,10 @@ fn only_a_limb(
             | Instruction::Copy { .. } => true,
             // An extension or a truncation is a move.
             Instruction::Cast { from_ty, to_ty, .. } => whole(*from_ty) && whole(*to_ty),
-            Instruction::Cmp { dest, .. } => own_test == Some(*dest),
+            // The loop's own test; and the carry out asked whether it is
+            // one (`c = (c1 | c2) != 0`), for which the carry pass reads
+            // the carry out: no comparison is left of it.
+            Instruction::Cmp { dest, .. } => own_test == Some(*dest) || adder.asked.contains(dest),
             Instruction::BinOp {
                 dest, op, lhs, rhs, ..
             } => {

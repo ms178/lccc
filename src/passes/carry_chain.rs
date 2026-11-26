@@ -25,6 +25,14 @@
 //! carries joined by `+`, `^` or `||` instead of `|` (`cy = s < a; ...;
 //! cy += t < s`, and what `(unsigned __int128)a + b + c` is split into).
 //!
+//! One spelling has no join to be found by: the double word. `(unsigned
+//! __int128)x - y - c` arrives split into words, its high word the mask
+//! `-(x <u y) - ((x - y) <u c)`, and the source reads the borrow out of
+//! that: `(t >> 64) & 1` (blst), `0 - (int1)(t >> 64)` (fiat-crypto),
+//! `t >> 127`, `(t >> 64) != 0`, a signed `t < 0`. [`borrow_reads`] makes
+//! each such read the join of the two comparisons that it is, and the
+//! matcher takes it from there.
+//!
 //! The pass rewrites the five instructions into the two halves of
 //! [`IntrinsicOp::Carry`], adjacent and on the same operands:
 //!
@@ -84,7 +92,10 @@
 //!   memory, so where in the block it is computed changes nothing else.
 //! * A carry out is 0 or 1 in a whole register, as a comparison's result
 //!   is, and takes the place of the `|` wherever that is read at 32 bits or
-//!   fewer; a 64-bit `|` becomes a conversion of it.
+//!   fewer; a 64-bit `|` becomes a conversion of it. A conversion that
+//!   extended the sign of the `|` extends none: it is 0 or 1.
+//! * The words of an addition go to the adder in the order they are made
+//!   in ([`words_in_order`]): an addition takes them in either.
 //! * Nothing with an effect is removed or duplicated: the old comparisons,
 //!   the `|` and the first addition are left for dead-code elimination, and
 //!   survive where something else reads them.
@@ -96,7 +107,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::intrinsics::CarryOp;
 use crate::ir::reexports::{
-    Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Value,
+    Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction, IrUnaryOp, Operand, Value,
 };
 
 /// Block and instruction index.
@@ -524,15 +535,50 @@ impl Shape {
             .enumerate()
             .find_map(|(at, operand)| Some((at, carry_of(func, facts, operand)?)))?;
         let (x, y, w) = (self.x.clone(), self.y.clone(), self.w.clone());
-        Some(match (self.op.borrow, at) {
+        let args = match (self.op.borrow, at) {
             // `w` is the carry.
             (_, 0) => [x, y, c],
             // The subtraction's `y`, or the addition's `x`.
             (true, _) => [x, w, c],
             (false, 1) => [y, w, c],
             (false, _) => [x, w, c],
+        };
+        Some(if self.op.borrow {
+            args
+        } else {
+            words_in_order(facts, args)
         })
     }
+}
+
+/// The two words of an addition in the order they are made in, a constant
+/// behind a value.
+///
+/// The backend loads the first word into its accumulator and reads the
+/// second where it is. The word made last -- a load right in front of the
+/// adder -- is read by the `adc` itself, and the one made first is loaded
+/// once. The other way round the earlier word waits in a register of its
+/// own while the later one is loaded: `a[i] + (b[i] + carry)` (blst) and
+/// `s = y + x` took a register and an instruction a limb more than `a[i] +
+/// b[i] + carry` (a loop of 54 instructions, and 43). A constant first is
+/// loaded where it could be an immediate.
+///
+/// Nothing but the order, and only of an addition, which takes its words
+/// in either; within one block, where one of two is the earlier.
+fn words_in_order(facts: &Facts, mut args: [Operand; 3]) -> [Operand; 3] {
+    let at = |v: &Value| facts.defs.get(v.0 as usize).copied().flatten();
+    let swap = match (&args[0], &args[1]) {
+        (Operand::Const(_), Operand::Value(_)) => true,
+        (Operand::Value(first), Operand::Value(second)) => match (at(first), at(second)) {
+            (Some(first), Some(second)) => first.0 == second.0 && first.1 > second.1,
+            _ => false,
+        },
+        _ => false,
+    };
+    if swap {
+        args.swap(0, 1);
+    }
+    args
 }
 
 /// `c1 = s1 <u x|y` with `s1 = x + y`; `c2 = s2 <u s1|w` with `s2 = s1 + w`.
@@ -810,6 +856,34 @@ pub(crate) struct LoopAdder {
     pub(crate) out: Value,
     /// The two words that are added.
     pub(crate) words: [Operand; 2],
+    /// The comparisons of the loop that ask the carry out whether it is
+    /// one (`out != 0`, of the join or of a conversion of it: a `_Bool`
+    /// carry, the borrow of a signed double word). The carry pass reads
+    /// the carry out for each of them ([`carry_passed_on`]), so none is a
+    /// comparison once the adder is one.
+    pub(crate) asked: Vec<Value>,
+}
+
+/// A conversion of a value between integers, or the value asked `!= 0`:
+/// `(the result, the value, whether it is the comparison)`. Of a carry out
+/// both are the carry out again, which is how [`full_adders`] reads them.
+fn carry_passed_on(inst: &Instruction) -> Option<(Value, Value, bool)> {
+    match inst {
+        Instruction::Cast {
+            dest,
+            src: Operand::Value(src),
+            from_ty,
+            to_ty,
+        } if is_integer(*from_ty) && is_integer(*to_ty) => Some((*dest, *src, false)),
+        Instruction::Cmp {
+            dest,
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(src),
+            rhs,
+            ..
+        } if const_bit(rhs) == Some(false) => Some((*dest, *src, true)),
+        _ => None,
+    }
 }
 
 impl Carried {
@@ -850,10 +924,31 @@ impl Carried {
         let received = carry_of(func, facts, back)?;
         let passed_on = matches!(received, Operand::Value(v) if v == adder.join_dest);
         let taken = matches!(adder.args[2], Operand::Value(v) if v == phi);
-        (passed_on && taken).then(|| LoopAdder {
+        if !(passed_on && taken) {
+            return None;
+        }
+        // The carry out again, in the order of the loop: the join, what is
+        // made of it by a conversion or by `!= 0`, and of those in turn.
+        let mut outs: FxHashSet<u32> = FxHashSet::default();
+        outs.insert(adder.join_dest.0);
+        let mut asked = Vec::new();
+        for &bi in blocks {
+            for inst in &func.blocks[bi].instructions {
+                if let Some((dest, src, compares)) = carry_passed_on(inst)
+                    && outs.contains(&src.0)
+                {
+                    outs.insert(dest.0);
+                    if compares {
+                        asked.push(dest);
+                    }
+                }
+            }
+        }
+        Some(LoopAdder {
             word: adder.word,
             out: adder.join_dest,
             words: [adder.args[0].clone(), adder.args[1].clone()],
+            asked,
         })
     }
 }
@@ -1016,37 +1111,40 @@ fn full_adders(func: &mut IrFunction) -> usize {
     // A conversion of a join to 32 bits or fewer is the carry out
     // (`unsigned char c = _addcarry_u64(...)`), and so is its `!= 0`
     // (`bool c = ...`); a wider conversion is one for the next link to
-    // look through.
-    for block in &func.blocks {
-        for inst in &block.instructions {
+    // look through. Where that one extends the sign (`int c = ...; limb +=
+    // c`), it extends a 0 or a 1, and is made the zero extension, which
+    // is a register move the peephole knows for a copy of the carry
+    // (`movl`, where the sign costs a `movslq`).
+    let mut widened: Vec<Position> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Some((dest, src, compares)) = carry_passed_on(inst) else {
+                continue;
+            };
+            let Some(&out) = carry.get(&src.0) else {
+                continue;
+            };
+            carry.insert(dest.0, out);
             match inst {
-                Instruction::Cast {
-                    dest,
-                    src: Operand::Value(src),
-                    from_ty,
-                    to_ty,
-                } if is_integer(*from_ty) && is_integer(*to_ty) => {
-                    if let Some(&out) = carry.get(&src.0) {
-                        carry.insert(dest.0, out);
-                        if narrow(*to_ty) {
-                            renamed.insert(dest.0, out);
-                        }
-                    }
+                _ if compares => {
+                    renamed.insert(dest.0, out);
                 }
-                Instruction::Cmp {
-                    dest,
-                    op: IrCmpOp::Ne,
-                    lhs: Operand::Value(src),
-                    rhs,
-                    ..
-                } if const_bit(rhs) == Some(false) => {
-                    if let Some(&out) = carry.get(&src.0) {
-                        carry.insert(dest.0, out);
-                        renamed.insert(dest.0, out);
-                    }
+                Instruction::Cast { to_ty, .. } if narrow(*to_ty) => {
+                    renamed.insert(dest.0, out);
+                }
+                Instruction::Cast { from_ty, to_ty, .. }
+                    if from_ty.is_signed() && to_ty.size() > from_ty.size() =>
+                {
+                    widened.push((bi, ii));
                 }
                 _ => {}
             }
+        }
+    }
+
+    for (bi, ii) in widened {
+        if let Instruction::Cast { from_ty, .. } = &mut func.blocks[bi].instructions[ii] {
+            *from_ty = from_ty.to_unsigned();
         }
     }
 
@@ -1120,7 +1218,8 @@ fn chain_heads(func: &mut IrFunction) -> usize {
             && word_op(ty, false) == Some(op)
             && let Some(at) = facts.defs[s.0 as usize]
         {
-            Some((at, s, op, [x, y, Operand::Const(IrConst::I8(0))]))
+            let args = words_in_order(&facts, [x, y, Operand::Const(IrConst::I8(0))]);
+            Some((at, s, op, args))
         } else if let Some(op) = word_op(ty, true) {
             func.blocks[bi].instructions[..cmp_index]
                 .iter()
@@ -1213,7 +1312,11 @@ fn chain_tails(func: &mut IrFunction) -> usize {
                     return None;
                 }
                 let c = carry_out(func, &mut facts, carry_in)?;
-                Some([x, y, c])
+                Some(if borrow {
+                    [x, y, c]
+                } else {
+                    words_in_order(&facts, [x, y, c])
+                })
             });
             if let Some(args) = found {
                 tails.push((
@@ -1235,6 +1338,355 @@ fn chain_tails(func: &mut IrFunction) -> usize {
     count
 }
 
+/// What a value is minus of, modulo its width.
+///
+/// A double-word difference of single words, `(unsigned __int128)x - y -
+/// c`, has the low word `(x - y) - c` and, once it is split into words
+/// (`passes::i128_split`: `hi = (a.hi - borrow) - b.hi`), the high word
+///
+/// ```text
+///     h = -z1 - z2          z1 = x <u y,  z2 = (x - y) <u c
+/// ```
+///
+/// which is 0, or all ones where the difference borrowed. One subtraction
+/// alone, `(unsigned __int128)x - y`, leaves `h = -z1`.
+enum Minus<'a> {
+    /// `-z` at this type.
+    One(&'a Operand, IrType),
+    /// `-z1 - z2` at this type.
+    Two(&'a Operand, &'a Operand, IrType),
+}
+
+/// What `value`, read at `read_at`, is minus of, behind the conversions
+/// that keep it so: a truncation (`-k` modulo a smaller width is `-k`
+/// modulo that width) and a sign extension (0, -1 and -2 are themselves in
+/// every signed type). A zero extension does not: `(unsigned char)-1` is
+/// 255.
+///
+/// Every step is read at the width it was made at: what a value holds
+/// above its own width is nobody's to say, and one read narrower without a
+/// conversion is no IR this pass was written against.
+fn minus_of<'a>(
+    func: &'a IrFunction,
+    facts: &Facts,
+    mut value: Value,
+    mut read_at: IrType,
+) -> Option<Minus<'a>> {
+    for _ in 0..6 {
+        match facts.def(func, value)? {
+            Instruction::Cast {
+                src: Operand::Value(src),
+                from_ty,
+                to_ty,
+                ..
+            } if is_integer(*from_ty)
+                && is_integer(*to_ty)
+                && read_at.size() == to_ty.size()
+                && (to_ty.size() <= from_ty.size() || from_ty.is_signed()) =>
+            {
+                value = *src;
+                read_at = *from_ty;
+            }
+            Instruction::UnaryOp {
+                op: IrUnaryOp::Neg,
+                src,
+                ty,
+                ..
+            } if is_integer(*ty) && read_at.size() == ty.size() => {
+                return Some(Minus::One(src, *ty));
+            }
+            Instruction::BinOp {
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(minus),
+                rhs: second,
+                ty,
+                ..
+            } if is_integer(*ty) && read_at.size() == ty.size() => {
+                return match facts.def(func, *minus)? {
+                    Instruction::UnaryOp {
+                        op: IrUnaryOp::Neg,
+                        src: first,
+                        ty: minus_ty,
+                        ..
+                    } if minus_ty == ty => Some(Minus::Two(first, second, *ty)),
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// How the bits `z1` and `z2` are joined by a read of `h = -z1 - z2`, which
+/// is `-k` modulo its width with `k` 0, 1 or 2:
+///
+/// ```text
+///     h & 1            k is odd             z1 ^ z2      blst
+///     -h               k                    z1 + z2      fiat-crypto
+///     h >> (bits - 1)  the top bit of -k    z1 | z2      `t >> 127`
+///     h != 0           k != 0               z1 | z2
+///     h <s 0           the sign of -k       z1 | z2      a signed `t < 0`
+/// ```
+///
+/// `(the join, the value read, the type it is read at, whether the read is
+/// a comparison)`. Of `h = -z` every one of them is `z`.
+fn borrow_read(inst: &Instruction) -> Option<(IrBinOp, Value, IrType, bool)> {
+    match inst {
+        Instruction::BinOp {
+            op: IrBinOp::And,
+            lhs,
+            rhs,
+            ty,
+            ..
+        } if is_integer(*ty) => match (lhs, rhs) {
+            (Operand::Value(read), one) | (one, Operand::Value(read))
+                if const_bit(one) == Some(true) =>
+            {
+                Some((IrBinOp::Xor, *read, *ty, false))
+            }
+            _ => None,
+        },
+        Instruction::UnaryOp {
+            op: IrUnaryOp::Neg,
+            src: Operand::Value(read),
+            ty,
+            ..
+        } if is_integer(*ty) => Some((IrBinOp::Add, *read, *ty, false)),
+        Instruction::BinOp {
+            op: IrBinOp::LShr,
+            lhs: Operand::Value(read),
+            rhs,
+            ty,
+            ..
+        } if top_bit_down(*ty, rhs) => Some((IrBinOp::Or, *read, *ty, false)),
+        Instruction::Cmp {
+            op,
+            lhs: Operand::Value(read),
+            rhs,
+            ty,
+            ..
+        } if is_integer(*ty)
+            && const_bit(rhs) == Some(false)
+            && (*op == IrCmpOp::Ne || (*op == IrCmpOp::Slt && ty.is_signed())) =>
+        {
+            Some((IrBinOp::Or, *read, *ty, true))
+        }
+        _ => None,
+    }
+}
+
+/// What a read of a mask is made: the bit, or the join of two.
+enum ReadBack {
+    /// `z`, which the mask's negation read at `from`.
+    Bit { z: Operand, from: IrType },
+    /// `first op second` at `ty`.
+    Join {
+        op: IrBinOp,
+        first: Operand,
+        second: Operand,
+        ty: IrType,
+    },
+}
+
+/// Borrows read out of the high word of a double-word difference become
+/// the joins of the two comparisons they are ([`borrow_read`]), and a bit
+/// that was negated and read back the bit. Returns how many there were.
+///
+/// `(unsigned __int128)a[i] - b[i] - borrow` with `borrow = (t >> 64) & 1`
+/// (blst), and fiat-crypto's `subborrowx` (`x2 = (int1)(x1 >> 64)`, `out2
+/// = 0 - x2`), reach the optimizer as arithmetic on the mask `-z1 - z2`.
+/// Read back as a bit that is `z1 ^ z2`, `z1 + z2` or `z1 | z2`, for any
+/// two bits and whether or not they are the borrows of an adder: the
+/// rewrite is an identity on bits, [`full_adders`] then finds the join of
+/// two partial borrows it knows, and the mask is left for dead-code
+/// elimination. Where no adder comes of it the join is still what the read
+/// computed in fewer instructions.
+///
+/// Runs ahead of [`full_adders`], and ahead of `passes::limb_unroll`: four
+/// copies of `d - (-h)` in one block are folded into `d + h` by the
+/// simplifier, which the copies of `d - (z1 + z2)` are not.
+///
+/// # Soundness
+///
+/// * `z1` and `z2` (or `z`) are proven 0 or 1 ([`booleans`]), so that the
+///   mask is `-k` with `k` at most 2, and stays so through the conversions
+///   [`minus_of`] passes; the table at [`borrow_read`] is then arithmetic,
+///   and the unit tests evaluate every row of it for every pair of bits
+///   and every such conversion.
+/// * The new instructions read the bits, which the mask read: they
+///   dominate the mask, and the mask the read that is replaced. The read
+///   keeps its name, its place and its type; a join made at another width
+///   than the read's is converted to it, zero-extended (it is 0, 1 or 2).
+/// * Nothing is removed: the mask and what it was made of die if nothing
+///   else reads them.
+pub(crate) fn borrow_reads(func: &mut IrFunction, dce: bool) -> usize {
+    if func.is_declaration {
+        return 0;
+    }
+    // Every mask is a negation: a function without one has nothing to read.
+    let negates = func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::UnaryOp {
+                    op: IrUnaryOp::Neg,
+                    ty,
+                    ..
+                } if is_integer(*ty)
+            )
+        })
+    });
+    if !negates {
+        return 0;
+    }
+    let mut facts = Facts::of(func);
+    let mut made: Vec<(Position, bool, ReadBack)> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let found = if let Some((op, read, read_at, compares)) = borrow_read(inst) {
+                minus_of(func, &facts, read, read_at).map(|minus| (op, compares, minus))
+            } else if let Instruction::Cmp {
+                op: IrCmpOp::Ne,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } = inst
+            {
+                // `-z1 != z2`: what `-z1 - z2 != 0` is simplified to.
+                [(lhs, rhs), (rhs, lhs)]
+                    .into_iter()
+                    .find_map(|(minus, second)| {
+                        let Operand::Value(minus) = minus else {
+                            return None;
+                        };
+                        match facts.def(func, *minus)? {
+                            Instruction::UnaryOp {
+                                op: IrUnaryOp::Neg,
+                                src: first,
+                                ty: minus_ty,
+                                ..
+                            } if minus_ty == ty && is_integer(*ty) => {
+                                Some((IrBinOp::Or, true, Minus::Two(first, second, *ty)))
+                            }
+                            _ => None,
+                        }
+                    })
+            } else {
+                None
+            };
+            let Some((op, compares, minus)) = found else {
+                continue;
+            };
+            // Values that are bits. (A constant here is one the simplifier
+            // folds: `-1`, `-z - 0`.)
+            let mut is_bit = |operand: &Operand| match operand {
+                Operand::Const(_) => false,
+                Operand::Value(v) => facts.is_bool(func, *v),
+            };
+            let read_back = match minus {
+                Minus::One(z, from) if is_bit(z) => ReadBack::Bit { z: z.clone(), from },
+                Minus::Two(first, second, ty) if is_bit(first) && is_bit(second) => {
+                    ReadBack::Join {
+                        op,
+                        first: first.clone(),
+                        second: second.clone(),
+                        ty,
+                    }
+                }
+                _ => continue,
+            };
+            made.push(((bi, ii), compares, read_back));
+        }
+    }
+    if made.is_empty() {
+        return 0;
+    }
+    let count = made.len();
+    let mut next = func.sound_next_value_id();
+    // From the back of each block, so that an insertion moves nothing that
+    // is still to be placed.
+    made.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for ((bi, ii), compares, read_back) in made {
+        let block = &mut func.blocks[bi];
+        let span = block.span_at(ii);
+        let Some(dest) = block.instructions[ii].dest() else {
+            continue;
+        };
+        // The type the read has its result in.
+        let read_ty = match &block.instructions[ii] {
+            Instruction::BinOp { ty, .. } | Instruction::UnaryOp { ty, .. } => *ty,
+            _ => IrType::U8,
+        };
+        let nonzero = |value: Operand, ty: IrType| Instruction::Cmp {
+            dest,
+            op: IrCmpOp::Ne,
+            lhs: value,
+            rhs: Operand::Const(IrConst::zero(ty)),
+            ty,
+        };
+        // Read at the type the mask read it, and made the read's type:
+        // zero-extended or truncated, it is 0, 1 or 2 either way. (Always a
+        // conversion, so that the read keeps its type as well as its name.)
+        let converted = |value: Operand, from: IrType| Instruction::Cast {
+            dest,
+            src: value,
+            from_ty: from.to_unsigned(),
+            to_ty: read_ty,
+        };
+        match read_back {
+            ReadBack::Bit { z, from } => {
+                block.instructions[ii] = if compares {
+                    nonzero(z, from)
+                } else {
+                    converted(z, from)
+                };
+            }
+            ReadBack::Join {
+                op,
+                first,
+                second,
+                ty,
+            } => {
+                if !compares && read_ty.size() == ty.size() {
+                    block.instructions[ii] = Instruction::BinOp {
+                        dest,
+                        op,
+                        lhs: first,
+                        rhs: second,
+                        ty: read_ty,
+                    };
+                    continue;
+                }
+                let join = Value(next);
+                next += 1;
+                block.instructions[ii] = if compares {
+                    nonzero(Operand::Value(join), ty)
+                } else {
+                    converted(Operand::Value(join), ty)
+                };
+                block.insert_inst(
+                    ii,
+                    Instruction::BinOp {
+                        dest: join,
+                        op,
+                        lhs: first,
+                        rhs: second,
+                        ty,
+                    },
+                    span,
+                );
+            }
+        }
+    }
+    func.next_value_id = next;
+    if dce {
+        crate::passes::dce::eliminate_dead_code(func);
+    }
+    count
+}
+
 /// Rewrite the adders of `func`; `dce` says whether dead code may be
 /// removed (the ends of a chain are found among what is left alive).
 /// Returns the number of rewrites.
@@ -1242,9 +1694,10 @@ pub(crate) fn run(func: &mut IrFunction, dce: bool) -> usize {
     if func.is_declaration {
         return 0;
     }
+    let read_back = borrow_reads(func, dce);
     let full = full_adders(func);
     if full == 0 {
-        return 0;
+        return read_back;
     }
     let sweep = |func: &mut IrFunction| {
         if dce {
@@ -1260,7 +1713,7 @@ pub(crate) fn run(func: &mut IrFunction, dce: bool) -> usize {
     if heads != 0 {
         sweep(func);
     }
-    full + tails + heads
+    read_back + full + tails + heads
 }
 
 #[cfg(test)]
@@ -1584,6 +2037,120 @@ mod tests {
                     .any(|inst| matches!(inst, Instruction::BinOp { op: o, .. } if *o == op)),
                 "no plain operation is left: {func:#?}"
             );
+        }
+    }
+
+    /// The words of an addition go to the adder in the order they are made
+    /// in, whichever way the source added them: the full adder's, the
+    /// head's and the tail's. A constant stands behind a value. The words
+    /// of a subtraction stay where they are.
+    #[test]
+    fn the_words_of_an_addition_are_taken_in_the_order_they_are_made() {
+        // `(y + x) + c`, the later word first: x, y at 0 and 1; a head
+        // `y + x` at 10 with its carry at 11; a tail `(y + x) + c` at 44.
+        let written = |op: IrBinOp, first: Operand, second: Operand| {
+            let borrow = op == IrBinOp::Sub;
+            let mut insts = vec![
+                param(0, 0, U64),
+                param(1, 1, U64),
+                param(2, 2, U64),
+                param(3, 3, U64),
+                // The head.
+                bin(10, op, first.clone(), second.clone(), U64),
+                if borrow {
+                    cmp(11, IrCmpOp::Ult, first.clone(), second.clone(), U64)
+                } else {
+                    cmp(11, IrCmpOp::Ult, v(10), second.clone(), U64)
+                },
+                cast(12, 11, IrType::U8, U64),
+                // The full adder, on the head's carry.
+                bin(20, op, first.clone(), second.clone(), U64),
+                bin(21, op, v(20), v(12), U64),
+                if borrow {
+                    cmp(22, IrCmpOp::Ult, first.clone(), second.clone(), U64)
+                } else {
+                    cmp(22, IrCmpOp::Ult, v(20), second.clone(), U64)
+                },
+                if borrow {
+                    cmp(23, IrCmpOp::Ult, v(20), v(12), U64)
+                } else {
+                    cmp(23, IrCmpOp::Ult, v(21), v(20), U64)
+                },
+                bin(24, IrBinOp::Or, v(22), v(23), IrType::I32),
+                // The tail, on the adder's.
+                cast(40, 24, IrType::I32, U64),
+                bin(42, op, first, second, U64),
+                bin(44, op, v(42), v(40), U64),
+            ];
+            let result = reading(&mut insts, &[(10, U64), (21, U64), (44, U64)]);
+            function(insts, result)
+        };
+        let words = |func: &IrFunction| -> Vec<(Operand, Operand)> {
+            halves(func)
+                .into_iter()
+                .filter(|(_, op, ..)| !op.out)
+                .map(|(_, _, _, args)| (args[0].clone(), args[1].clone()))
+                .collect()
+        };
+        let big = Operand::Const(IrConst::I64(0x1_0000_0000));
+        for (first, second, wanted) in [
+            // Made first, written first: as written.
+            (v(0), v(1), (v(0), v(1))),
+            // Made last, written first: turned round.
+            (v(1), v(0), (v(0), v(1))),
+            (v(3), v(2), (v(2), v(3))),
+            // A constant goes behind the value.
+            (big.clone(), v(1), (v(1), big.clone())),
+            (v(1), big.clone(), (v(1), big.clone())),
+        ] {
+            let mut func = written(IrBinOp::Add, first.clone(), second.clone());
+            assert_eq!(run(&mut func, true), 3, "{first:?} + {second:?}: {func:#?}");
+            assert_eq!(
+                words(&func),
+                vec![wanted.clone(), wanted.clone(), wanted],
+                "{first:?} + {second:?}: {func:#?}"
+            );
+        }
+        // A difference is of its words in the order they are written in.
+        for (first, second) in [(v(0), v(1)), (v(1), v(0)), (v(3), v(2))] {
+            let mut func = written(IrBinOp::Sub, first.clone(), second.clone());
+            assert_eq!(run(&mut func, true), 3, "{first:?} - {second:?}: {func:#?}");
+            let as_written = (first.clone(), second.clone());
+            assert_eq!(
+                words(&func),
+                vec![as_written.clone(), as_written.clone(), as_written],
+                "{first:?} - {second:?}: {func:#?}"
+            );
+        }
+        // Made in two blocks, neither word is the earlier one of a block:
+        // as written, either way.
+        for (first, second) in [(v(1), v(0)), (v(0), v(1))] {
+            let mut func = written(IrBinOp::Add, first.clone(), second.clone());
+            let moved = func.blocks[0].instructions.remove(1);
+            func.blocks.insert(
+                0,
+                BasicBlock {
+                    label: BlockId(7),
+                    instructions: vec![moved],
+                    terminator: Terminator::Branch(BlockId(0)),
+                    source_spans: vec![],
+                    source_inline_ids: Vec::new(),
+                },
+            );
+            assert_eq!(run(&mut func, true), 3, "{func:#?}");
+            let found: Vec<(Operand, Operand)> = func.blocks[1]
+                .instructions
+                .iter()
+                .filter_map(|inst| match inst {
+                    Instruction::Intrinsic {
+                        op: IntrinsicOp::Carry(op),
+                        args,
+                        ..
+                    } if !op.out => Some((args[0].clone(), args[1].clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(found, vec![(first, second); 3], "{func:#?}");
         }
     }
 
@@ -2003,6 +2570,74 @@ mod tests {
         assert_eq!(run(&mut function(insts, result), true), 0);
     }
 
+    /// `join != 0` is the carry out. `join == 0` and `join != 1` are
+    /// comparisons of it, and stay comparisons: the function computes what
+    /// it computed.
+    #[test]
+    fn a_join_asked_anything_but_whether_it_is_one_stays_a_comparison() {
+        let build = || {
+            let mut insts = vec![param(2, 2, IrType::U8)];
+            insts.extend(header_adder(100, v(2), U64));
+            let by = |count: i64| Operand::Const(IrConst::I64(count));
+            insts.extend([
+                cmp(120, IrCmpOp::Ne, v(116), zero(), IrType::I32),
+                cmp(121, IrCmpOp::Eq, v(116), zero(), IrType::I32),
+                cmp(122, IrCmpOp::Ne, v(116), one(), IrType::I32),
+                // Each in a bit of its own, above them the word.
+                cast(130, 120, IrType::I32, U64),
+                cast(131, 121, IrType::I32, U64),
+                cast(132, 122, IrType::I32, U64),
+                bin(123, IrBinOp::Shl, v(131), by(1), U64),
+                bin(124, IrBinOp::Shl, v(132), by(2), U64),
+                bin(125, IrBinOp::Or, v(130), v(123), U64),
+                bin(126, IrBinOp::Or, v(125), v(124), U64),
+                bin(127, IrBinOp::Shl, v(113), by(3), U64),
+                bin(128, IrBinOp::Xor, v(126), v(127), U64),
+            ]);
+            function(insts, v(128))
+        };
+        let (before, mut after) = (build(), build());
+        assert_eq!(run(&mut after, true), 1, "{after:#?}");
+        let out = halves(&after)[1].2;
+        // `!= 0` is gone, and what read it reads the carry out; the other
+        // two are asked of the carry out.
+        let asked: Vec<(IrCmpOp, Operand, Operand)> = after.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|inst| match inst {
+                Instruction::Cmp { op, lhs, rhs, .. } if *lhs == Operand::Value(out) => {
+                    Some((*op, lhs.clone(), rhs.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                (IrCmpOp::Eq, Operand::Value(out), zero()),
+                (IrCmpOp::Ne, Operand::Value(out), one()),
+            ],
+            "{after:#?}"
+        );
+        assert!(
+            matches!(def_of(&after, 130), Instruction::Cast { src, .. } if *src == Operand::Value(out)),
+            "{after:#?}"
+        );
+        for x in [0u64, 1, u64::MAX - 1, u64::MAX] {
+            for y in [0u64, 1, u64::MAX] {
+                for c in [0u64, 1, 2, 0xff] {
+                    // The parameters are 100 (`x`), 101 (`y`) and 2 (`c`).
+                    let was = evaluate(&before, &[x, y, c]);
+                    let is = evaluate(&after, &[x, y, c]);
+                    assert_eq!(was[&128], is[&128], "{x:#x} + {y:#x} + {c}");
+                    let carry =
+                        u128::from(x) + u128::from(y) + u128::from(c != 0) > u128::from(u64::MAX);
+                    assert_eq!(is[&out.0], u64::from(carry));
+                }
+            }
+        }
+    }
+
     /// What must not match.
     #[test]
     fn near_misses_are_left_alone() {
@@ -2312,6 +2947,815 @@ mod tests {
         // one from the second trip on; the first trip adds the word.
         let mut func = counted_loop(v(2), IrBinOp::Or);
         assert_eq!(run(&mut func, true), 0);
+    }
+
+    fn neg(dest: u32, src: u32, ty: IrType) -> Instruction {
+        Instruction::UnaryOp {
+            dest: Value(dest),
+            op: IrUnaryOp::Neg,
+            src: v(src),
+            ty,
+        }
+    }
+
+    fn one() -> Operand {
+        Operand::Const(IrConst::I64(1))
+    }
+
+    /// Block 0 of `func` run on `params`, every value in its own type.
+    fn evaluate(func: &IrFunction, params: &[u64]) -> FxHashMap<u32, u64> {
+        fn fit(value: u64, ty: IrType) -> u64 {
+            match ty.size() {
+                8 => value,
+                bytes => value & ((1u64 << (8 * bytes)) - 1),
+            }
+        }
+        fn signed(value: u64, ty: IrType) -> i64 {
+            let shift = 64 - 8 * ty.size() as u32;
+            ((value << shift) as i64) >> shift
+        }
+        let mut values: FxHashMap<u32, u64> = FxHashMap::default();
+        let read = |values: &FxHashMap<u32, u64>, operand: &Operand, ty: IrType| match operand {
+            Operand::Value(value) => fit(values[&value.0], ty),
+            Operand::Const(c) => fit(c.to_i64().expect("an integer") as u64, ty),
+        };
+        for inst in &func.blocks[0].instructions {
+            let (dest, value) = match inst {
+                Instruction::ParamRef {
+                    dest,
+                    param_idx,
+                    ty,
+                } => (*dest, fit(params[*param_idx], *ty)),
+                Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => {
+                    let (a, b) = (read(&values, lhs, *ty), read(&values, rhs, *ty));
+                    let value = match op {
+                        IrBinOp::Add => a.wrapping_add(b),
+                        IrBinOp::Sub => a.wrapping_sub(b),
+                        IrBinOp::And => a & b,
+                        IrBinOp::Or => a | b,
+                        IrBinOp::Xor => a ^ b,
+                        IrBinOp::LShr => a >> b,
+                        IrBinOp::Shl => a << b,
+                        other => panic!("{other:?}"),
+                    };
+                    (*dest, fit(value, *ty))
+                }
+                Instruction::UnaryOp {
+                    dest,
+                    op: IrUnaryOp::Neg,
+                    src,
+                    ty,
+                } => (*dest, fit(read(&values, src, *ty).wrapping_neg(), *ty)),
+                Instruction::Cmp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => {
+                    let (a, b) = (read(&values, lhs, *ty), read(&values, rhs, *ty));
+                    let holds = match op {
+                        IrCmpOp::Ult => a < b,
+                        IrCmpOp::Ugt => a > b,
+                        IrCmpOp::Ne => a != b,
+                        IrCmpOp::Eq => a == b,
+                        IrCmpOp::Slt => signed(a, *ty) < signed(b, *ty),
+                        other => panic!("{other:?}"),
+                    };
+                    (*dest, u64::from(holds))
+                }
+                Instruction::Cast {
+                    dest,
+                    src,
+                    from_ty,
+                    to_ty,
+                } => {
+                    let value = read(&values, src, *from_ty);
+                    let value = if from_ty.is_signed() {
+                        signed(value, *from_ty) as u64
+                    } else {
+                        value
+                    };
+                    (*dest, fit(value, *to_ty))
+                }
+                Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: IntrinsicOp::Carry(op),
+                    args,
+                    ..
+                } => {
+                    let ty = op.word_type();
+                    let (word, out) = op.evaluate(
+                        read(&values, &args[0], ty),
+                        read(&values, &args[1], ty),
+                        read(&values, &args[2], IrType::U8) != 0,
+                    );
+                    (*dest, if op.out { u64::from(out) } else { word })
+                }
+                other => panic!("{other:?}"),
+            };
+            values.insert(dest.0, value);
+        }
+        values
+    }
+
+    /// The conversions a mask keeps its value through, from 64 bits on:
+    /// truncations, sign extensions, and the same width again.
+    const KEEPING: [&[(IrType, IrType)]; 6] = [
+        &[],
+        // fiat-crypto: `(int1)(x1 >> 64)`, promoted to `int`.
+        &[(IrType::I64, IrType::I8), (IrType::I8, IrType::I32)],
+        &[(IrType::U64, IrType::U32)],
+        &[(IrType::U64, IrType::I32), (IrType::I32, IrType::I64)],
+        &[(IrType::U64, IrType::I64)],
+        &[(IrType::I64, IrType::I16), (IrType::I16, IrType::I64)],
+    ];
+
+    /// And two that do not: the zero extension of a mask is 255, or 2^32-1.
+    const LOSING: [&[(IrType, IrType)]; 2] = [
+        &[(IrType::U64, IrType::U8), (IrType::U8, IrType::I32)],
+        &[(IrType::U64, IrType::U32), (IrType::U32, IrType::U64)],
+    ];
+
+    /// The ways a borrow is read out of a mask of type `ty`: the name, the
+    /// instruction (`%30` of `%29`), the type of its result, and what it is
+    /// of the two bits.
+    #[allow(clippy::type_complexity)]
+    fn reads_of(ty: IrType) -> Vec<(&'static str, Instruction, IrType, fn(u64, u64) -> u64)> {
+        let top = 8 * ty.size() as i32 - 1;
+        let mut reads: Vec<(&'static str, Instruction, IrType, fn(u64, u64) -> u64)> = vec![
+            (
+                "& 1",
+                bin(30, IrBinOp::And, v(29), one(), ty),
+                ty,
+                |a, b| a ^ b,
+            ),
+            (
+                "1 &",
+                bin(30, IrBinOp::And, one(), v(29), ty),
+                ty,
+                |a, b| a ^ b,
+            ),
+            ("-", neg(30, 29, ty), ty, |a, b| a + b),
+            (
+                "!= 0",
+                cmp(30, IrCmpOp::Ne, v(29), zero(), ty),
+                IrType::U8,
+                |a, b| a | b,
+            ),
+        ];
+        if ty.size() >= 4 {
+            reads.push((
+                ">> top",
+                bin(
+                    30,
+                    IrBinOp::LShr,
+                    v(29),
+                    Operand::Const(IrConst::I32(top)),
+                    ty,
+                ),
+                ty,
+                |a, b| a | b,
+            ));
+        }
+        if ty.is_signed() {
+            reads.push((
+                "<s 0",
+                cmp(30, IrCmpOp::Slt, v(29), zero(), ty),
+                IrType::U8,
+                |a, b| a | b,
+            ));
+        }
+        reads
+    }
+
+    /// The low bits of two parameters, `%2` and `%3`; the mask `-%2 - %3`
+    /// (or `-%2` alone) made at `made_at`, and `%29`, which is the mask
+    /// behind `casts` (`None`: the mask itself); `read` of it, which is
+    /// `%30`; and `%40`, the read at 64 bits, which is returned.
+    fn mask_read(
+        made_at: IrType,
+        two: bool,
+        casts: Option<&[(IrType, IrType)]>,
+        read: Instruction,
+        read_ty: IrType,
+    ) -> IrFunction {
+        let mut insts = vec![
+            param(0, 0, U64),
+            param(1, 1, U64),
+            bin(2, IrBinOp::And, v(0), one(), U64),
+            bin(3, IrBinOp::And, v(1), one(), U64),
+        ];
+        // The mask under its own name, or under `%29` where it is read
+        // as it is.
+        let name = if casts.is_some() { 5 } else { 29 };
+        if two {
+            insts.push(neg(4, 2, made_at));
+            insts.push(bin(name, IrBinOp::Sub, v(4), v(3), made_at));
+        } else {
+            insts.push(neg(name, 2, made_at));
+        }
+        if let Some(casts) = casts {
+            let mut last = name;
+            for (i, &(from, to)) in casts.iter().enumerate() {
+                insts.push(cast(10 + i as u32, last, from, to));
+                last = 10 + i as u32;
+            }
+            let mask_ty = casts.last().map_or(made_at, |&(_, to)| to);
+            insts.push(cast(29, last, mask_ty, mask_ty));
+        }
+        insts.push(read);
+        insts.push(cast(40, 30, read_ty, U64));
+        function(insts, v(40))
+    }
+
+    /// The instruction of block 0 that defines `value`.
+    fn def_of(func: &IrFunction, value: u32) -> &Instruction {
+        func.blocks[0]
+            .instructions
+            .iter()
+            .find(|inst| inst.dest() == Some(Value(value)))
+            .expect("a definition")
+    }
+
+    /// Every read of a mask is the join of its bits the table at
+    /// [`borrow_read`] says, for every pair of bits and through every
+    /// conversion [`minus_of`] passes: the function computes the same
+    /// before and after, and what it computes is that join.
+    #[test]
+    fn a_borrow_read_out_of_a_mask_is_the_join_of_its_bits() {
+        // Masks of 64 bits behind every conversion and as they are, and
+        // masks of 8 bits as they are.
+        let cases = KEEPING
+            .iter()
+            .map(|casts| Some(*casts))
+            .chain([None])
+            .flat_map(|casts| [U64, IrType::I64].map(|made_at| (made_at, casts)))
+            .chain([(IrType::U8, None), (IrType::I8, None)]);
+        for (made_at, casts) in cases {
+            let mask_ty = casts
+                .and_then(|casts| casts.last())
+                .map_or(made_at, |&(_, to)| to);
+            for (name, read, read_ty, join) in reads_of(mask_ty) {
+                for two in [true, false] {
+                    let build = || mask_read(made_at, two, casts, read.clone(), read_ty);
+                    let (before, mut after) = (build(), build());
+                    let what = format!(
+                        "{name} of {} made at {made_at:?} behind {casts:?}",
+                        if two { 2 } else { 1 }
+                    );
+                    assert_eq!(borrow_reads(&mut after, true), 1, "{what}: {after:#?}");
+                    assert_eq!(
+                        count(&after, |inst| matches!(inst, Instruction::UnaryOp { .. })),
+                        0,
+                        "{what}: the mask is gone: {after:#?}"
+                    );
+                    // A name the pass made is one the function knows of.
+                    assert_eq!(after.next_value_id, after.sound_next_value_id(), "{what}");
+                    // A comparison is a comparison still, and anything else
+                    // has the type it had. What is converted is zero-extended
+                    // (it is 0, 1 or 2: a `movl` and no `movslq`).
+                    match (&read, def_of(&after, 30)) {
+                        (Instruction::Cmp { .. }, Instruction::Cmp { .. }) => {}
+                        (Instruction::Cmp { .. }, other) => panic!("{what}: {other:?}"),
+                        (_, Instruction::Cast { from_ty, to_ty, .. }) => {
+                            assert!(!from_ty.is_signed(), "{what}: {after:#?}");
+                            assert_eq!(*to_ty, read_ty, "{what}");
+                        }
+                        (_, Instruction::BinOp { ty, .. }) => assert_eq!(*ty, read_ty, "{what}"),
+                        (_, other) => panic!("{what}: {other:?}"),
+                    }
+                    // The bits are joined at the width the mask read them at.
+                    let joins: Vec<IrType> = after.blocks[0]
+                        .instructions
+                        .iter()
+                        .filter_map(|inst| match inst {
+                            Instruction::BinOp { lhs, rhs, ty, .. }
+                                if *lhs == v(2) && *rhs == v(3) =>
+                            {
+                                Some(*ty)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(joins.len(), usize::from(two), "{what}: {after:#?}");
+                    assert!(
+                        joins.iter().all(|ty| ty.size() == made_at.size()),
+                        "{what}: {after:#?}"
+                    );
+                    // A second run finds nothing to do.
+                    assert_eq!(borrow_reads(&mut after, true), 0, "{what}");
+                    for a in 0..4u64 {
+                        for b in 0..4u64 {
+                            let (z1, z2) = (a & 1, if two { b & 1 } else { 0 });
+                            let wanted = join(z1, z2);
+                            assert_eq!(
+                                evaluate(&before, &[a, b])[&40],
+                                wanted,
+                                "{what}, as it was"
+                            );
+                            assert_eq!(
+                                evaluate(&after, &[a, b])[&40],
+                                wanted,
+                                "{what}: {after:#?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Two reads in one block, each with a join of its own in front of it:
+    /// the second is found where the first one's join moved it to.
+    #[test]
+    fn two_borrow_reads_in_a_block_are_each_their_own_join() {
+        let build = || {
+            function(
+                vec![
+                    param(0, 0, U64),
+                    param(1, 1, U64),
+                    bin(2, IrBinOp::And, v(0), one(), U64),
+                    bin(3, IrBinOp::And, v(1), one(), U64),
+                    neg(4, 2, U64),
+                    bin(5, IrBinOp::Sub, v(4), v(3), U64),
+                    cmp(6, IrCmpOp::Ne, v(5), zero(), U64),
+                    cast(7, 6, IrType::U8, U64),
+                    neg(8, 3, U64),
+                    bin(9, IrBinOp::Sub, v(8), v(2), U64),
+                    cast(10, 9, U64, IrType::I32),
+                    neg(11, 10, IrType::I32),
+                    cast(12, 11, IrType::I32, U64),
+                    bin(
+                        13,
+                        IrBinOp::Shl,
+                        v(12),
+                        Operand::Const(IrConst::I64(4)),
+                        U64,
+                    ),
+                    bin(14, IrBinOp::Or, v(13), v(7), U64),
+                ],
+                v(14),
+            )
+        };
+        let (before, mut after) = (build(), build());
+        assert_eq!(borrow_reads(&mut after, true), 2, "{after:#?}");
+        assert_eq!(
+            count(&after, |inst| matches!(inst, Instruction::UnaryOp { .. })),
+            0
+        );
+        assert_eq!(after.next_value_id, after.sound_next_value_id());
+        for a in 0..4u64 {
+            for b in 0..4u64 {
+                let (z1, z2) = (a & 1, b & 1);
+                let wanted = ((z1 + z2) << 4) | (z1 | z2);
+                assert_eq!(evaluate(&before, &[a, b])[&14], wanted);
+                assert_eq!(evaluate(&after, &[a, b])[&14], wanted, "{after:#?}");
+            }
+        }
+    }
+
+    /// `-z1 - z2 != 0` as the simplifier leaves it: `-z1 != z2`, either way
+    /// round.
+    #[test]
+    fn a_mask_compared_with_the_other_bit_is_their_or() {
+        for swapped in [false, true] {
+            let (lhs, rhs) = if swapped { (v(3), v(4)) } else { (v(4), v(3)) };
+            let build = || {
+                function(
+                    vec![
+                        param(0, 0, U64),
+                        param(1, 1, U64),
+                        bin(2, IrBinOp::And, v(0), one(), U64),
+                        bin(3, IrBinOp::And, v(1), one(), U64),
+                        neg(4, 2, U64),
+                        cmp(30, IrCmpOp::Ne, lhs.clone(), rhs.clone(), U64),
+                        cast(40, 30, IrType::U8, U64),
+                    ],
+                    v(40),
+                )
+            };
+            let (before, mut after) = (build(), build());
+            assert_eq!(borrow_reads(&mut after, true), 1, "{after:#?}");
+            assert_eq!(
+                count(&after, |inst| matches!(inst, Instruction::UnaryOp { .. })),
+                0
+            );
+            assert_eq!(
+                count(&after, |inst| matches!(
+                    inst,
+                    Instruction::BinOp {
+                        op: IrBinOp::Or,
+                        ..
+                    }
+                )),
+                1,
+                "{after:#?}"
+            );
+            for a in 0..4u64 {
+                for b in 0..4u64 {
+                    let wanted = (a | b) & 1;
+                    assert_eq!(evaluate(&before, &[a, b])[&40], wanted);
+                    assert_eq!(evaluate(&after, &[a, b])[&40], wanted, "{after:#?}");
+                }
+            }
+        }
+    }
+
+    /// What is not a mask read back, and stays.
+    #[test]
+    fn a_read_that_is_no_borrow_stays() {
+        let stays = |what: &str, func: &mut IrFunction| {
+            assert_eq!(borrow_reads(func, true), 0, "{what}: {func:#?}");
+        };
+        let masked = |read: Instruction| mask_read(U64, true, Some(&[]), read, U64);
+        // Behind a zero extension the mask is 255 or 2^32-1, and its
+        // negation and its top bit are not the bits' any more: for a
+        // borrow, `-(int)(unsigned char)h` is -255.
+        for casts in LOSING {
+            let mask_ty = casts.last().map_or(U64, |&(_, to)| to);
+            for (name, read, read_ty, _) in reads_of(mask_ty) {
+                for two in [true, false] {
+                    stays(
+                        name,
+                        &mut mask_read(U64, two, Some(casts), read.clone(), read_ty),
+                    );
+                }
+            }
+            let negated = mask_read(U64, true, Some(casts), neg(30, 29, mask_ty), mask_ty);
+            assert_ne!(evaluate(&negated, &[1, 0])[&40], 1, "{casts:?}");
+        }
+        // Not a read: two bits of the mask, a bit that is not the top one,
+        // an arithmetic shift, the sign of an unsigned word, `== 0`, a
+        // comparison with 1.
+        let no_reads = [
+            bin(
+                30,
+                IrBinOp::And,
+                v(29),
+                Operand::Const(IrConst::I64(3)),
+                U64,
+            ),
+            bin(
+                30,
+                IrBinOp::LShr,
+                v(29),
+                Operand::Const(IrConst::I32(62)),
+                U64,
+            ),
+            bin(
+                30,
+                IrBinOp::AShr,
+                v(29),
+                Operand::Const(IrConst::I32(63)),
+                U64,
+            ),
+            cmp(30, IrCmpOp::Slt, v(29), zero(), U64),
+            cmp(30, IrCmpOp::Eq, v(29), zero(), U64),
+            cmp(30, IrCmpOp::Ne, v(29), one(), U64),
+            cmp(30, IrCmpOp::Slt, v(29), one(), IrType::I64),
+            bin(30, IrBinOp::Or, v(29), one(), U64),
+        ];
+        for read in no_reads {
+            for (two, casts) in [(true, None), (false, None), (true, Some(&[][..]))] {
+                stays(
+                    "no read",
+                    &mut mask_read(U64, two, casts, read.clone(), U64),
+                );
+            }
+        }
+        // Words, not bits: `-(-x - y)` is `x + y`, which the simplifier
+        // knows, and its low bit is not `x ^ y`'s business here.
+        for (name, read, read_ty, _) in reads_of(U64) {
+            for two in [true, false] {
+                let mut func = mask_read(U64, two, Some(&[]), read.clone(), read_ty);
+                func.blocks[0].instructions[2] =
+                    bin(2, IrBinOp::And, v(0), Operand::Const(IrConst::I64(3)), U64);
+                stays(name, &mut func);
+            }
+        }
+        // The mask subtracted from the bit is their sum, not minus it.
+        let mut func = masked(bin(30, IrBinOp::And, v(29), one(), U64));
+        func.blocks[0].instructions[5] = bin(5, IrBinOp::Sub, v(3), v(4), U64);
+        stays("the mask subtracted", &mut func);
+        let mut func = masked(neg(30, 29, U64));
+        func.blocks[0].instructions[5] = bin(5, IrBinOp::Sub, v(3), v(4), U64);
+        stays("the mask subtracted and negated", &mut func);
+        // The two at different widths: `-z1` at 32 bits is not `-z1` at 64.
+        let mut func = masked(bin(30, IrBinOp::And, v(29), one(), U64));
+        func.blocks[0].instructions[4] = neg(4, 2, IrType::U32);
+        stays("a mask of another width", &mut func);
+        let narrow_mask = || {
+            function(
+                vec![
+                    param(0, 0, U64),
+                    param(1, 1, U64),
+                    bin(2, IrBinOp::And, v(0), one(), U64),
+                    bin(3, IrBinOp::And, v(1), one(), U64),
+                    neg(4, 2, IrType::U32),
+                    cmp(30, IrCmpOp::Ne, v(4), v(3), U64),
+                    cast(40, 30, IrType::U8, U64),
+                ],
+                v(40),
+            )
+        };
+        stays("a mask of another width compared", &mut narrow_mask());
+        // Read at another width than it was made at, with no conversion
+        // between: wider (what is above a mask of 8 bits?) or narrower.
+        // Behind a conversion at its own width as well.
+        for (made_at, read_at) in [(IrType::U8, IrType::I32), (U64, IrType::U32)] {
+            for (name, read, read_ty, _) in reads_of(read_at) {
+                for two in [true, false] {
+                    for casts in [None, Some(&[][..])] {
+                        stays(
+                            name,
+                            &mut mask_read(made_at, two, casts, read.clone(), read_ty),
+                        );
+                    }
+                }
+            }
+        }
+        // A constant where a bit stands is the simplifier's to fold.
+        let mut func = masked(bin(30, IrBinOp::And, v(29), one(), U64));
+        func.blocks[0].instructions[5] = bin(5, IrBinOp::Sub, v(4), one(), U64);
+        stays("a constant subtracted", &mut func);
+        // No negation in the function at all.
+        let mut func = function(
+            vec![param(0, 0, U64), bin(1, IrBinOp::And, v(0), one(), U64)],
+            v(1),
+        );
+        stays("nothing negated", &mut func);
+    }
+
+    /// `(unsigned __int128)x - y - (w & 1)` split into words, with the
+    /// borrow read out of the high word `%17` by `reads` (the last of which
+    /// is the borrow, of type `borrow_ty`): the low word is `%14`, and
+    /// `%40` the borrow at 64 bits. `summed` is blst's `x - (y + c)`.
+    fn double_word_difference(
+        summed: bool,
+        reads: Vec<Instruction>,
+        borrow_ty: IrType,
+    ) -> IrFunction {
+        let borrow = reads.last().and_then(Instruction::dest).expect("a read").0;
+        let mut insts = vec![
+            param(0, 0, U64),
+            param(1, 1, U64),
+            param(2, 2, U64),
+            bin(3, IrBinOp::And, v(2), one(), U64),
+        ];
+        insts.extend(if summed {
+            vec![
+                bin(10, IrBinOp::Add, v(1), v(3), U64),
+                cmp(11, IrCmpOp::Ult, v(10), v(3), U64),
+                cast(12, 11, IrType::U8, U64),
+                bin(14, IrBinOp::Sub, v(0), v(10), U64),
+                cmp(15, IrCmpOp::Ult, v(0), v(10), U64),
+                cast(16, 15, IrType::U8, U64),
+                neg(13, 16, U64),
+                bin(17, IrBinOp::Sub, v(13), v(12), U64),
+            ]
+        } else {
+            vec![
+                bin(10, IrBinOp::Sub, v(0), v(1), U64),
+                cmp(11, IrCmpOp::Ult, v(0), v(1), U64),
+                cast(12, 11, IrType::U8, U64),
+                neg(13, 12, U64),
+                bin(14, IrBinOp::Sub, v(10), v(3), U64),
+                cmp(15, IrCmpOp::Ult, v(10), v(3), U64),
+                cast(16, 15, IrType::U8, U64),
+                bin(17, IrBinOp::Sub, v(13), v(16), U64),
+            ]
+        });
+        insts.extend(reads);
+        insts.push(cast(40, borrow, borrow_ty, U64));
+        insts.push(bin(41, IrBinOp::Xor, v(40), v(14), U64));
+        function(insts, v(41))
+    }
+
+    /// The borrow of a double-word difference, however it is read out of
+    /// the high word, is the borrow out of one `sbb`: blst's `(limbx >> 64)
+    /// & 1`, fiat-crypto's `0 - (int1)(x1 >> 64)`, `t >> 127`, `(t >> 64) !=
+    /// 0`, a signed `t < 0`. The function computes the same word and the
+    /// same borrow as before, and both are those of the 128-bit difference.
+    #[test]
+    fn a_borrow_read_out_of_the_high_word_is_the_borrow_out() {
+        let spellings: Vec<(&str, Vec<Instruction>, IrType)> = vec![
+            ("& 1", vec![bin(30, IrBinOp::And, v(17), one(), U64)], U64),
+            ("-", vec![neg(30, 17, U64)], U64),
+            (
+                "fiat",
+                vec![
+                    cast(18, 17, IrType::I64, IrType::I8),
+                    cast(19, 18, IrType::I8, IrType::I32),
+                    neg(20, 19, IrType::I32),
+                    cast(30, 20, IrType::I32, IrType::U8),
+                ],
+                IrType::U8,
+            ),
+            (
+                ">> 63",
+                vec![bin(
+                    30,
+                    IrBinOp::LShr,
+                    v(17),
+                    Operand::Const(IrConst::I32(63)),
+                    U64,
+                )],
+                U64,
+            ),
+            (
+                "!= 0",
+                vec![cmp(30, IrCmpOp::Ne, v(17), zero(), U64)],
+                IrType::U8,
+            ),
+            (
+                "<s 0",
+                vec![cmp(30, IrCmpOp::Slt, v(17), zero(), IrType::I64)],
+                IrType::U8,
+            ),
+        ];
+        let samples = [0u64, 1, 2, 1 << 63, u64::MAX - 1, u64::MAX];
+        for summed in [false, true] {
+            for (name, reads, borrow_ty) in &spellings {
+                let what = format!("{name}, summed {summed}");
+                let before = double_word_difference(summed, reads.clone(), *borrow_ty);
+                let mut after = double_word_difference(summed, reads.clone(), *borrow_ty);
+                // The read made a join, and the join an adder.
+                assert_eq!(run(&mut after, true), 2, "{what}: {after:#?}");
+                let found = halves(&after);
+                assert_eq!(found.len(), 2, "{what}: {after:#?}");
+                assert!(found[0].1.borrow && !found[0].1.out && found[1].1.out);
+                assert_eq!(found[0].2, Value(14), "{what}: the word keeps its name");
+                assert_eq!(found[0].3, vec![v(0), v(1), v(3)], "{what}");
+                assert_eq!(found[1].0, found[0].0 + 1);
+                assert_eq!(spelling_left(&after), 0, "{what}: {after:#?}");
+                assert_eq!(
+                    count(&after, |inst| matches!(inst, Instruction::UnaryOp { .. })),
+                    0,
+                    "{what}: {after:#?}"
+                );
+                for &x in &samples {
+                    for &y in &samples {
+                        for w in 0..4u64 {
+                            let was = evaluate(&before, &[x, y, w]);
+                            let is = evaluate(&after, &[x, y, w]);
+                            let c = w & 1;
+                            let borrow = u128::from(x) < u128::from(y) + u128::from(c);
+                            let word = x.wrapping_sub(y).wrapping_sub(c);
+                            assert_eq!((was[&14], was[&40]), (word, u64::from(borrow)), "{what}");
+                            assert_eq!((is[&14], is[&40]), (word, u64::from(borrow)), "{what}");
+                            assert_eq!(is[&41], was[&41], "{what}");
+                        }
+                    }
+                }
+            }
+        }
+        // A borrow in that is a word and not a bit: the reads are joins of
+        // two comparisons all the same, and no adder comes of them.
+        let mut func =
+            double_word_difference(false, vec![bin(30, IrBinOp::And, v(17), one(), U64)], U64);
+        func.blocks[0].instructions[3] =
+            bin(3, IrBinOp::And, v(2), Operand::Const(IrConst::I64(3)), U64);
+        let before = function(func.blocks[0].instructions.clone(), v(41));
+        assert_eq!(run(&mut func, true), 1, "{func:#?}");
+        assert!(halves(&func).is_empty(), "{func:#?}");
+        for &x in &samples {
+            for &y in &samples {
+                for w in 0..4u64 {
+                    assert_eq!(
+                        evaluate(&func, &[x, y, w])[&41],
+                        evaluate(&before, &[x, y, w])[&41]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Two links of fiat-crypto's `subborrowx`, inlined: the first has no
+    /// borrow in, and its borrow out is the comparison negated at 8 bits,
+    /// sign-extended and negated again, which is the comparison; the second
+    /// takes that through its `unsigned char`. A `sub` and an `sbb`.
+    #[test]
+    fn a_chain_of_double_word_differences_is_a_borrow_chain() {
+        let (i8, i32, u8) = (IrType::I8, IrType::I32, IrType::U8);
+        let build = || {
+            let mut insts = vec![
+                param(0, 0, U64),
+                param(1, 1, U64),
+                param(2, 2, U64),
+                param(3, 3, U64),
+                // out1 = x0 - y0; out2 = 0 - (int1)(x1 >> 64)
+                bin(10, IrBinOp::Sub, v(0), v(1), U64),
+                cmp(11, IrCmpOp::Ult, v(0), v(1), U64),
+                neg(12, 11, u8),
+                cast(13, 12, u8, i8),
+                cast(14, 13, i8, i32),
+                neg(15, 14, i32),
+                cast(16, 15, i32, u8),
+                // out1 = (x1 - c) - y1, and its borrow the same way.
+                cast(20, 16, u8, U64),
+                bin(21, IrBinOp::Sub, v(2), v(20), U64),
+                cmp(22, IrCmpOp::Ult, v(2), v(20), U64),
+                cast(23, 22, u8, U64),
+                neg(24, 23, U64),
+                bin(25, IrBinOp::Sub, v(21), v(3), U64),
+                cmp(26, IrCmpOp::Ult, v(21), v(3), U64),
+                cast(27, 26, u8, U64),
+                bin(28, IrBinOp::Sub, v(24), v(27), U64),
+                cast(29, 28, IrType::I64, i8),
+                cast(30, 29, i8, i32),
+                neg(31, 30, i32),
+                cast(32, 31, i32, u8),
+            ];
+            let result = reading(&mut insts, &[(10, U64), (25, U64), (32, u8)]);
+            function(insts, result)
+        };
+        let (before, mut after) = (build(), build());
+        // Two reads, the adder, and the head of the chain.
+        assert_eq!(run(&mut after, true), 4, "{after:#?}");
+        let found = halves(&after);
+        assert_eq!(found.len(), 4, "{after:#?}");
+        assert!(found.iter().all(|(_, op, ..)| op.borrow));
+        assert_eq!(found[0].3, vec![v(0), v(1), zero()]);
+        assert_eq!(found[0].2, Value(10));
+        assert_eq!(
+            found[2].3,
+            vec![v(2), v(3), Operand::Value(found[1].2)],
+            "the second link takes the borrow out of the first"
+        );
+        assert_eq!(found[2].2, Value(25));
+        assert_eq!(spelling_left(&after), 0, "{after:#?}");
+        assert_eq!(
+            count(&after, |inst| matches!(inst, Instruction::UnaryOp { .. })),
+            0
+        );
+        let result = |func: &IrFunction, params: &[u64]| match &func.blocks[0].terminator {
+            Terminator::Return(Some(Operand::Value(result))) => evaluate(func, params)[&result.0],
+            other => panic!("{other:?}"),
+        };
+        let samples = [0u64, 1, 2, 1 << 63, u64::MAX - 1, u64::MAX];
+        for &x0 in &samples {
+            for &y0 in &samples {
+                for &x1 in &samples {
+                    for &y1 in &samples {
+                        let params = [x0, y0, x1, y1];
+                        let low = u128::from(x0) < u128::from(y0);
+                        let high = u128::from(x1) < u128::from(y1) + u128::from(low);
+                        let wanted = x0.wrapping_sub(y0)
+                            ^ x1.wrapping_sub(y1).wrapping_sub(u64::from(low))
+                            ^ u64::from(high);
+                        assert_eq!(result(&before, &params), wanted, "{params:x?}");
+                        assert_eq!(result(&after, &params), wanted, "{params:x?}: {after:#?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A carry out converted to 64 bits from a signed type (`int c = ...;
+    /// limb += c`) is converted without its sign: 0 and 1 have none, and
+    /// the move is then one of the register and not of its sign.
+    #[test]
+    fn a_carry_widened_with_its_sign_is_widened_without() {
+        let mut insts = vec![param(2, 2, IrType::U8)];
+        insts.extend(header_adder(100, v(2), U64));
+        insts.push(cast(120, 116, IrType::I32, IrType::I64));
+        insts.push(cast(121, 117, IrType::I8, U64));
+        insts.push(cast(122, 116, IrType::U32, U64));
+        insts.push(bin(123, IrBinOp::Xor, v(120), v(121), U64));
+        insts.push(bin(124, IrBinOp::Xor, v(123), v(122), U64));
+        insts.push(bin(125, IrBinOp::Xor, v(124), v(113), U64));
+        let mut func = function(insts, v(125));
+        assert_eq!(run(&mut func, true), 1);
+        let out = halves(&func)[1].2;
+        let widened: Vec<(IrType, IrType)> = func.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|inst| match inst {
+                Instruction::Cast {
+                    src,
+                    from_ty,
+                    to_ty,
+                    ..
+                } if *src == Operand::Value(out) => Some((*from_ty, *to_ty)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            widened,
+            vec![
+                (IrType::U32, IrType::I64),
+                (IrType::U8, U64),
+                (IrType::U32, U64)
+            ],
+            "{func:#?}"
+        );
     }
 
     /// The table of [`CarryOp::evaluate`] against 128-bit arithmetic.

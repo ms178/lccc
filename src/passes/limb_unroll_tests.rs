@@ -1434,6 +1434,111 @@ fn a_trip_that_is_more_than_a_limb_is_left_alone() {
     left_alone(func, "an index counted from the other end");
 }
 
+/// The carry out asked whether it is one, `c = (c1 | c2) != 0` -- a `_Bool`
+/// carry, the borrow of a signed double word -- is the carry out: the
+/// carry pass reads it for the comparison, and no comparison stands
+/// between two limbs. Read behind a loop tested at the bottom it is part
+/// of the trip, and the loop is split all the same.
+#[test]
+fn a_carry_out_asked_whether_it_is_one_is_no_work() {
+    // The join is 38. `asked` are the lines that make 151 of it, which goes
+    // round the loop and is what is read behind it.
+    let asking = |limbs: &Limbs, asked: Vec<Instruction>| {
+        let mut func = limbs.build();
+        let latch = if limbs.bottom { 1 } else { 2 };
+        let (work, _) = work_of(&mut func, limbs.bottom);
+        let at = work
+            .iter()
+            .position(|inst| matches!(inst, Instruction::Store { .. }))
+            .expect("the store");
+        work.splice(at..at, asked);
+        func.blocks[1].instructions[1] = phi(11, U64, vec![(wide(0), 0), (v(151), latch)]);
+        if limbs.bottom {
+            let behind = func.blocks.last_mut().expect("behind the loop");
+            assert!(matches!(
+                behind.terminator,
+                Terminator::Return(Some(Operand::Value(Value(38))))
+            ));
+            behind.terminator = Terminator::Return(Some(v(151)));
+        }
+        func.next_value_id = func.sound_next_value_id();
+        func
+    };
+    for limbs in [Limbs::gmp(), Limbs::mini()] {
+        let counts = counters(limbs.ty, limbs.up);
+        // `(c1 | c2) != 0`, widened to go round.
+        let plain = vec![
+            cmp(150, IrCmpOp::Ne, v(38), wide(0), U64),
+            cast(151, 150, IrType::I32, U64),
+        ];
+        compared_built(asking(&limbs, plain), &"the join asked", true, &counts);
+        // Through a conversion of the join, and asked twice.
+        let converted = vec![
+            cast(148, 38, U64, IrType::U8),
+            cmp(149, IrCmpOp::Ne, v(148), typed(0, IrType::U8), IrType::U8),
+            cmp(150, IrCmpOp::Ne, v(149), typed(0, IrType::I32), IrType::I32),
+            cast(151, 150, IrType::I32, U64),
+        ];
+        compared_built(
+            asking(&limbs, converted),
+            &"a conversion asked",
+            true,
+            &counts,
+        );
+
+        // Not the carry out asked whether it is one: asked whether it is
+        // not (which is no carry to hand on at all), asked against 1, and
+        // another word of the trip asked.
+        for (why, asked) in [
+            (
+                "asked whether it is none",
+                vec![
+                    cmp(150, IrCmpOp::Eq, v(38), wide(0), U64),
+                    cast(151, 150, IrType::I32, U64),
+                ],
+            ),
+            (
+                "asked against one",
+                vec![
+                    cmp(150, IrCmpOp::Ne, v(38), wide(1), U64),
+                    cast(151, 150, IrType::I32, U64),
+                ],
+            ),
+        ] {
+            left_alone(asking(&limbs, asked), why);
+        }
+    }
+    // The carry goes round as it is, and something else is asked and read
+    // behind the loop: the sum, or the carry out against 1.
+    let gmp = Limbs::gmp();
+    for (why, asked) in [
+        ("the sum asked", cmp(150, IrCmpOp::Ne, v(35), wide(0), U64)),
+        (
+            "the carry out asked against one",
+            cmp(150, IrCmpOp::Ne, v(38), wide(1), U64),
+        ),
+        (
+            "the carry out asked whether it is none",
+            cmp(150, IrCmpOp::Eq, v(38), wide(0), U64),
+        ),
+    ] {
+        let mut func = gmp.build();
+        let (work, _) = work_of(&mut func, true);
+        let at = work
+            .iter()
+            .position(|inst| matches!(inst, Instruction::Store { .. }))
+            .expect("the store");
+        work.splice(at..at, [asked, cast(151, 150, IrType::I32, U64)]);
+        // Behind the loop: the carry out and what was asked.
+        let behind = func.blocks.last_mut().expect("behind the loop");
+        behind
+            .instructions
+            .push(bin(152, IrBinOp::Xor, v(38), v(151), U64));
+        behind.terminator = Terminator::Return(Some(v(152)));
+        left_alone(func, why);
+    }
+}
+
 /// What an access folds into its address, and a move, are part of a limb:
 /// an index moved by a constant, scaled by the size of a word in either
 /// spelling, a copy of the sum.
