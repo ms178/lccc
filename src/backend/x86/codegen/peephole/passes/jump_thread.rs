@@ -920,7 +920,7 @@ std::thread_local! {
 }
 
 /// `.LBBn` mention counts plus the set of multiply-defined labels.
-type LabelCounts = (FxHashMap<u32, u32>, FxHashSet<u32>);
+pub(super) type LabelCounts = (FxHashMap<u32, u32>, FxHashSet<u32>);
 
 /// Every `.LBBn` mention count (definitions excluded), plus labels defined
 /// more than once. [`label_uses`] answers "mentioned at all"; a conditional

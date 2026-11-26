@@ -2998,6 +2998,14 @@ fn peephole_optimize_inner(
         multiword::widen_carry_in_place(&mut store, &mut infos);
     }
 
+    // Phase 7d: the carry of a limb loop stays in the flag round the back
+    // edge (`sub $1, n; test n, n; jne` -> `dec n; jne`, the `bt` in front
+    // of the loop and the `mov $0; setc` behind it).  Behind the widening:
+    // it moves the pair that pass writes.
+    if !sk("multiword") && !sk("carry_loop") {
+        multiword::keep_carry_round_loop(&mut store, &mut infos);
+    }
+
     // Armed HERE, not at function entry: the first `late!` below must measure
     // only its own phase, not everything since `time_peephole` was read.
     let mut late_clock = time_peephole.then(std::time::Instant::now);

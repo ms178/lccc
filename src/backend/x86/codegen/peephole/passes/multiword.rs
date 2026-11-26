@@ -19,7 +19,7 @@
 //! five instructions with a four-deep dependency chain from `s` to `hi`,
 //! where the machine has a carry flag for exactly this: `addq; adcq $0`.
 //! GCC 16.2 and Clang 23.1.5 both emit the two-instruction form for this
-//! source, and one `mulq` for the product.  Five independent rewrites:
+//! source, and one `mulq` for the product.  Seven rewrites:
 //!
 //! 1. [`fold_carry_compare`] -- the carry *producer*.  A `cmp` that recomputes
 //!    the carry of the addition (or the borrow of the subtraction) just
@@ -40,6 +40,11 @@
 //!    a loop, into a result).  `setc b; movzb b, r` becomes `mov $0, r;
 //!    setc r`: the same two instructions with one of them, not two, between
 //!    the flag and the register.  Late, once, behind every fold above.
+//! 7. [`keep_carry_round_loop`] -- the carry round a limb loop.  Where the
+//!    loop's count is the one thing that writes the flags between its last
+//!    adder and its first, the count becomes a `dec`, which leaves CF, and
+//!    the carry goes into the flag once in front of the loop and comes out
+//!    once behind it.  Behind the widening, whose `mov $0; setc` it moves.
 //!
 //! # Soundness
 //!
@@ -74,7 +79,12 @@
 //!   and the register untouched from the `setc` on (only flag-neutral lines
 //!   that do not name it lie between), and the scratch byte, which is no
 //!   longer written, dead behind the extension.  A `mov` of an immediate
-//!   writes no flag.
+//!   writes no flag;
+//! * the carry kept round a loop needs the loop to have one way in, round
+//!   and out, the carry's register named by nothing in it but the `bt` and
+//!   the `mov $0; setc`, no flag written from the `setc` to the first
+//!   adder but by the count, and the flags dead behind the loop (the list
+//!   is at [`keep_carry_round_loop`]).
 //!
 //! No rewrite deletes or duplicates a memory access the program made, and
 //! none touches a pinned line or one flagged as a volatile access.  The
@@ -83,7 +93,8 @@
 
 use super::super::types::*;
 use super::flag_peepholes::{FlagsEffect, flags_dead_after, flags_effect};
-use super::helpers::{is_rsp_shift_line, writes_family};
+use super::helpers::{extract_jump_target, is_rsp_shift_line, steps_over_line, writes_family};
+use super::jump_thread::{LabelCounts, label_mention_counts, label_text, local_label};
 use super::liveness::FileLiveness;
 use super::load_op_fuse::may_write_families;
 use super::relay_and_lea::{
@@ -904,6 +915,364 @@ fn widen_carries_once(
         replace_line(store, &mut infos[k], k, set);
         if let Some(lv) = liveness.as_mut() {
             lv.refresh_at(store, infos, j);
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// The most lines of a loop [`keep_carry_round_loop`] looks at. The limb
+/// loops `passes::limb_unroll` writes have about twenty.
+const CARRY_LOOP_LINES: usize = 64;
+
+/// The lines of the loop that the `jne` at `j` closes, when it is one
+/// straight run from its own label: the label first and the `jne` last,
+/// and between them instructions alone -- no label, branch, call, push,
+/// pop or inline assembly, and no directive but the debugger's line marks,
+/// which are not among the lines and stay where they are.
+fn straight_loop(store: &LineStore, infos: &[LineInfo], j: usize) -> Option<Vec<usize>> {
+    let (mnem, target) = mnemonic(infos[j].trimmed(store.get(j)))?;
+    if !matches!(mnem, "jne" | "jnz") {
+        return None;
+    }
+    let mut lines = vec![j];
+    let mut k = j;
+    loop {
+        k = prev_real(store, infos, k)?;
+        let info = infos[k];
+        let t = info.trimmed(store.get(k));
+        lines.push(k);
+        if info.kind == LineKind::Label {
+            lines.reverse();
+            return (label_text(t) == target).then_some(lines);
+        }
+        // The lines trade places: a directive among them (unwind state,
+        // alignment, data) would be moved with them.
+        // DIRECTIVE-LAW: bails
+        if info.kind == LineKind::Directive || info.is_barrier() || lines.len() > CARRY_LOOP_LINES {
+            return None;
+        }
+    }
+}
+
+/// `sub $1, r`, `add $-1, r` or `dec r`: the width, the register, and
+/// whether it is the `dec` already.
+fn counts_down(t: &str) -> Option<(Width, RegId, bool)> {
+    if let Some((width, by, dst)) = sized(t, "sub") {
+        return (immediate(by) == Some(1)).then_some((width, width.register(dst)?, false));
+    }
+    if let Some((width, by, dst)) = sized(t, "add") {
+        return (immediate(by) == Some(-1)).then_some((width, width.register(dst)?, false));
+    }
+    let (mnem, operand) = mnemonic(t)?;
+    let width = match mnem {
+        "decl" => Width::L,
+        "decq" => Width::Q,
+        _ => return None,
+    };
+    Some((width, width.register(operand)?, true))
+}
+
+/// How far above a `jmp` its label may be for [`flags_dead_behind`] to
+/// look there.
+const LOOP_EXIT_WINDOW: usize = 256;
+
+/// True when the flags are dead from line `from` on: down the lines
+/// ([`flags_dead_after`], which follows a jump down only), or through one
+/// `jmp` to a label further up behind which they are. The main loop of a
+/// split limb loop leaves into the old loop, which is laid out above it.
+fn flags_dead_behind(store: &LineStore, infos: &[LineInfo], from: usize) -> bool {
+    if flags_dead_after(store, infos, from) {
+        return true;
+    }
+    for n in from..store.len() {
+        let info = infos[n];
+        let t = info.trimmed(store.get(n));
+        if info.kind == LineKind::Jmp {
+            let Some(target) = extract_jump_target(t) else {
+                return false;
+            };
+            let names_target = |k: &usize| {
+                infos[*k].kind == LineKind::Label
+                    && infos[*k]
+                        .trimmed(store.get(*k))
+                        .strip_suffix(':')
+                        .map(str::trim_ascii)
+                        == Some(target)
+            };
+            return (n.saturating_sub(LOOP_EXIT_WINDOW)..n)
+                .rev()
+                .find(names_target)
+                .is_some_and(|label| flags_dead_after(store, infos, label + 1));
+        }
+        // On the way to the jump: a label this path runs through, and
+        // lines that leave the flags as they are.
+        let passed = steps_over_line(&info, t)
+            || info.kind == LineKind::Label
+            || (!info.is_barrier() && flags_effect(t) == FlagsEffect::Neutral);
+        if !passed {
+            return false;
+        }
+    }
+    false
+}
+
+/// `add $k, r` or `sub $k, r` as the `lea` that computes the same register
+/// and writes no flag.
+fn stepped_by_lea(t: &str) -> Option<String> {
+    let (width, by, dst, down) = match sized(t, "add") {
+        Some((width, by, dst)) => (width, by, dst, false),
+        None => {
+            let (width, by, dst) = sized(t, "sub")?;
+            (width, by, dst, true)
+        }
+    };
+    let reg = width.register(dst)?;
+    let by = i32::try_from(immediate(by)?).ok()?;
+    let by = if down { by.checked_neg()? } else { by };
+    // The whole register is the base: the low half of the sum is the sum
+    // of the low halves.
+    (reg != RSP).then(|| {
+        format!(
+            "    lea{} {by}({}), {}",
+            width.suffix(),
+            Width::Q.name(reg),
+            width.name(reg)
+        )
+    })
+}
+
+/// What [`keep_carry_round_loop`] makes of the loop that the `jne` at `j`
+/// closes: its lines, and the text each of them gets (`None`: the line
+/// goes).
+fn carry_kept_round(
+    store: &LineStore,
+    infos: &[LineInfo],
+    j: usize,
+    labels: &mut Option<LabelCounts>,
+) -> Option<(Vec<usize>, Vec<Option<String>>)> {
+    let lines = straight_loop(store, infos, j)?;
+    let text = |n: usize| infos[lines[n]].trimmed(store.get(lines[n]));
+    let neutral = |n: usize| flags_effect(text(n)) == FlagsEffect::Neutral;
+    let last = lines.len() - 1;
+
+    // The count, last: `sub $1, c`, perhaps `test c, c`, and the `jne`.
+    // Behind the last of them stand lines that leave the flags alone. A
+    // test may stand further down than its count: up from it to the line
+    // that writes what it tests there are such lines and steps by a
+    // constant, whose flags the test wrote over.
+    let lowest = (1..last).rev().find(|&n| !neutral(n))?;
+    let tested = match sized(text(lowest), "test") {
+        Some((width, a, b)) if a == b => Some((width, width.register(a)?)),
+        _ => None,
+    };
+    let count = match tested {
+        Some((_, counter)) => (1..lowest).rev().find(|&n| {
+            may_write(&infos[lines[n]], text(n), counter)
+                || !(neutral(n) || stepped_by_lea(text(n)).is_some())
+        })?,
+        None => lowest,
+    };
+    let (width, counter, is_dec) = counts_down(text(count))?;
+    if tested.is_some_and(|tested| tested != (width, counter)) {
+        return None;
+    }
+    let test = tested.map(|_| lowest);
+
+    // The carry in, first: `bt $0, r` behind lines that leave the flags
+    // alone, and an adder the first to read them.
+    let bt = (1..count).find(|&n| !neutral(n))?;
+    let (bt_width, bit, reg) = sized(text(bt), "bt")?;
+    let carry = bt_width.register(reg)?;
+    if immediate(bit) != Some(0) || carry == RSP {
+        return None;
+    }
+    let adder = (bt + 1..count).find(|&n| !neutral(n))?;
+    if !mnemonic(text(adder))
+        .is_some_and(|(mnem, _)| matches!(mnem, "adcl" | "adcq" | "sbbl" | "sbbq"))
+    {
+        return None;
+    }
+
+    // The carry out: `mov $0, s` and `setc s`, and from the `setc` to the
+    // count lines that leave the flags alone, or steps by a constant,
+    // which an `lea` takes as well. `s` is the carry's register `r`, or
+    // another one that a copy on the way to the branch moves into `r`:
+    // what a phi receives round the loop, in a register of its own.
+    let set = (adder + 1..count)
+        .rev()
+        .find(|&n| !neutral(n) && stepped_by_lea(text(n)).is_none())?;
+    let (mnem, byte) = mnemonic(text(set))?;
+    let out = REG_NAMES[3].iter().position(|name| *name == byte)? as RegId;
+    if carry_setcc(mnem) != Some(true) || out == RSP {
+        return None;
+    }
+    let copies_out = |n: usize| {
+        sized(text(n), "mov").is_some_and(|(width, src, dst)| {
+            width.register(src) == Some(out) && width.register(dst) == Some(carry)
+        })
+    };
+    let copy = match out == carry {
+        true => None,
+        false => Some((set + 1..last).find(|&n| copies_out(n))?),
+    };
+    let names = |n: usize, fam: RegId| {
+        let (info, t) = (infos[lines[n]], text(n));
+        (info.reg_refs | implicit_reg_refs(t.as_bytes())) & (1u16 << fam) != 0
+            || may_write(&info, t, fam)
+    };
+    let zero = (adder + 1..set).rev().find(|&n| names(n, out))?;
+    if text(zero) != format!("movl $0, {}", Width::L.name(out)) {
+        return None;
+    }
+    // The two registers are the carry's alone: no other line of the loop
+    // names them, so they need not hold the carry while the loop runs.
+    let moved = |n: usize| n == bt || n == zero || n == set || Some(n) == copy;
+    if (1..last).any(|n| !moved(n) && (names(n, carry) || names(n, out))) {
+        return None;
+    }
+
+    // Nothing but the line above enters the loop, and that one does.
+    let label = local_label(label_text(text(0)))?;
+    let (mentions, duplicate) = labels.get_or_insert_with(|| label_mention_counts(store, infos));
+    if mentions.get(&label) != Some(&1) || duplicate.contains(&label) {
+        return None;
+    }
+    let above = prev_real(store, infos, lines[0])?;
+    // A directive above the label (an alignment, data, another section)
+    // is no line to fall in from.
+    // DIRECTIVE-LAW: bails
+    if matches!(
+        infos[above].kind,
+        LineKind::Jmp
+            | LineKind::JmpIndirect
+            | LineKind::Ret
+            | LineKind::InlineAsm
+            | LineKind::Directive
+    ) {
+        return None;
+    }
+    // Behind the loop the flags are the `dec`'s and the last adder's
+    // carry, where they were the count's: nobody may read them.
+    if !rewritable(infos, &lines) || !flags_dead_behind(store, infos, j + 1) {
+        return None;
+    }
+
+    // The carry in of a register that was just cleared is the flag the
+    // clearing left: no `bt` is needed for it.
+    let cleared = format!("xorl {0}, {0}", Width::L.name(carry));
+    let cleared = infos[above].trimmed(store.get(above)) == cleared;
+    let whole = |n: usize| Some(store.get(lines[n]).to_string());
+    let stepped = |n: usize| match stepped_by_lea(text(n)) {
+        Some(lea) if n > set => Some(lea),
+        _ => whole(n),
+    };
+    let mut made: Vec<Option<String>> = Vec::with_capacity(lines.len());
+    if !cleared {
+        made.push(whole(bt));
+    }
+    made.extend((0..count).filter(|&n| !moved(n)).map(stepped));
+    made.push(if is_dec {
+        whole(count)
+    } else {
+        Some(format!("    dec{} {}", width.suffix(), width.name(counter)))
+    });
+    made.extend(
+        (count + 1..last)
+            .filter(|&n| Some(n) != test && !moved(n))
+            .map(stepped),
+    );
+    made.extend([whole(last), whole(zero), whole(set)]);
+    made.extend(copy.map(whole));
+    made.resize(lines.len(), None);
+    Some((lines, made))
+}
+
+/// Keep the carry of a limb loop in the flag round its back edge:
+///
+/// ```text
+///                                   btl   $0, %r8d
+/// .LBB7:                            .LBB7:
+///     movq  (%rdx), %rax                movq  (%rdx), %rax
+///     btl   $0, %r8d
+///     adcq  (%rdi), %rax                adcq  (%rdi), %rax
+///     movq  %rax, (%r10)                movq  %rax, (%r10)
+///     ...                               ...
+///     adcq  24(%rdi), %rax       ->     adcq  24(%rdi), %rax
+///     movl  $0, %r8d
+///     setc  %r8b
+///     movq  %rax, 24(%r10)              movq  %rax, 24(%r10)
+///     leaq  32(%rdx), %rdx              leaq  32(%rdx), %rdx
+///     subq  $1, %r11                    decq  %r11
+///     testq %r11, %r11
+///     jne   .LBB7                       jne   .LBB7
+///                                       movl  $0, %r8d
+///                                       setc  %r8b
+/// ```
+///
+/// Inside one trip the carry stays in the flag from one `adc` to the next
+/// ([`forward_carry_flag`]). Round the loop it left the flag at the bottom
+/// and was put back at the top, because the loop's own counting and
+/// stepping wrote the flags in between -- and only that. `dec` counts
+/// without writing CF and `lea` steps without writing any flag. So the
+/// count becomes a `dec` (whose ZF the `jne` reads as it read the `sub`'s
+/// or the `test`'s), an index or pointer stepped by `add $k` is stepped by
+/// `lea k(r), r`, the carry goes into the flag once in front of the loop
+/// and comes out once behind it, and the recurrence of the loop is the
+/// `adc` chain itself: one cycle a limb, where flag, register, flag was
+/// three more every trip.
+///
+/// The lines move by trading texts among the loop's own lines (as
+/// `ebb_reuse::sink_copies_into_fallthrough` moves a copy): the `bt` takes
+/// the label's place and the label the next, the `mov $0; setc` end up
+/// behind the `jne`.
+///
+/// Sound because, with `r` the carry's register:
+///
+/// * the loop is one straight run from its label to the `jne`, the label
+///   is named by that `jne` alone and the line above it falls into it: one
+///   way in, through the `bt`, one way round, one way out, through the
+///   `mov $0; setc`;
+/// * no line of the loop but the `bt`, the `mov $0` and the `setc` names
+///   `r`: nothing reads it while it is not kept up to date, and it is the
+///   carry in at the `bt` in front as it was at the `bt` on top. The carry
+///   out may be taken in another register and copied into `r` on the way
+///   to the branch (a phi and what it receives round the loop, where the
+///   allocator gave them two registers): then nothing else names that one
+///   either, and the copy goes behind the loop with the `mov $0; setc`;
+/// * CF at the first adder is the `setc`'s CF of the trip before: between
+///   the two stand lines that leave the flags alone (checked from the
+///   `setc` to the `jne`, where the count becomes the `dec` and a step by
+///   a constant the `lea` that leaves them alone, and from the label to
+///   the old `bt`). The first line behind the old `bt` that touches a
+///   flag is an `adc`/`sbb`, which reads CF alone and writes all six. The
+///   flags a replaced `add $k` wrote were read by nobody: the count or its
+///   test wrote them again before the `jne`;
+/// * behind the loop `r` is CF as it was, and the flags, which differ (the
+///   count's before, the `dec`'s and the last carry now), are dead
+///   ([`flags_dead_behind`]).
+///
+/// The cost of `dec` in front of `adc` is the processor's: the P6 family up
+/// to Nehalem stalled an `adc` behind a `dec` until the flags were merged,
+/// and the cores since rename CF apart from the other five. Measured on an
+/// Ice Lake-SP the loop above runs 2,048 limbs in 0.26 s where it took
+/// 0.38 s. The pass asks for no tuning target;
+/// `CCC_PEEPHOLE_SKIP=carry_loop` switches it off.
+pub(super) fn keep_carry_round_loop(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let mut labels = None;
+    for j in 0..store.len() {
+        if infos[j].is_nop() || infos[j].kind != LineKind::CondJmp {
+            continue;
+        }
+        let Some((lines, made)) = carry_kept_round(store, infos, j, &mut labels) else {
+            continue;
+        };
+        for (&line, text) in lines.iter().zip(made) {
+            match text {
+                Some(text) => replace_line(store, &mut infos[line], line, text),
+                None => mark_nop(&mut infos[line]),
+            }
         }
         changed = true;
     }

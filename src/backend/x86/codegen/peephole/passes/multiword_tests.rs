@@ -33,12 +33,23 @@ fn run_folds(body: &str) -> (bool, String) {
 }
 
 /// Sixteen registers, 8-byte memory cells keyed by address (a 32-bit store
-/// writes the low half of its cell), and CF.
-#[derive(Clone, PartialEq, Debug)]
+/// writes the low half of its cell), CF, and ZF where a loop is counted
+/// (written by the instructions that count: `sub`, `add`, `dec`, `test`,
+/// `xor`).
+#[derive(Clone, Debug)]
 struct Cpu {
     regs: [u64; 16],
     memory: FxHashMap<u64, u64>,
     carry: bool,
+    zero: bool,
+}
+
+/// Two states are the same in what a fold has to keep: ZF is the model's
+/// own, for the loops it runs.
+impl PartialEq for Cpu {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.regs, &self.memory, self.carry) == (&other.regs, &other.memory, other.carry)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -171,6 +182,7 @@ impl Cpu {
                     + u128::from(self.read(&self.place(operands[0]), size))
                     + carry_in;
                 self.carry = sum > limit;
+                self.zero = sum & limit == 0;
                 self.write(&dst, size, sum as u64);
             }
             "subq" | "subl" | "sbbq" | "sbbl" | "cmpq" | "cmpl" => {
@@ -179,9 +191,30 @@ impl Cpu {
                 let minuend = u128::from(self.read(&dst, size));
                 let subtrahend = u128::from(self.read(&self.place(operands[0]), size)) + borrow_in;
                 self.carry = minuend < subtrahend;
+                self.zero = minuend.wrapping_sub(subtrahend) & limit == 0;
                 if !mnem.starts_with("cmp") {
                     self.write(&dst, size, minuend.wrapping_sub(subtrahend) as u64);
                 }
+            }
+            // Counts down and leaves CF as it was.
+            "decq" | "decl" => {
+                let dst = self.place(operands[0]);
+                let left = u128::from(self.read(&dst, size)).wrapping_sub(1) & limit;
+                self.zero = left == 0;
+                self.write(&dst, size, left as u64);
+            }
+            "testq" | "testl" => {
+                let both = self.read(&self.place(operands[0]), size)
+                    & self.read(&self.place(operands[1]), size);
+                self.carry = false;
+                self.zero = both == 0;
+            }
+            "xorl" | "xorq" => {
+                let dst = self.place(operands[1]);
+                let value = self.read(&dst, size) ^ self.read(&self.place(operands[0]), size);
+                self.carry = false;
+                self.zero = value == 0;
+                self.write(&dst, size, value);
             }
             // Products: only the register results are modelled; the flags
             // a multiply leaves are never read by the shapes under test.
@@ -251,6 +284,40 @@ impl Cpu {
         }
         self
     }
+
+    /// `body` as a program: a label is a place, `jne`, `je` and `jmp` go to
+    /// one, and `ret` or the last line ends it.
+    fn run_program(mut self, body: &str) -> Self {
+        let lines: Vec<&str> = body
+            .lines()
+            .map(str::trim_ascii)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let place_of = |label: &str| {
+            lines
+                .iter()
+                .position(|line| line.strip_suffix(':') == Some(label))
+                .unwrap_or_else(|| panic!("no label {label}"))
+        };
+        let (mut at, mut fuel) = (0, 10_000);
+        while let Some(&line) = lines.get(at) {
+            fuel -= 1;
+            assert!(fuel > 0, "the program does not end:\n{body}");
+            at += 1;
+            if line.ends_with(':') || line.starts_with('.') {
+                continue;
+            }
+            match line.split_once(' ') {
+                Some(("jne", label)) if !self.zero => at = place_of(label),
+                Some(("je", label)) if self.zero => at = place_of(label),
+                Some(("jne" | "je", _)) => {}
+                Some(("jmp", label)) => at = place_of(label),
+                _ if line == "ret" => break,
+                _ => self.step(line),
+            }
+        }
+        self
+    }
 }
 
 fn top_level_operands(args: &str) -> Option<(&str, &str)> {
@@ -311,6 +378,7 @@ fn states() -> Vec<Cpu> {
             regs,
             memory,
             carry: round % 2 == 0,
+            zero: round % 3 == 0,
         });
     }
     all
@@ -1801,5 +1869,670 @@ fn a_carry_taken_out_of_the_flag_for_nobody_is_not_taken_out() {
             "    addq 8(%rdi), %rax\n{pair}    movq 24(%rdi), %rax\n    movq %rax, %rcx\n    ret"
         );
         assert_eq!(alone(&body), (false, 0), "{body}");
+    }
+}
+
+// ── The carry round a loop ───────────────────────────────────────────────
+
+fn kept(body: &str) -> (bool, String) {
+    kept_unless(body, |_| {})
+}
+
+/// [`kept`], with `mark` applied to the line infos first (a pin, a
+/// volatile access).
+fn kept_unless(body: &str, mark: impl Fn(&mut [LineInfo])) -> (bool, String) {
+    let text = format!("foo:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+    let mut store = LineStore::new(text);
+    let mut infos: Vec<_> = (0..store.len())
+        .map(|i| classify_line(store.get(i)))
+        .collect();
+    mark(&mut infos);
+    let changed = keep_carry_round_loop(&mut store, &mut infos);
+    let out = (0..store.len())
+        .filter(|&i| !infos[i].is_nop())
+        .map(|i| store.get(i).trim_ascii())
+        .filter(|line| !line.starts_with(".cfi") && *line != "foo:")
+        .collect::<Vec<_>>()
+        .join("\n");
+    (changed, out)
+}
+
+/// `body` keeps its carry in the flag and computes, from every state, the
+/// registers (all but `%rax`, the loop's scratch) and the memory it did.
+/// The flags are dead behind it.
+fn kept_the_same(body: &str) -> String {
+    let (changed, out) = kept(body);
+    assert!(changed, "not kept:\n{body}");
+    for state in states() {
+        let before = state.clone().run_program(body);
+        let after = state.clone().run_program(&out);
+        for fam in 1..16 {
+            assert_eq!(
+                before.regs[fam], after.regs[fam],
+                "{} differs\n--- before\n{body}\n--- after\n{out}\n{state:x?}",
+                REG_NAMES[0][fam]
+            );
+        }
+        assert_eq!(before.memory, after.memory, "memory\n{body}\n=>\n{out}");
+    }
+    out
+}
+
+/// A limb loop as `limb_unroll` and the passes above leave it: `trips`
+/// trips of two limbs through `%rdx`, `%r9` and `%r10`, the carry in
+/// `carry` (a 64-bit register name without `%`), with `top` behind the
+/// label, `adder` the mnemonic, `bottom` between the carry out and the
+/// count, `count` the count, and `behind` behind the loop. `%rax` is its
+/// scratch.
+struct Loop<'a> {
+    carry: &'a str,
+    way_in: &'a str,
+    top: &'a str,
+    adder: &'a str,
+    bottom: &'a str,
+    count: &'a str,
+    jump: &'a str,
+    behind: &'a str,
+}
+
+impl Loop<'_> {
+    fn limbs() -> Self {
+        Loop {
+            carry: "r8",
+            way_in: "",
+            top: "    movq (%rdx), %rax\n",
+            adder: "adcq",
+            bottom: "    movq %rax, 8(%r10)\n    leaq 16(%r10), %r10\n    leaq 16(%r9), %r9\n    \
+                     leaq 16(%rdx), %rdx\n",
+            count: "    subq $1, %r11\n    testq %r11, %r11\n",
+            jump: "    jne .LBB7\n",
+            behind: "    movq %r8, %rcx\n    xorl %eax, %eax\n    ret",
+        }
+    }
+
+    fn text(&self) -> String {
+        let Loop {
+            carry,
+            way_in,
+            top,
+            adder,
+            bottom,
+            count,
+            jump,
+            behind,
+        } = self;
+        let fam = REG_NAMES[0]
+            .iter()
+            .position(|name| name[1..] == **carry)
+            .expect("the carry's register");
+        let (low, byte) = (REG_NAMES[1][fam], REG_NAMES[3][fam]);
+        // Eight limbs of `a` at (%rdi), which the states fill, eight of
+        // `b` in the frame, which they fill with edges, the sum behind
+        // `a`, and three trips.
+        format!(
+            "    movq %rdi, %rdx\n    leaq (%rsp), %r9\n    leaq 64(%rdi), %r10\n    movl $3, %r11d\n\
+             {way_in}.LBB7:\n{top}    btl $0, {low}\n    {adder} (%r9), %rax\n    movq %rax, (%r10)\n    \
+             movq 8(%rdx), %rax\n    {adder} 8(%r9), %rax\n    movl $0, {low}\n    setc {byte}\n\
+             {bottom}{count}{jump}{behind}"
+        )
+    }
+
+    /// The loop keeps its carry in the flag, and computes what it did.
+    fn is_kept(&self) -> String {
+        kept_the_same(&self.text())
+    }
+
+    fn stays(&self, why: &str) {
+        let body = self.text();
+        let (changed, out) = kept(&body);
+        assert!(!changed, "{why}: must stay\n{body}\n=>\n{out}");
+    }
+}
+
+#[test]
+fn the_model_runs_a_counted_loop() {
+    let cpu = states().remove(0);
+    let ran = cpu.clone().run_program(
+        "    movl $5, %r11d\n    movl $0, %ecx\n.LBB1:\n    leaq 3(%rcx), %rcx\n    decq %r11\n    \
+         jne .LBB1\n    ret\n    movl $99, %ecx",
+    );
+    assert_eq!((ran.regs[1], ran.regs[11]), (15, 0));
+    // `dec` leaves CF, `sub` and `test` write it.
+    for (count, carry) in [
+        ("decq %r11", true),
+        ("subq $1, %r11", false),
+        ("testq %r11, %r11", false),
+    ] {
+        let ran = cpu.clone().run(&format!(
+            "    movl $2, %r11d\n    movq $-1, %rcx\n    addq $1, %rcx\n    {count}"
+        ));
+        assert_eq!((ran.carry, ran.zero), (carry, false), "{count}");
+    }
+}
+
+#[test]
+fn a_carry_stays_in_the_flag_round_a_limb_loop() {
+    let limbs = Loop::limbs();
+    let out = limbs.is_kept();
+    // The carry goes in once in front of the loop and comes out once
+    // behind it; the count is a `dec` and nothing tests it again.
+    assert_eq!(
+        lines(&out)[4..],
+        [
+            "btl $0, %r8d",
+            ".LBB7:",
+            "movq (%rdx), %rax",
+            "adcq (%r9), %rax",
+            "movq %rax, (%r10)",
+            "movq 8(%rdx), %rax",
+            "adcq 8(%r9), %rax",
+            "movq %rax, 8(%r10)",
+            "leaq 16(%r10), %r10",
+            "leaq 16(%r9), %r9",
+            "leaq 16(%rdx), %rdx",
+            "decq %r11",
+            "jne .LBB7",
+            "movl $0, %r8d",
+            "setc %r8b",
+            "movq %r8, %rcx",
+            "xorl %eax, %eax",
+            "ret",
+        ],
+        "{out}"
+    );
+
+    // Every spelling of the count, in both widths; a borrow; another
+    // register; and nothing between the label and the `bt`.
+    for count in [
+        "    subq $1, %r11\n",
+        "    addq $-1, %r11\n    testq %r11, %r11\n",
+        "    decq %r11\n",
+        "    decq %r11\n    testq %r11, %r11\n",
+        "    subl $1, %r11d\n    testl %r11d, %r11d\n",
+        "    decl %r11d\n",
+    ] {
+        let out = Loop {
+            count,
+            ..Loop::limbs()
+        }
+        .is_kept();
+        let dec = if count.contains("r11d") {
+            "decl %r11d"
+        } else {
+            "decq %r11"
+        };
+        assert!(
+            out.contains(&format!("{dec}\njne .LBB7\nmovl $0, %r8d\nsetc %r8b")),
+            "{out}"
+        );
+        assert!(
+            !out.contains("test") && !out.contains("sub") && !out.contains("add"),
+            "{out}"
+        );
+    }
+    Loop {
+        adder: "sbbq",
+        ..Loop::limbs()
+    }
+    .is_kept();
+    let out = Loop {
+        carry: "rbx",
+        behind: "    movq %rbx, %rcx\n    xorl %eax, %eax\n    ret",
+        ..Loop::limbs()
+    }
+    .is_kept();
+    assert!(
+        out.contains("btl $0, %ebx\n.LBB7:")
+            && out.ends_with("setc %bl\nmovq %rbx, %rcx\nxorl %eax, %eax\nret"),
+        "{out}"
+    );
+    let out = Loop {
+        top: "    movq (%rdx), %rax\n    movq %rax, %rax\n",
+        ..Loop::limbs()
+    }
+    .is_kept();
+    assert!(
+        out.contains("btl $0, %r8d\n.LBB7:\nmovq (%rdx), %rax\nmovq %rax, %rax\nadcq"),
+        "{out}"
+    );
+
+    // Copies between the count, its test and the branch stay where they
+    // are; one that writes the counter in front of its test keeps the test
+    // and so the loop as it is.
+    for (count, bottom) in [
+        (
+            "    subq $1, %r11\n    movq %rcx, %rbx\n    testq %r11, %r11\n",
+            "decq %r11\nmovq %rcx, %rbx\njne .LBB7\nmovl $0, %r8d",
+        ),
+        (
+            "    subq $1, %r11\n    movq %r11, %rbx\n    testq %r11, %r11\n    movq %rbx, %rcx\n",
+            "decq %r11\nmovq %r11, %rbx\nmovq %rbx, %rcx\njne .LBB7\nmovl $0, %r8d",
+        ),
+        (
+            "    subq $1, %r11\n    movq %r11, %rcx\n",
+            "decq %r11\nmovq %r11, %rcx\njne .LBB7\nmovl $0, %r8d",
+        ),
+    ] {
+        let out = Loop {
+            count,
+            ..Loop::limbs()
+        }
+        .is_kept();
+        assert!(out.contains(bottom), "{out}");
+    }
+    Loop {
+        count: "    subq $1, %r11\n    movq %rcx, %r11\n    testq %r11, %r11\n",
+        ..Loop::limbs()
+    }
+    .stays("the counter is written in front of its test");
+
+    // The carry out in another register than the carry in -- a phi and
+    // what it receives round the loop -- and copied over on the way to the
+    // branch: both are written once, behind the loop.
+    let in_r13 = |text: String| {
+        text.replace(
+            "movl $0, %r8d\n    setc %r8b",
+            "movl $0, %r13d\n    setc %r13b",
+        )
+    };
+    for (bottom, count) in [
+        (
+            "    movq %rax, 8(%r10)\n    movq %r13, %r8\n    leaq 16(%r10), %r10\n    \
+             leaq 16(%r9), %r9\n    leaq 16(%rdx), %rdx\n",
+            Loop::limbs().count,
+        ),
+        (
+            Loop::limbs().bottom,
+            "    subq $1, %r11\n    movq %r13, %r8\n    testq %r11, %r11\n",
+        ),
+        (
+            Loop::limbs().bottom,
+            "    subq $1, %r11\n    testq %r11, %r11\n    movl %r13d, %r8d\n",
+        ),
+    ] {
+        let body = in_r13(
+            Loop {
+                bottom,
+                count,
+                ..Loop::limbs()
+            }
+            .text(),
+        );
+        let out = kept_the_same(&body);
+        assert!(
+            out.contains("btl $0, %r8d\n.LBB7:")
+                && out.contains("decq %r11\njne .LBB7\nmovl $0, %r13d\nsetc %r13b\nmov")
+                && (out.contains("movq %r13, %r8\nmovq %r8, %rcx")
+                    || out.contains("movl %r13d, %r8d\nmovq %r8, %rcx")),
+            "{out}"
+        );
+    }
+
+    // The count, then the steps, then its test: `do ... while (--n)` over
+    // stepped pointers as it arrives when it is not split. The steps
+    // become `lea` behind the `dec`.
+    let out = Loop {
+        bottom: "    movq %rax, 8(%r10)\n",
+        count: "    subq $1, %r11\n    addq $16, %r10\n    addq $16, %r9\n    movq %r11, %rbx\n    \
+                addq $16, %rdx\n    testq %r11, %r11\n",
+        ..Loop::limbs()
+    }
+    .is_kept();
+    assert!(
+        out.contains(
+            "movq %rax, 8(%r10)\ndecq %r11\nleaq 16(%r10), %r10\nleaq 16(%r9), %r9\n\
+             movq %r11, %rbx\nleaq 16(%rdx), %rdx\njne .LBB7\nmovl $0, %r8d\nsetc %r8b"
+        ),
+        "{out}"
+    );
+    // Two steps of the counter: the test reads the second.
+    let out = Loop {
+        count: "    subq $1, %r11\n    addq $-1, %r11\n    testq %r11, %r11\n",
+        way_in: "    movl $6, %r11d\n",
+        ..Loop::limbs()
+    }
+    .is_kept();
+    assert!(
+        out.contains("leaq -1(%r11), %r11\ndecq %r11\njne .LBB7"),
+        "{out}"
+    );
+
+    // An index or a pointer stepped by a constant is stepped by an `lea`,
+    // which leaves the flag alone: up, down, in either width.
+    let out = Loop {
+        bottom: "    movq %rax, 8(%r10)\n    addq $16, %r10\n    subq $-16, %r9\n    addq $16, %rdx\n    \
+                 addl $3, %ecx\n    subl $5, %ebx\n    subq $7, %r12\n",
+        ..Loop::limbs()
+    }
+    .is_kept();
+    assert!(
+        out.contains(
+            "movq %rax, 8(%r10)\nleaq 16(%r10), %r10\nleaq 16(%r9), %r9\nleaq 16(%rdx), %rdx\n\
+             leal 3(%rcx), %ecx\nleal -5(%rbx), %ebx\nleaq -7(%r12), %r12\ndecq %r11\njne .LBB7"
+        ),
+        "{out}"
+    );
+    // ... but not a step between the adders, which is not on the way
+    // round, and whose flags the next adder would have to survive.
+    let body = Loop::limbs().text().replacen(
+        "    movq %rax, (%r10)\n",
+        "    movq %rax, (%r10)\n    addq $1, %rcx\n",
+        1,
+    );
+    let out = kept_the_same(&body);
+    assert!(out.contains("addq $1, %rcx"), "{out}");
+
+    // The loop leaves through a jump up, to where the flags are written
+    // before anything reads them (the old loop of a split one).
+    let up = Loop::limbs().text().replacen(
+        ".LBB7:",
+        "    jmp .LBB6\n.LBB4:\n    movq %r8, %rcx\n    cmpq %rdx, %rdx\n    ret\n.LBB6:\n.LBB7:",
+        1,
+    );
+    let up = up.replace(
+        "    jne .LBB7\n    movq %r8, %rcx\n",
+        "    jne .LBB7\n.LBB8:\n    movq %r9, %rbx\n    jmp .LBB4\n",
+    );
+    let out = kept_the_same(&up);
+    assert!(
+        out.contains("jne .LBB7\nmovl $0, %r8d\nsetc %r8b\n.LBB8:\nmovq %r9, %rbx\njmp .LBB4"),
+        "{out}"
+    );
+    // ... but not to where they are read, or to a label that is not above.
+    for (from, to) in [
+        ("    cmpq %rdx, %rdx\n    ret", "    sete %cl\n    ret"),
+        ("    cmpq %rdx, %rdx\n    ret", "    jb .LBB8\n    ret"),
+        ("    jmp .LBB4\n", "    jmp elsewhere\n"),
+        (
+            "    movq %r9, %rbx\n    jmp .LBB4\n",
+            "    pushq %rcx\n    jmp .LBB4\n",
+        ),
+        (
+            "    movq %r9, %rbx\n    jmp .LBB4\n",
+            "    jb .LBB4\n    jmp .LBB4\n",
+        ),
+    ] {
+        assert!(up.contains(from), "{from}");
+        let body = up.replace(from, to);
+        let (changed, out) = kept(&body);
+        assert!(!changed, "must stay:\n{body}\n=>\n{out}");
+    }
+
+    // The debugger's line marks are not lines of the loop: they stay where
+    // they are, and the loop is kept round them.
+    let marked = Loop::limbs()
+        .text()
+        .replacen(
+            "    movq %rax, (%r10)\n",
+            "    movq %rax, (%r10)\n    .loc 1 7 3\n",
+            1,
+        )
+        .replacen(
+            "    btl $0, %r8d\n",
+            "    .loc 1 6 9\n    btl $0, %r8d\n",
+            1,
+        );
+    let out = kept_the_same(&marked);
+    assert!(
+        out.contains(".loc 1 6 9\n")
+            && out.contains(".loc 1 7 3\n")
+            && out.contains("decq %r11\njne .LBB7\nmovl $0, %r8d\nsetc %r8b"),
+        "{out}"
+    );
+
+    // A carry in that was just cleared is the flag the clearing left: no
+    // `bt` at all. Cleared further up, or another register cleared, it is
+    // tested.
+    let out = Loop {
+        way_in: "    xorl %r8d, %r8d\n",
+        ..Loop::limbs()
+    }
+    .is_kept();
+    assert!(
+        !out.contains("bt") && out.contains("xorl %r8d, %r8d\n.LBB7:"),
+        "{out}"
+    );
+    for way_in in [
+        "    xorl %r8d, %r8d\n    movq %rdx, %rcx\n",
+        "    xorl %ecx, %ecx\n",
+        "    movl $1, %r8d\n",
+        "    cmpq %rdx, %r9\n    je .LBB9\n",
+        "    cmpq %rdx, %rdx\n    je .LBB9\n",
+    ] {
+        let out = Loop {
+            way_in,
+            behind: "    movq %r8, %rcx\n    xorl %eax, %eax\n.LBB9:\n    ret",
+            ..Loop::limbs()
+        }
+        .is_kept();
+        assert!(out.contains("btl $0, %r8d\n.LBB7:"), "{out}");
+    }
+}
+
+#[test]
+fn a_loop_whose_carry_cannot_stay_in_the_flag_is_left_alone() {
+    let limbs = Loop::limbs;
+    // A flag written on the way round: between the label and the `bt`,
+    // between the carry out and the count.
+    Loop {
+        top: "    movq (%rdx), %rax\n    addq $0, %rcx\n",
+        ..limbs()
+    }
+    .stays("a flag written in front of the carry in");
+    Loop {
+        bottom: "    movq %rax, 8(%r10)\n    addq %rcx, %r10\n    leaq 16(%r9), %r9\n    leaq 16(%rdx), %rdx\n",
+        ..limbs()
+    }
+    .stays("a pointer stepped by a register");
+    Loop {
+        bottom: "    movq %rax, 8(%r10)\n    leaq 16(%r10), %r10\n    leaq 16(%r9), %r9\n    \
+                 leaq 16(%rdx), %rdx\n    addq $16, 8(%rsp)\n",
+        ..limbs()
+    }
+    .stays("a step in memory");
+    Loop {
+        bottom: "    movq %rax, 8(%r10)\n    leaq 16(%r10), %r10\n    leaq 16(%r9), %r9\n    \
+                 leaq 16(%rdx), %rdx\n    shlq $1, %rcx\n",
+        ..limbs()
+    }
+    .stays("a shift in front of the count");
+    Loop {
+        bottom: "    movq %rax, 8(%r10)\n    leaq 16(%r10), %r10\n    leaq 16(%r9), %r9\n    \
+                 leaq 16(%rdx), %rdx\n    cmpq %r9, %rdx\n",
+        ..limbs()
+    }
+    .stays("a compare in front of the count");
+    // A directive among the lines, which would trade places with them:
+    // unwind state, alignment, data, another section.
+    for directive in [
+        ".cfi_remember_state",
+        ".p2align 4",
+        ".byte 0x90",
+        ".section .rodata",
+    ] {
+        let body = limbs().text().replacen(
+            "    movq %rax, (%r10)\n",
+            &format!("    movq %rax, (%r10)\n    {directive}\n"),
+            1,
+        );
+        let (changed, out) = kept(&body);
+        assert!(!changed, "{directive} must stay:\n{out}");
+    }
+    // The carry out in another register than the carry in: with no copy
+    // into the carry's, with the copy the other way, in front of the
+    // `setc`, or not the only reader of that register.
+    let in_r13 = |text: String| {
+        text.replace(
+            "movl $0, %r8d\n    setc %r8b",
+            "movl $0, %r13d\n    setc %r13b",
+        )
+    };
+    let with_bottom = |extra: &str| {
+        let bottom = format!("    movq %rax, 8(%r10)\n{extra}    leaq 16(%r10), %r10\n");
+        in_r13(
+            Loop {
+                bottom: &bottom,
+                ..limbs()
+            }
+            .text(),
+        )
+    };
+    for body in [
+        with_bottom(""),
+        with_bottom("    movq %r8, %r13\n"),
+        with_bottom("    movq %r13, %r8\n    movq %r13, %rcx\n"),
+        with_bottom("    movq %r13, %r8\n    movq %r8, %rcx\n"),
+        with_bottom("    movq %r13, %r8\n    movq %r13, %r8\n"),
+        limbs().text().replace(
+            "    movl $0, %r8d\n    setc %r8b",
+            "    movq %r13, %r8\n    movl $0, %r13d\n    setc %r13b",
+        ),
+    ] {
+        let (changed, out) = kept(&body);
+        assert!(!changed, "must stay:\n{body}\n=>\n{out}");
+    }
+    // Between the count and its test: the counter stepped by another
+    // constant, a step by a register, a reader of the flags. And a step
+    // behind a count that has no test: the branch reads the step's flags.
+    for count in [
+        "    subq $1, %r11\n    addq $16, %r11\n    testq %r11, %r11\n",
+        "    subq $1, %r11\n    addq %rcx, %r10\n    testq %r11, %r11\n",
+        "    subq $1, %r11\n    setc %cl\n    testq %r11, %r11\n",
+        "    subq $1, %r11\n    addq $16, %r10\n",
+    ] {
+        Loop { count, ..limbs() }.stays("the count is not what the branch reads");
+    }
+    // The carry's register read or written by the loop.
+    for (top, bottom) in [
+        (
+            "    movq (%rdx), %rax\n    movq %r8, %rcx\n",
+            limbs().bottom,
+        ),
+        ("    movq (%rdx,%r8,8), %rax\n", limbs().bottom),
+        ("    movq (%rdx), %rax\n    movl $1, %r8d\n", limbs().bottom),
+        (
+            limbs().top,
+            "    movq %rax, 8(%r10)\n    movq %r8, 24(%r10)\n    leaq 16(%r10), %r10\n    \
+             leaq 16(%r9), %r9\n    leaq 16(%rdx), %rdx\n",
+        ),
+        (
+            limbs().top,
+            "    movq %rax, 8(%r10)\n    leaq 16(%r10,%r8), %r10\n    leaq 16(%r9), %r9\n    \
+             leaq 16(%rdx), %rdx\n",
+        ),
+    ] {
+        Loop {
+            top,
+            bottom,
+            ..limbs()
+        }
+        .stays("the carry's register named in the loop");
+    }
+    Loop {
+        carry: "r11",
+        ..limbs()
+    }
+    .stays("the carry's register is the count");
+    // The count: by two, of another register than the one tested, in
+    // another width than the test, compared instead of tested.
+    for count in [
+        "    subq $2, %r11\n",
+        "    subq $1, %r11\n    testq %rcx, %rcx\n",
+        "    subq $1, %r11\n    testl %r11d, %r11d\n",
+        "    subl $1, %r11d\n    testq %r11, %r11\n",
+        "    subq $1, %r11\n    cmpq $0, %r11\n",
+        "    subq $1, %r11\n    testq %r11, %rcx\n",
+        "    leaq -1(%r11), %r11\n    testq %r11, %r11\n",
+    ] {
+        Loop { count, ..limbs() }.stays("a count that is no `sub $1; test`");
+    }
+    // Another branch closes the loop, or the `jne` goes elsewhere.
+    for jump in [
+        "    je .LBB7\n",
+        "    jb .LBB7\n",
+        "    jne .LBB8\n.LBB8:\n",
+        "    jmp .LBB7\n",
+    ] {
+        Loop { jump, ..limbs() }.stays("a loop not closed by its own `jne`");
+    }
+    // The label on top is named once, and not by the branch at the bottom:
+    // no loop.
+    Loop {
+        way_in: "    jmp .LBB7\n.LBB6:\n",
+        jump: "    jne .LBB8\n.LBB8:\n",
+        ..limbs()
+    }
+    .stays("the branch at the bottom goes elsewhere");
+    // A second way in: the label named twice, or reached by a jump alone.
+    Loop {
+        behind: "    movq %r8, %rcx\n    xorl %eax, %eax\n    testq %rcx, %rcx\n    jne .LBB7\n    ret",
+        ..limbs()
+    }
+    .stays("two branches to the label");
+    Loop {
+        way_in: "    jmp .LBB7\n",
+        ..limbs()
+    }
+    .stays("no way in from above");
+    Loop {
+        way_in: "    .p2align 4\n",
+        ..limbs()
+    }
+    .stays("an aligned label");
+    // Not one straight run: a label, a call, a push inside.
+    for top in [
+        "    movq (%rdx), %rax\n.LBB8:\n",
+        "    call g\n    movq (%rdx), %rax\n",
+        "    pushq %rcx\n    popq %rcx\n    movq (%rdx), %rax\n",
+    ] {
+        Loop { top, ..limbs() }.stays("more than one block");
+    }
+    // The flags of the count are read behind the loop.
+    for behind in [
+        "    adcq $0, %rcx\n    xorl %eax, %eax\n    ret",
+        "    movq %r8, %rcx\n    sete %cl\n    xorl %eax, %eax\n    ret",
+        "    jb .LBB9\n    movq %r8, %rcx\n.LBB9:\n    xorl %eax, %eax\n    ret",
+    ] {
+        Loop { behind, ..limbs() }.stays("flags read behind the loop");
+    }
+    // A line of the loop that may not be rewritten: every one of them is
+    // given another text. (The first six lines are `foo:`, the unwind
+    // directive and what comes before the label.)
+    let body = Loop::limbs().text();
+    let loop_lines = 6..6 + 16;
+    assert!(kept_unless(&body, |infos| infos[5].pinned = true).0);
+    assert!(kept_unless(&body, |infos| infos[22].pinned = true).0);
+    for line in loop_lines {
+        let (pinned, _) = kept_unless(&body, |infos| infos[line].pinned = true);
+        let (volatile, _) = kept_unless(&body, |infos| infos[line].volatile_access = true);
+        assert!(!pinned && !volatile, "line {line} of\n{body}");
+    }
+
+    // The first to read the flag behind the `bt` is no adder; the carry
+    // out is not the carry's (another byte, no zero, a `setnc`).
+    for body in [
+        Loop::limbs()
+            .text()
+            .replacen("adcq (%r9), %rax", "setc %cl\n    adcq (%r9), %rax", 1),
+        Loop::limbs()
+            .text()
+            .replacen("adcq (%r9), %rax", "rclq $1, %rax", 1),
+        Loop::limbs().text().replace("setc %r8b", "setc %cl"),
+        Loop::limbs().text().replace("setc %r8b", "setnc %r8b"),
+        Loop::limbs()
+            .text()
+            .replace("movl $0, %r8d", "movl $0, %ecx"),
+        Loop::limbs()
+            .text()
+            .replace("movl $0, %r8d", "movl $1, %r8d"),
+        Loop::limbs().text().replace("    movl $0, %r8d\n", ""),
+        Loop::limbs().text().replace("btl $0, %r8d", "btl $1, %r8d"),
+        Loop::limbs()
+            .text()
+            .replace("btl $0, %r8d", "btl $0, 8(%rsp)"),
+        Loop::limbs().text().replace("    btl $0, %r8d\n", ""),
+    ] {
+        let (changed, out) = kept(&body);
+        assert!(!changed, "must stay:\n{body}\n=>\n{out}");
     }
 }
