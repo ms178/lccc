@@ -9,9 +9,17 @@ SQLite release **tag** `version-3.54.1` from the project's GitHub mirror,
 checks the pinned ZIP SHA-256 and the upstream `manifest.uuid`, and builds the
 SQLite CLI and static library with **both** LCCC and GCC 16.2 at the same C
 optimization/target flags. The `lccc-ld` binary independently links a third
-CLI from LCCC objects. The active swap file is mandatory; the repository's
-`ensure_swap.sh` now provisions **8 GiB**, since 4 GiB was measured insufficient
-for the monolithic Rust lib-test link on a small host.
+CLI from LCCC objects. An active swap file is mandatory. The repository's
+`ensure_swap.sh` defaults to **8 GiB** because 4 GiB did not suffice for a
+Rust lib-test link on an earlier ~2 GiB RAM host. On the restored ~3.8 GiB
+RAM host, an **exactly 4 GiB** active `/swapfile` sufficed for the fastbuild
+compiler, full Rust all-targets suite with `-j 1`, and both SQLite arms.
+This is a measured *host/job-count-specific* result, not a smaller universal
+swap requirement. For that setup, set `LCCC_SWAP_SIZE=4G` on **every** build
+wrapper invocation; the default would otherwise request 8 GiB. Check both
+`stat -c %s /swapfile` (4294967296 bytes) and `/proc/swaps` before claiming
+exactly 4 GiB: `ensure_swap.sh` accepts an already-active **larger** area as
+meeting its minimum budget without shrinking it.
 
 `ms178/archpkgbuilds` supplies the pinned SQLite recipe and its compile-time
 flags. Its `PKGBUILD` at `0516be29c004aa2a64e8a66ba84a3eda154ccd6e`
@@ -35,8 +43,20 @@ git -C /home/user/archpkgbuilds checkout --detach \
 
 cd /home/user/lccc
 source /home/user/.cache/lccc/agent-toolchains/env.sh
+# Reproduce the restored ~3.8 GiB RAM host's *exact* 4 GiB swap setup.
+# Start without an already-active larger area; inspect the active entry too.
+export LCCC_SWAPFILE=/swapfile LCCC_SWAP_SIZE=4G
+scripts/ensure_swap.sh
+stat -c %s /swapfile   # 4294967296
+cat /proc/swaps
 # If LCCC needs building: fastbuild profile (-O1), explicitly two jobs + swap.
 LCCC_BUILD_JOBS=2 scripts/build_lccc_fast.sh
+# The full Rust all-targets gate used ONE Cargo job on this host:
+CARGO_INCREMENTAL=0 CARGO_PROFILE_FASTBUILD_DEBUG=0 \
+  RUSTFLAGS="$(cat target/lccc-rustflags)" \
+  cargo test --profile fastbuild --all-targets --locked -j 1 \
+  --config 'target.x86_64-unknown-linux-gnu.linker="clang"' \
+  --config 'target.i686-unknown-linux-gnu.linker="clang"'
 JOBS=2 tests/workloads/sqlite-3.54.1/run.sh
 # Targeted SQLite varint and guarded-negative-control C regressions:
 tests/workloads/sqlite-3.54.1/check_ptr_delta_phi.sh

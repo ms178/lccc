@@ -218,3 +218,74 @@ meaningful `pahole` analysis. The full SQLite Tcl suite, local ICX SQLite,
 native cross-target speed, and a completed full local fast-CI run remain
 **unverified** here. Hosted CI must be assessed on the final pushed head, not
 inferred from earlier green checks.
+
+## 2026-11-26 fresh four-GiB-swap validation — same compiler source
+
+On a restored host with **3.8 GiB RAM**, `/swapfile` was **4294967296 bytes**
+(exactly 4 GiB), active in `/proc/swaps` throughout the build and tests.
+Unlike the earlier ~2 GiB RAM host, this host completed the fastbuild with
+`LCCC_BUILD_JOBS=2` and the **full** `cargo test --profile fastbuild
+--all-targets --locked -j 1` (matching the built `target/lccc-rustflags`,
+`CARGO_INCREMENTAL=0`, debug info disabled): **9808** library tests and **1**
+linker-bin test passed, **10** ignored, **0** failed. The compiler and linker
+SHA-256 hashes matched the previously validated forward-only binaries above.
+The directly targeted pointer-pass unit tests also passed **14/14**. Unit
+suite output contains *expected fixture* warnings from diagnostic tests (for
+example unrecognized options and missing returns); the SQLite production
+build's warning gate below remained clean. This all-targets run is **not** a
+completed run of the repository's entire `ci_local.sh --fast` corpus.
+
+With `JOBS=2` and the same pinned GCC 16.2, the fresh enabled and disabled
+SQLite **full bounded workloads** each passed LCCC/GCC/standalone-linker SQL,
+six speedtest hashes and test identities, empty runtime/build-warning logs,
+and every database integrity gate. Both used the same LCCC SHA-256 and C flags,
+changing **only** `CCC_DISABLE_PASSES=ptr_delta_phi`. The pinned Clang 23.1.5
+reference also passed both SQL cases, all six hashes/identities, integrity and
+warning gates. A fresh seven-round AB/BA comparison checked **84/84** runs
+against the hashes and test identities and checked each fresh database's
+integrity. `summarize.py` tests **19/19** and `perf_ab.py` tests **10/10**
+passed. Host and four-target freestanding correctness, negative-control
+assembly, IR/SSA and warning checks passed again under this swap setup.
+
+| speedtest1 set | A/GCC, 3-run VM median | B/GCC, 3-run VM median | B/A, 7-run VM medians | median paired B/A | B slower in pairs |
+|---|---:|---:|---:|---:|---:|
+| main | 1.250 | 1.370 | 0.969 | 0.994 | 2/7 |
+| cte | 1.451 | 1.386 | 1.017 | 0.967 | 2/7 |
+| rtree | 1.666 | 1.636 | 0.983 | 0.981 | 2/7 |
+| orm | 1.275 | 1.180 | 0.991 | 0.981 | 3/7 |
+| json | 1.099 | 1.182 | 1.076 | 1.056 | 5/7 |
+| fp | 1.495 | 1.504 | 0.991 | 1.014 | 5/7 |
+
+Here A is enabled, B disabled, and B/A above one favors the fold. The
+**separately** built A/GCC and B/GCC three-run medians are *not* paired with
+one another: do not derive an A/B effect by subtracting them. In particular,
+`main` was **0.969** by pooled B/A medians in this session versus **1.046**
+in the prior one, and `json` ranged **0.822–1.427** across its seven *paired*
+ratios. These small or variable VM results do **not** establish an overall
+SQLite speedup or regression on native Raptor Lake hardware.
+
+| guarded host screen, same on/off compiler | interleaved pairs | minimum B/A | low-three B/A | paired median B/A | B slower |
+|---|---:|---:|---:|---:|---:|
+| forward varint (`ptr_delta_phi_bench`) | 15 | 1.020 | 1.031 | 1.029 | 9/15 |
+| unchanged backward Sub control | 31 | 0.989 | 0.988 | 0.976 | 14/31 |
+| unchanged backward Add/GEP control | 31 | 0.992 | 0.992 | 1.008 | 16/31 |
+
+The forward result is a **targeted VM screen**, not a statistically stable
+hardware speedup (only 9/15 pairs favored the fold); both backward-control
+whole-TU assembly files were byte-identical between settings, so their timing
+variation cannot represent a pass-generated code change. Fresh GDB/nm found
+the forward fixture's function **360 bytes on / 364 off**, and the real
+SQLite `sqlite3GetVarint` remains **404 on / 409 off**. The cross-target
+runtime tests validate function, not native speed. `objtool` and `pahole`
+were unavailable; optimized SQLite objects still carried no debug-type
+layout. As of the prior exact-code pushed head `5c8ec93`, GitHub PR checks
+were **23 passing, 3 skipped, 0 failing**, including a passing *hosted*
+authenticated ICX 2026.2 integration (not an ICX SQLite run). Check the
+current PR head independently after any later documentation-only commit.
+
+Fresh raw logs, manifests and paired JSON were saved under `target/audit/`
+(for example `sqlite-4gb-{enabled,disabled,clang}/`,
+`sqlite-4gb-paired.json` and `ptr_delta_phi_bench-15.json`); `target/` is
+excluded from Git and may be absent after an environment reset. The SQLite
+Tcl suite, local ICX comparison, native cross-target/PMU performance and full
+local fast-CI remain **not run**.
