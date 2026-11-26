@@ -3862,6 +3862,16 @@ gate "carry-chain-fuzz" fast \
 gate "loop-carried-homes" fast \
     python3 tests/regression/check_loop_carried_homes.py --lccc target/fastbuild/lccc
 
+# A switch dispatched through an absolute table (-fno-pic, the kernel code
+# model, an executable linked by the same invocation) is an edge the
+# peephole's liveness reads: a function that holds one is analysed like any
+# other. The fixture's output in 15 configurations, and each of its
+# functions position-fixed no longer than position-independent less the
+# three instructions a dispatch saves; one function as it was emitted
+# before is the negative control.
+gate "switch-table-liveness" fast \
+    python3 tests/regression/check_switch_table_liveness.py --lccc target/fastbuild/lccc --gcc gcc-16
+
 # Indexed SIB fold with a scratch-homed index (S13): the x86-64 fold decider
 # must accept %rdx/%r11-homed SIB operands. Structural fold assertion on
 # sqlite_put_varint plus a shrunk-corpus gcc differential — the golden-gate

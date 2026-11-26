@@ -3148,6 +3148,18 @@ jobs:
         # leaves its counts alone, the second is no workload of it.) The
         # matchers are tried first on the code that had both defects.
         python3 tests/regression/check_loop_carried_homes.py --lccc target/fastbuild/lccc
+        # A `switch` dispatched through an absolute table (`jmpq
+        # *.Ljt_N(,%reg,8)` over `.quad` entries: the form of -fno-pic, of
+        # the kernel code model and of an executable linked by the same
+        # invocation, so of every benchmark binary) is an edge the
+        # peephole's liveness reads, as the position-independent form is.
+        # Unread, it left every function that holds a table unanalysed: 11
+        # to 19 instructions too many in each function of the fixture.
+        # Held: the fixture's output in 15 configurations, and each of its
+        # functions position-fixed no longer than position-independent
+        # less the three instructions a dispatch saves; the check first
+        # refuses one function as it was emitted before.
+        python3 tests/regression/check_switch_table_liveness.py --lccc target/fastbuild/lccc --gcc gcc-16
         # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
         # only place the audit's site counts are measurable; the ratchet is
         # what stops them growing back.  Runs in ci_local.sh too.
