@@ -3839,7 +3839,8 @@ gate "asm-registers" fast \
 # Multi-word adders as adc/sbb chains (docs/x86-carry-chain.md). The shape
 # gate reads the assembly of carry_chain_adders.c (adc/sbb per function, no
 # setc/bt inside a straight chain, an instruction ceiling, four adc/sbb in
-# a row in the main loop of a limb loop); the fuzz gate compares generated
+# a row in the main loop of a limb loop and no boolean made of its carry);
+# the fuzz gate compares generated
 # adders, and things that only look like adders, with GCC 16.2's programs
 # through seven configurations, and with --limbs generated limb loops
 # through eight, where a floor is held under the share that limb_unroll

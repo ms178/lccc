@@ -104,13 +104,13 @@ static u64 limb(void)
     return (r & 3) ? edges[(r >> 8) % NEDGES] : rng();
 }
 
+/* ---- 1. The header intrinsics, one adder each. ---- */
+
+#if HAVE_HEADER
 /* What a carry in may hold: an `unsigned char` that is not a bit. */
 static const u8 carries[] = {0, 1, 2, 0x80, 0xff};
 #define NCARRIES (sizeof carries / sizeof carries[0])
 
-/* ---- 1. The header intrinsics, one adder each. ---- */
-
-#if HAVE_HEADER
 static NOINLINE u8 hdr_add64(u8 c, u64 a, u64 b, u64 *r)
 {
     return _addcarry_u64(c, a, b, (unsigned long long *)r);
@@ -909,6 +909,50 @@ static NOINLINE u64 lib_bool_sub_n(u64 *r, const u64 *a, const u64 *b, long n)
     return borrow;
 }
 
+/* A counter narrower than the index it becomes: `int i` is widened to
+ * address with, and the test reads it through its truncation. The count
+ * is the low half of `n`, whatever its high half is (`long long`: 64 bits
+ * on every target, so that there is a high half to ignore). */
+static NOINLINE u64 lib_int_add_n(u64 *r, const u64 *a, const u64 *b, long long n)
+{
+    u64 c = 0;
+    for (int i = 0; i < (int)n; i++) {
+        u64 s = a[i] + b[i];
+        u64 t = s + c;
+        c = (s < a[i]) | (t < s);
+        r[i] = t;
+    }
+    return c;
+}
+
+/* The count stepped before it is asked, and read behind the loop, where it
+ * is one step past the end. */
+static NOINLINE u64 lib_while_sub_n(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    u64 borrow = 0;
+    while (n-- > 0) {
+        u64 x = *a++, y = *b++;
+        u64 d = x - y;
+        u64 e = d - borrow;
+        borrow = (x < y) | (d < borrow);
+        *r++ = e;
+    }
+    return borrow + ((u64)n + 1) * 2;
+}
+
+/* The carry in is the top bit of a word. */
+static NOINLINE u64 lib_topbit_add_n(u64 *r, const u64 *a, const u64 *b, long n, u64 p)
+{
+    u64 c = p >> 63;
+    for (long i = 0; i < n; i++) {
+        u64 s = a[i] + b[i];
+        u64 t = s + c;
+        c = (s < a[i]) | (t < s);
+        r[i] = t;
+    }
+    return c;
+}
+
 /* Not adders: the carries of three words a trip are counted (0, 1 or 2),
  * and the count is what goes round. */
 static NOINLINE u64 lib_count_n(u64 *r, const u64 *a, const u64 *b, const u64 *w, long n)
@@ -1414,6 +1458,20 @@ static void libraries(const u64 *a, const u64 *b)
         expect_limbs("lib_ovf_add_n", r, want, LIMBS);
         expect("lib_bool_add_n carry", lib_bool_add_n(r, a, b, n), want_c);
         expect_limbs("lib_bool_add_n", r, want, LIMBS);
+        expect("lib_int_add_n carry", lib_int_add_n(r, a, b, n), want_c);
+        expect_limbs("lib_int_add_n", r, want, LIMBS);
+        expect("lib_int_add_n carry, high half", lib_int_add_n(r, a, b, (long long)n | (5LL << 32)), want_c);
+        expect_limbs("lib_int_add_n, high half", r, want, LIMBS);
+        expect("lib_int_add_n, none", lib_int_add_n(r, a, b, -(long long)n - 1), 0);
+        expect_limbs("lib_int_add_n, none", r, want, LIMBS);
+        for (unsigned in = 0; in < 2; in++) {
+            /* Last with no carry in: `want` is what the loops below go on from. */
+            unsigned first = !in;
+            want_c = ref_addn(want, a, b, n, first);
+            expect("lib_topbit_add_n carry", lib_topbit_add_n(r, a, b, n, ((u64)first << 63) | (0x7ffull + in)),
+                   want_c);
+            expect_limbs("lib_topbit_add_n", r, want, LIMBS);
+        }
 #if HAVE_INT128
         expect("lib_i128_add_n carry", lib_i128_add_n(r, a, b, n), want_c);
         expect_limbs("lib_i128_add_n", r, want, LIMBS);
@@ -1432,6 +1490,10 @@ static void libraries(const u64 *a, const u64 *b)
         expect_limbs("lib_ovf_sub_n", r, want, LIMBS);
         expect("lib_bool_sub_n borrow", lib_bool_sub_n(r, a, b, n), want_c);
         expect_limbs("lib_bool_sub_n", r, want, LIMBS);
+        expect("lib_while_sub_n borrow", lib_while_sub_n(r, a, b, n), want_c);
+        expect_limbs("lib_while_sub_n", r, want, LIMBS);
+        expect("lib_while_sub_n, none", lib_while_sub_n(r, a, b, -(long)n - 1), -2 * ((u64)n + 1));
+        expect_limbs("lib_while_sub_n, none", r, want, LIMBS);
 #if HAVE_INT128
         expect("lib_i128_sub_n borrow", lib_i128_sub_n(r, a, b, n), want_c);
         expect_limbs("lib_i128_sub_n", r, want, LIMBS);

@@ -75,8 +75,9 @@ allowed to be written in between, seeds 10 and 16 do. A change to the
 generator changes what a seed is; choose the window again then. The limb
 loops are drawn from a stream of their own (the programs without them are
 what they were before there were any), and their window is seeds 9 to 16
-too: 26 of its 64 loops are split, in each of the ten spellings of a loop
-that the pass takes.
+too: 31 of its 64 loops are split, in ten of the eleven spellings of a loop
+that the pass takes (the eleventh, `while (n-- > 0)`, has its split loop in
+`carry_chain_adders.c`, where the shape gate holds it).
 """
 
 from __future__ import annotations
@@ -143,12 +144,12 @@ ADDERS = (0, 1, 2, 4, 5, 6, 7)
 # How many of the 64 limb loops of the run in CI (`--limbs`, seeds
 # `LIMBS_FROM` and the seven behind it) `limb_unroll` splits at the least:
 # what it splits today (`--limbs --census` says which; of the 640 loops of
-# seeds 1 to 80 it is 235). The others are loops it has to leave alone (a
+# seeds 1 to 80 it is 303). The others are loops it has to leave alone (a
 # call or a sum in the trip, a carry that is edited, a spelling that is no
 # adder, a count that is known and small) and loops it does not take yet
 # (`docs/x86-carry-chain.md` lists them). The number goes up with the pass
 # and never down. Other windows are counted and not judged.
-MUST_SPLIT = 26
+MUST_SPLIT = 31
 
 
 class Program:

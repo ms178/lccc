@@ -3125,8 +3125,10 @@ jobs:
         # the assembly of carry_chain_adders.c, function by function -- how
         # many adc/sbb, no setc/bt inside a straight chain, no more
         # instructions than today, and four adc/sbb in a row in the main
-        # loop of every limb loop. With the carry pass off the pins must
-        # break, and with limb_unroll off the fours.
+        # loop of every limb loop, which makes no boolean of its carry
+        # (no setc, no bt: the count is a dec). With the carry pass off
+        # the pins must break, with limb_unroll off the fours, and with
+        # the carry_loop peephole off the boolean must be back.
         python3 tests/regression/check_carry_chain_shape.py --lccc target/fastbuild/lccc
         # Random limb loops, which limb_unroll splits into four limbs a
         # trip and a remainder: eight generated programs of eight loops
@@ -3135,7 +3137,7 @@ jobs:
         # in the trip), each through eight configurations (the seven of
         # the adders below, and the split off), every one printing what
         # GCC 16.2's program prints. One planted wrong carry is the
-        # negative control, and at least 26 of the 64 loops have to be
+        # negative control, and at least 31 of the 64 loops have to be
         # split.
         python3 tests/regression/check_carry_chain_fuzz.py --limbs --lccc target/fastbuild/lccc --gcc gcc-16
         # What a loop carries from one iteration to the next has a
