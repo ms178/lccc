@@ -115,6 +115,33 @@ compatibility wrapper
 delegates to the canonical runner — it deliberately does not maintain a
 second, smaller benchmark list that could drift out of sync.
 
+**One report, one host.** The hosted pool hands the lane a different CPU
+model from run to run, and a kernel's LCCC/GCC ratio belongs to that CPU as
+much as to the two compilers. `zlib_ng_huffman_heap` is the extreme case: its
+sift loop branches on the data. Where those branches are mispredicted both
+compilers pay the same penalty; where the predictor learns the sixteen
+histograms the instruction count is what is left, and LCCC executes about
+half as many instructions again as GCC in that loop. Read back from the job
+logs of 2026-11-21 to 2026-11-26, by the GCC median, which does not depend on
+LCCC and so names the host:
+
+| GCC median | LCCC/GCC without PR #1211 | LCCC/GCC with PR #1211 |
+| ---: | --- | --- |
+| 144.4 to 145.5 ms | 1.169 to 1.180 (seven runs) | no run |
+| 127.4 to 129.3 ms | 1.127 to 1.138 (four runs) | 1.128, 1.137, 1.140 |
+| 44.8 ms (AMD EPYC 9V74) | 1.578 (one run) | 1.563, 1.567 |
+| 29.7 ms | no run | 1.814 |
+
+One machine shows the same thing. With one histogram instead of sixteen an
+Ice Lake Xeon learns the branches too, and LCCC then reads 1.75 to 1.79
+against GCC where the benchmark itself reads 1.02 (108.9 M instructions for
+GCC's 73.2 M with one histogram; 16.4 M for 13.5 M with sixteen at
+`-DPASSES=8`). So set a report only beside one from the same CPU model: the
+Markdown summary, the terminal table in the job log and the ratio annotation
+of `ci_bench_ratios.py` each name it. The codegen gate's counts over the
+emitted assembly and an instruction count under cachegrind do not depend on
+the host.
+
 **PGO A/B.** For profile-guided work there is a dedicated harness,
 [`tests/benchmark/run_pgo_ab.py`](../tests/benchmark/run_pgo_ab.py).  For each
 kernel and compiler it builds both a plain binary and a

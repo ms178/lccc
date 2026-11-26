@@ -67,8 +67,22 @@ def collect(report: dict) -> tuple[list[tuple[float, str, int, list[str]]], dict
     return rows, aggregate
 
 
-def render(rows: list[tuple[float, str, int, list[str]]], aggregate: dict, top: int) -> str:
-    lines = ["LCCC/GCC paired median wall-clock ratios (<1 = LCCC faster)"]
+def host_of(report: dict) -> str:
+    """The CPU model(s) the shard ran on, as the runner recorded them.
+
+    A ratio is a property of the host as much as of the compiler: the same
+    binary pair reads 1.13 on one hosted CPU model and 1.56 on another for
+    `zlib_ng_huffman_heap`. A table without its host invites a comparison
+    between two runs that measured two machines.
+    """
+    models = (report.get("metadata") or {}).get("cpu_models") or []
+    return "; ".join(str(model) for model in models) or "unknown"
+
+
+def render(rows: list[tuple[float, str, int, list[str]]], aggregate: dict, top: int,
+           host: str = "unknown") -> str:
+    lines = ["LCCC/GCC paired median wall-clock ratios (<1 = LCCC faster)",
+             f"host {host} (compare only with a run on the same CPU model)"]
     if not rows:
         lines.append("no benchmark carries a paired ratio (both sides must be correct to have one)")
         return "\n".join(lines)
@@ -130,7 +144,7 @@ def main() -> int:
         return 0
 
     rows, aggregate = collect(report)
-    table = render(rows, aggregate, args.top)
+    table = render(rows, aggregate, args.top, host_of(report))
     print(table)
     if annotate:
         print(f"::warning title=bench-ratios::{gha_escape(table)}")

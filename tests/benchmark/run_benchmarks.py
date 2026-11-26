@@ -1108,6 +1108,30 @@ def format_ratio(value: float | None) -> str:
     return f"{value:.3f} ({value:.2f}× slower)"
 
 
+# What a reader must know before setting two reports side by side.  The lane
+# runs on whatever CPU the hosted pool hands out, and one kernel's LCCC/GCC
+# ratio differs by more between two CPU models than any change under review
+# moves it: `zlib_ng_huffman_heap` read 1.13 to 1.18 on two models and 1.56
+# to 1.58 on a third within one day, for the same compiler (its branches are
+# hard to predict on the first two and learned on the third, where only the
+# instruction count is left).  The reference compiler's own median does not
+# depend on LCCC at all, so it tells which host a report came from.
+COMPARABILITY_NOTE = ("Wall-clock ratios belong to the CPU they were measured on: compare this report only "
+                      "with one from the same CPU model (a kernel's GCC median does not depend on LCCC and "
+                      "identifies the host).")
+
+
+def measurement_hosts(report: dict[str, Any]) -> list[str]:
+    """The CPU model(s) behind the report: one entry per shard, else one."""
+    def models(metadata: dict[str, Any]) -> str:
+        return "; ".join(metadata.get("cpu_models") or []) or "unknown"
+
+    shards = report.get("shards") or []
+    if shards:
+        return [f"{shard.get('report', 'unknown')}: {models(shard.get('metadata') or {})}" for shard in shards]
+    return [models(report.get("metadata") or {})]
+
+
 def render_terminal(report: dict[str, Any]) -> str:
     lines: list[str] = []
     metadata = report["metadata"]
@@ -1118,10 +1142,14 @@ def render_terminal(report: dict[str, Any]) -> str:
     lines.append("LCCC generated-code benchmark report")
     lines.append(f"Measurement class: {measurement_class}; PMU: {metadata['pmu']['reason']}")
     lines.append(f"Pinning: {metadata['pinning']}; rounds: {report['settings']['reps']}; warm-ups: {report['settings']['warmup']}")
+    # The job log is the one place this report can be read back from through
+    # the API, so it names the host as the Markdown summary does.
+    lines.append("CPU model(s): " + " | ".join(measurement_hosts(report)))
     if report["settings"]["skip_perf"]:
         lines.append("Correctness-only mode: no performance statistic is emitted.")
     else:
         lines.append("Primary statistic is paired median wall time.  All samples are retained; min is diagnostic only.")
+        lines.append(COMPARABILITY_NOTE)
     lines.append("=" * 108)
     lines.append(f"{'Benchmark':<22} {'LCCC median':>14} {'GCC median':>14} {'LCCC/GCC paired':>29} {'Correct':>10}")
     lines.append("-" * 108)
@@ -1209,6 +1237,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"- **UTC:** `{metadata['timestamp_utc']}`",
         f"- **CPU model(s):** `{'; '.join(metadata['cpu_models']) or 'unknown'}`",
+        *([] if report["settings"]["skip_perf"] else [f"- **Comparability:** {COMPARABILITY_NOTE}"]),
         f"- **Hypervisor detected:** `{metadata['hypervisor_detected']}`",
         f"- **CPU pinning:** `{metadata['pinning']}`",
         f"- **PMU:** `{metadata['pmu']['reason']}`",
