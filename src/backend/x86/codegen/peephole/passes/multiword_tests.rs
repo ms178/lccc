@@ -2061,10 +2061,8 @@ fn a_carry_stays_in_the_flag_round_a_limb_loop() {
         } else {
             "decq %r11"
         };
-        assert!(
-            out.contains(&format!("{dec}\njne .LBB7\nmovl $0, %r8d\nsetc %r8b")),
-            "{out}"
-        );
+        let made = format!("{dec}\njne .LBB7\nmovl $0, %r8d\nsetc %r8b");
+        assert!(out.contains(&made), "{out}");
         assert!(
             !out.contains("test") && !out.contains("sub") && !out.contains("add"),
             "{out}"

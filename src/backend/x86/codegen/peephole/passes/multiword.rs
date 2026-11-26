@@ -1122,7 +1122,7 @@ fn carry_kept_round(
             || may_write(&info, t, fam)
     };
     let zero = (adder + 1..set).rev().find(|&n| names(n, out))?;
-    if text(zero) != format!("movl $0, {}", Width::L.name(out)) {
+    if text(zero).strip_prefix("movl $0, ") != Some(Width::L.name(out)) {
         return None;
     }
     // The two registers are the carry's alone: no other line of the loop
