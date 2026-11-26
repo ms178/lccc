@@ -4092,6 +4092,25 @@ impl Driver {
         crate::passes::verify::verify_after_pass(module, "phi_relay_fold");
     }
 
+    /// Rewrite proven byte pointer differences while their phi arms are still
+    /// SSA values. The late relay fold exposes direct constant-offset arms;
+    /// after phi elimination the proof would be scattered among edge copies.
+    /// Keep this stage next to the relay fold and out of backend orchestration.
+    fn fold_pointer_deltas(&self, module: &mut crate::ir::module::IrModule) {
+        if self.opt_level < 2
+            || crate::passes::pass_disabled(
+                std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
+                "ptr_delta_phi",
+            )
+        {
+            return;
+        }
+        let changed = module.for_each_function(crate::passes::ptr_delta_phi::run);
+        if changed != 0 {
+            crate::passes::verify::verify_after_pass(module, "ptr_delta_phi");
+        }
+    }
+
     /// x86/i686: place each `BitTest` next to a `BitSet`/`BitClear`/
     /// `BitToggle` of the same bit so instruction selection can share the
     /// modify's CF (`btr; setc` / `btr; jnc`).  Last IR edit before phi
@@ -4239,6 +4258,7 @@ impl Driver {
         }
 
         self.fold_phi_relays(&mut module);
+        self.fold_pointer_deltas(&mut module);
         self.schedule_bit_test_modify_pairs(&mut module);
 
         // Lower SSA phi nodes to copies before codegen

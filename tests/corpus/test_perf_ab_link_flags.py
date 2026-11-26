@@ -1,7 +1,12 @@
 """A/B library flags must be symmetric, explicit and reproducible."""
+import argparse
+import contextlib
 import importlib.util
+import io
+import json
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -67,6 +72,37 @@ class LinkFlagContract(unittest.TestCase):
                 ok, _ = perf.build_binary(cc, Path("test.c"), "test.bin", {}, ["-O2"])
                 self.assertTrue(ok)
                 self.assertEqual(run.call_args.args[0], [cc, "-O2", "test.c", "-o", "test.bin"])
+
+    def test_runtime_sample_retains_stderr_for_the_gate(self):
+        with patch.object(perf.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, b"same output\n", b"warning\n")
+            elapsed, rc, out, err = perf.run_once("/fake/program")
+        self.assertGreaterEqual(elapsed, 0)
+        self.assertEqual((rc, out, err), (0, b"same output\n", b"warning\n"))
+
+    def test_matching_stdout_does_not_excuse_runtime_stderr(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "stderr_case.c"
+            source.write_text("int main(void) { return 0; }\n")
+            report = Path(td) / "paired.json"
+            args = argparse.Namespace(
+                list_presets=False, compiler_a="lccc", compiler_b=None,
+                env=["CCC_NO_FAKE=1"], skip=None, preset=None, opt="-O2",
+                cflag=[], only="stderr_case", extra=[source], metric="runtime",
+                reps=1, json_out=str(report), md_out=None,
+                floor_margin=1.5, min_delta=1.0,
+            )
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.object(perf, "parse_args", return_value=args), \
+                 patch.object(perf, "build_binary", return_value=(True, "")), \
+                 patch.object(perf, "measure_floor", return_value=0.1), \
+                 patch.object(perf, "run_once", return_value=(20.0, 0, b"same\n", b"warning\n")), \
+                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = perf.main()
+            self.assertEqual(rc, 1)
+            self.assertIn("wrote runtime stderr", stderr.getvalue())
+            self.assertEqual(json.loads(report.read_text())["failures"],
+                             ["stderr_case: A wrote runtime stderr (b'warning\\n')"])
 
 
 if __name__ == "__main__":

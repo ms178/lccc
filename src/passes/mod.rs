@@ -88,6 +88,9 @@ pub(crate) mod narrow;
 pub(crate) mod outline_switch;
 mod pair_load_carry;
 pub(crate) mod phi_relay_fold;
+pub(crate) mod ptr_delta_phi;
+#[cfg(test)]
+mod ptr_delta_phi_tests;
 pub(crate) mod ptr_iv_collapse;
 pub(crate) mod quadratic_sr;
 pub(crate) mod range_check;
