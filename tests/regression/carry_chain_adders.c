@@ -1732,6 +1732,298 @@ static void libraries(const u64 *a, const u64 *b)
     }
 }
 
+/* ---- 10. Limb loops that read what a split must keep in order. ----
+ *
+ * `limb_unroll` makes four copies of a trip. These read what the copies
+ * must not move: the store of the trip before, the carry and the sum of the
+ * last trip, the counter behind the loop. The second half is loops it must
+ * leave whole, because a trip reads its own index or can leave early. */
+
+/* The sum of one limb is the addend of the next: a trip reads the store of
+ * the trip before it. `a` has n + 1 limbs. */
+static NOINLINE u64 atk_alias_next(u64 *a, const u64 *b, long n)
+{
+    u64 c = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned long long s, t;
+        u64 c1 = __builtin_add_overflow((unsigned long long)a[i], (unsigned long long)b[i], &s);
+        u64 c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+        a[i + 1] = t;
+        c = c1 | c2;
+    }
+    return c;
+}
+
+/* In place, the limb its own addend: one load feeds both operands. */
+static NOINLINE u64 atk_double(u64 *a, long n)
+{
+    u64 c = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned long long s, t;
+        u64 c1 = __builtin_add_overflow((unsigned long long)a[i], (unsigned long long)a[i], &s);
+        u64 c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+        a[i] = t;
+        c = c1 | c2;
+    }
+    return c;
+}
+
+/* The carry that went into the last limb is read behind the loop. */
+static NOINLINE u64 atk_prev_carry(u64 *r, const u64 *a, const u64 *b, long n, u64 *prev)
+{
+    u64 c = 0, p = 77;
+    for (long i = 0; i < n; i++) {
+        unsigned long long s, t;
+        u64 c1, c2;
+        p = c;
+        c1 = __builtin_add_overflow((unsigned long long)a[i], (unsigned long long)b[i], &s);
+        c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+        r[i] = t;
+        c = c1 | c2;
+    }
+    *prev = p;
+    return c;
+}
+
+/* The last sum is read behind the loop. */
+static NOINLINE u64 atk_last_sum(u64 *r, const u64 *a, const u64 *b, long n, u64 *last)
+{
+    u64 c = 0;
+    unsigned long long t = 0x1234;
+    for (long i = 0; i < n; i++) {
+        unsigned long long s;
+        u64 c1 = __builtin_add_overflow((unsigned long long)a[i], (unsigned long long)b[i], &s);
+        u64 c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+        r[i] = t;
+        c = c1 | c2;
+    }
+    *last = t;
+    return c;
+}
+
+/* The counter is read behind the loop. */
+static NOINLINE u64 atk_counter_after(u64 *r, const u64 *a, const u64 *b, long n, long *count)
+{
+    u64 c = 0;
+    long i;
+    for (i = 0; i < n; i++) {
+        unsigned long long s, t;
+        u64 c1 = __builtin_add_overflow((unsigned long long)a[i], (unsigned long long)b[i], &s);
+        u64 c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+        r[i] = t;
+        c = c1 | c2;
+    }
+    *count = i * 3 + 1;
+    return c;
+}
+
+/* The test at the bottom and the step in front of the limb, which is
+ * addressed from the stepped counter. */
+static NOINLINE u64 atk_step_first(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    u64 c = 0;
+    long i = 0;
+    if (n <= 0)
+        return 0;
+    do {
+        unsigned long long s, t;
+        u64 c1, c2;
+        i++;
+        c1 = __builtin_add_overflow((unsigned long long)a[i - 1], (unsigned long long)b[i - 1], &s);
+        c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+        r[i - 1] = t;
+        c = c1 | c2;
+    } while (i < n);
+    return c;
+}
+
+/* From the top limb down: the carry goes the way the counter goes. */
+static NOINLINE u64 atk_downward(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    u64 c = 0;
+    for (long i = n - 1; i >= 0; i--) {
+        unsigned long long s, t;
+        u64 c1 = __builtin_add_overflow((unsigned long long)a[i], (unsigned long long)b[i], &s);
+        u64 c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+        r[i] = t;
+        c = c1 | c2;
+    }
+    return c;
+}
+
+/* The index is a value of the trip, not only an address. */
+static NOINLINE u64 atk_index_value(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    u64 c = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned long long s, t;
+        u64 c1 = __builtin_add_overflow((unsigned long long)a[i], (unsigned long long)b[i], &s);
+        u64 c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+        r[i] = t + (u64)i;
+        c = c1 | c2;
+    }
+    return c;
+}
+
+/* The index is stored where a sum is zero. */
+static NOINLINE u64 atk_index_stored(u64 *r, const u64 *a, const u64 *b, long n, long *where)
+{
+    u64 c = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned long long s, t;
+        u64 c1 = __builtin_add_overflow((unsigned long long)a[i], (unsigned long long)b[i], &s);
+        u64 c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+        r[i] = t;
+        c = c1 | c2;
+        if (t == 0)
+            *where = i;
+    }
+    return c;
+}
+
+/* A zero limb ends the loop early. */
+static NOINLINE u64 atk_early_exit(u64 *r, const u64 *a, const u64 *b, long n, long *at)
+{
+    u64 c = 0;
+    long i;
+    for (i = 0; i < n; i++) {
+        unsigned long long s, t;
+        u64 c1, c2;
+        if (a[i] == 0)
+            break;
+        c1 = __builtin_add_overflow((unsigned long long)a[i], (unsigned long long)b[i], &s);
+        c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+        r[i] = t;
+        c = c1 | c2;
+    }
+    *at = i;
+    return c;
+}
+
+/* A second value goes round beside the carry, and it reads the index. */
+static NOINLINE u64 atk_second_recurrence(u64 *r, const u64 *a, const u64 *b, long n, u64 *out)
+{
+    u64 c = 0, acc = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned long long s, t;
+        u64 c1 = __builtin_add_overflow((unsigned long long)a[i], (unsigned long long)b[i], &s);
+        u64 c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+        r[i] = t;
+        c = c1 | c2;
+        acc = (acc << 1 | acc >> 63) ^ t ^ (u64)i;
+    }
+    *out = acc;
+    return c;
+}
+
+static void reset_limbs(u64 *r, u64 *want)
+{
+    for (int i = 0; i <= LIMBS; i++)
+        r[i] = want[i] = 0xa5a5a5a5a5a5a5a5ull + (u64)i;
+}
+
+/* The loops of section 10, at every length. */
+static void attacks(const u64 *a, const u64 *b)
+{
+    u64 r[LIMBS + 1], want[LIMBS + 1];
+    for (int n = 0; n <= LIMBS; n++) {
+        unsigned c, k;
+
+        reset_limbs(r, want);
+        c = ref_addn(want, a, b, n, 0);
+        {
+            u64 prev = 5, want_prev = 77;
+            k = 0;
+            for (int i = 0; i < n; i++) {
+                want_prev = k;
+                (void)ref_add64(a[i], b[i], k, &k);
+            }
+            expect("atk_prev_carry carry", atk_prev_carry(r, a, b, n, &prev), c);
+            expect("atk_prev_carry, into the last limb", prev, want_prev);
+            expect_limbs("atk_prev_carry", r, want, LIMBS + 1);
+        }
+        {
+            u64 last = 5;
+            expect("atk_last_sum carry", atk_last_sum(r, a, b, n, &last), c);
+            expect("atk_last_sum, the last sum", last, n ? want[n - 1] : 0x1234);
+            expect_limbs("atk_last_sum", r, want, LIMBS + 1);
+        }
+        {
+            long count = -1;
+            expect("atk_counter_after carry", atk_counter_after(r, a, b, n, &count), c);
+            expect("atk_counter_after, the counter", (u64)count, (u64)n * 3 + 1);
+            expect_limbs("atk_counter_after", r, want, LIMBS + 1);
+        }
+        expect("atk_step_first carry", atk_step_first(r, a, b, n), c);
+        expect_limbs("atk_step_first", r, want, LIMBS + 1);
+        expect("atk_step_first, none", atk_step_first(r, a, b, -(long)n), 0);
+        expect_limbs("atk_step_first, none", r, want, LIMBS + 1);
+        {
+            long where = -5, want_where = -5;
+            for (int i = 0; i < n; i++)
+                if (want[i] == 0)
+                    want_where = i;
+            expect("atk_index_stored carry", atk_index_stored(r, a, b, n, &where), c);
+            expect("atk_index_stored, the index", (u64)where, (u64)want_where);
+            expect_limbs("atk_index_stored", r, want, LIMBS + 1);
+        }
+        {
+            u64 acc = 5, want_acc = 0;
+            for (int i = 0; i < n; i++)
+                want_acc = (want_acc << 1 | want_acc >> 63) ^ want[i] ^ (u64)i;
+            expect("atk_second_recurrence carry", atk_second_recurrence(r, a, b, n, &acc), c);
+            expect("atk_second_recurrence, the other value", acc, want_acc);
+            expect_limbs("atk_second_recurrence", r, want, LIMBS + 1);
+        }
+        for (int i = 0; i < n; i++)
+            want[i] += (u64)i;
+        expect("atk_index_value carry", atk_index_value(r, a, b, n), c);
+        expect_limbs("atk_index_value", r, want, LIMBS + 1);
+
+        reset_limbs(r, want);
+        k = 0;
+        for (int i = n - 1; i >= 0; i--)
+            want[i] = ref_add64(a[i], b[i], k, &k);
+        expect("atk_downward carry", atk_downward(r, a, b, n), k);
+        expect_limbs("atk_downward", r, want, LIMBS + 1);
+
+        {
+            long at = -1, want_at = n;
+            reset_limbs(r, want);
+            k = 0;
+            for (int i = 0; i < n; i++) {
+                if (a[i] == 0) {
+                    want_at = i;
+                    break;
+                }
+                want[i] = ref_add64(a[i], b[i], k, &k);
+            }
+            expect("atk_early_exit carry", atk_early_exit(r, a, b, n, &at), k);
+            expect("atk_early_exit, where", (u64)at, (u64)want_at);
+            expect_limbs("atk_early_exit", r, want, LIMBS + 1);
+        }
+        {
+            /* Each limb is the sum of the one below and `b`. */
+            for (int i = 0; i <= LIMBS; i++)
+                r[i] = want[i] = i < LIMBS ? a[i] : 0x0123456789abcdefull;
+            k = 0;
+            for (int i = 0; i < n; i++)
+                want[i + 1] = ref_add64(want[i], b[i], k, &k);
+            expect("atk_alias_next carry", atk_alias_next(r, b, n), k);
+            expect_limbs("atk_alias_next", r, want, LIMBS + 1);
+        }
+        {
+            for (int i = 0; i <= LIMBS; i++)
+                r[i] = want[i] = i < LIMBS ? a[i] : 0x0123456789abcdefull;
+            k = 0;
+            for (int i = 0; i < n; i++)
+                want[i] = ref_add64(want[i], want[i], k, &k);
+            expect("atk_double carry", atk_double(r, n), k);
+            expect_limbs("atk_double", r, want, LIMBS + 1);
+        }
+    }
+}
+
 static void chains(void)
 {
     u64 a[LIMBS], b[LIMBS], r[LIMBS], want[LIMBS];
@@ -1751,6 +2043,7 @@ static void chains(void)
     }
     libraries(a, b);
     double_words(a, b);
+    attacks(a, b);
     {
         u32 a32[LIMBS], b32[LIMBS], r32[LIMBS], want32[LIMBS];
         for (int n = 0; n <= LIMBS; n++) {

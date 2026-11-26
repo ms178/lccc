@@ -51,7 +51,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 FIXTURE = ROOT / "tests/regression/carry_chain_adders.c"
-PREFIXES = ("hdr_", "bi_", "cmp_", "lib_", "two_")
+PREFIXES = ("hdr_", "bi_", "cmp_", "lib_", "two_", "atk_")
 
 # function: (adc + sbb, carry traffic inside the chain, instruction ceiling)
 SHAPES: dict[str, tuple[int, int, int]] = {
@@ -157,6 +157,23 @@ SHAPES: dict[str, tuple[int, int, int]] = {
     "two_stored_over_addend": (1, 0, 7),
     "two_stored_over_minuend": (1, 0, 8),
     "two_sum_in_place": (0, 0, 6),
+    # Section 10. Split: a trip that reads the store of the trip before it
+    # (the sum stays in a register from one limb to the next), the carry
+    # into the last limb and the last sum read behind the loop, the counter
+    # read behind it, the step in front of the limb, the top limb first.
+    "atk_alias_next": (5, 2, 61),
+    "atk_double": (5, 2, 47),
+    "atk_prev_carry": (5, 3, 67),
+    "atk_last_sum": (5, 2, 57),
+    "atk_counter_after": (5, 2, 54),
+    "atk_step_first": (5, 2, 58),
+    "atk_downward": (5, 2, 45),
+    # Left whole, one link a trip: the index is a value of the trip, the
+    # loop can leave early, a second value goes round that reads the index.
+    "atk_index_value": (1, 0, 17),
+    "atk_index_stored": (1, 0, 21),
+    "atk_early_exit": (1, 0, 25),
+    "atk_second_recurrence": (1, 0, 26),
 }
 # How many of them the pass is responsible for, at the least.
 MUST_BREAK = 50
@@ -197,6 +214,17 @@ FOUR_A_TRIP = (
     "lib_guarded_i128_sub_n",
     "lib_blst_add_n",
     "lib_blst_sub_n",
+    # Section 10, the loops whose four copies read nothing a trip writes:
+    # one load for both operands, the last sum and the counter read behind
+    # the loop, the step in front of the limb, the top limb first.
+    # `atk_alias_next` and `atk_prev_carry` are split too and are not here:
+    # the first keeps its sum in a register and counts with `sub`, the
+    # second needs the carry into the last limb as a number.
+    "atk_double",
+    "atk_last_sum",
+    "atk_counter_after",
+    "atk_step_first",
+    "atk_downward",
 )
 LINKS_A_TRIP = 4
 
