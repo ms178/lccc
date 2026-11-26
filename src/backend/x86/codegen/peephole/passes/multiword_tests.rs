@@ -1583,6 +1583,110 @@ fn a_second_destination_between_the_lines_is_a_write() {
     folded(&chain("", "    xchg %rbx, %r11\n"), &["%rcx", "%r10"]);
 }
 
+// ── A carry copied into another register ─────────────────────────────────
+
+/// Two links of a chain whose carry out was made in `%rax` and moved to a
+/// register of its own (`copy`), which the second link tests (`test`);
+/// `between` stands between the copy and the test, and `behind` behind the
+/// second link.
+fn copied(first: &str, then: &str, copy: &str, between: &str, test: &str, behind: &str) -> String {
+    format!(
+        "    movq (%rdi), %r15\n    {first} 8(%rdi), %r15\n    setc %cl\n    movzbl %cl, %eax\n    \
+         {copy}\n    movq %r15, 16(%rdi)\n{between}    movq 24(%rdi), %rax\n    {test}\n    \
+         {then} 32(%rdi), %rax\n    movq %rax, 40(%rdi)\n{behind}    ret"
+    )
+}
+
+/// The copy's register is written again behind the chain, unread.
+const COPY_DIES: &str = "    leaq 48(%rdi), %rbp\n    movq %rbp, 56(%rdi)\n";
+/// It is read behind the chain.
+const COPY_IS_READ: &str = "    movq %rbp, 56(%rdi)\n";
+
+#[test]
+fn a_carry_copied_into_another_register_is_not_put_back() {
+    let between = [
+        "",
+        "    movq 64(%rdi), %r8\n",
+        "    movq %r9, 72(%rdi)\n    movl %r9d, 80(%rdi)\n",
+    ];
+    for (first, then) in [("addq", "adcq"), ("subq", "sbbq")] {
+        for (copy, test) in [
+            ("movq %rax, %rbp", "btl $0, %ebp"),
+            ("movl %eax, %ebp", "btl $0, %ebp"),
+            ("movq %rax, %rbp", "btq $0, %rbp"),
+        ] {
+            for between in between {
+                // Nothing reads the copy but the test: the test, the copy
+                // and the boolean all go, and the chain is the two links.
+                let body = copied(first, then, copy, between, test, COPY_DIES);
+                let out = folded(&body, &["%rcx"]);
+                let gone = ["setc %cl", "movzbl %cl, %eax", copy, test];
+                let expected: Vec<&str> = lines(&body)
+                    .into_iter()
+                    .filter(|line| !gone.contains(line))
+                    .collect();
+                assert_eq!(lines(&out), expected, "{body}");
+                // The copy is read again: the test alone goes.
+                let body = copied(first, then, copy, between, test, COPY_IS_READ);
+                let out = folded(&body, &[]);
+                let expected: Vec<&str> = lines(&body)
+                    .into_iter()
+                    .filter(|line| *line != test)
+                    .collect();
+                assert_eq!(lines(&out), expected, "{body}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_copied_carry_that_may_have_changed_is_tested() {
+    let chain = |copy: &str, between: &str| {
+        copied("addq", "adcq", copy, between, "btl $0, %ebp", COPY_DIES)
+    };
+    folded(&chain("movq %rax, %rbp", ""), &["%rcx"]);
+    for between in [
+        // A flag written between the copy and the test.
+        "    addq $1, %r11\n",
+        "    cmpq %r11, %rdi\n",
+        // The copy written again, in whole or in its low byte.
+        "    movq %r11, %rbp\n",
+        "    movb %r11b, %bpl\n",
+        // Another path, a call, and a branch out (which writes no flag
+        // and is the end of a straight line all the same).
+        ".Ljoin:\n",
+        "    call helper\n",
+        "    jne .Lelsewhere\n",
+    ] {
+        unchanged(&chain("movq %rax, %rbp", between));
+    }
+    for copy in [
+        // Not a copy of the boolean: of another register, of the boolean
+        // written again, of a byte or of two (no move of a word or of
+        // half a word).
+        "movq %r11, %rbp",
+        "movq %r11, %rax\n    movq %rax, %rbp",
+        "movb %al, %bpl",
+        "movw %ax, %bp",
+        // A sign extension, a load and an `lea` are no copy either.
+        "movslq %eax, %rbp",
+        "movq (%rax), %rbp",
+        "leaq (%rax), %rbp",
+    ] {
+        unchanged(&chain(copy, ""));
+    }
+    // A flag written between the extension and the copy.
+    unchanged(
+        "    addq %rsi, %rdx\n    setc %cl\n    movzbl %cl, %eax\n    addq $1, %r11\n    \
+         movq %rax, %rbp\n    btl $0, %ebp\n    adcq %r9, %r8\n    ret",
+    );
+    // Not the carry.
+    unchanged(
+        "    addq %rsi, %rdx\n    setnc %cl\n    movzbl %cl, %eax\n    movq %rax, %rbp\n    \
+         btl $0, %ebp\n    adcq %r9, %r8\n    ret",
+    );
+}
+
 // ── A carry parked in the frame ──────────────────────────────────────────
 
 /// Two links of a chain whose carry found no register: the first parks

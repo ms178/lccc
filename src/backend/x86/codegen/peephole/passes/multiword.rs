@@ -628,6 +628,10 @@ fn parked_in(
 /// `setc`, extension and store stay for [`drop_unread_carries`], behind
 /// the pass that knows which slots are read; the chain no longer waits
 /// for them.
+///
+/// And where it was copied into another register in between (`movq %rax,
+/// %rbp` ... `btl $0, %ebp`: [`copied_in`]).  The copy goes with the `bt`
+/// if nothing else reads its register, and the boolean then as above.
 pub(super) fn forward_carry_flag(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let mut liveness = None;
@@ -641,18 +645,27 @@ pub(super) fn forward_carry_flag(store: &mut LineStore, infos: &mut [LineInfo]) 
         if immediate(bit) != Some(0) {
             continue;
         }
-        // Where the bit was last in a register: at the `bt` itself, or at
-        // the line that parked it in the slot the `bt` reads.
+        // Where the bit was last in the register its `setc` was extended
+        // into: at the `bt` itself, at the line that copied it into the
+        // register the `bt` reads, or at the line that parked it in the
+        // slot the `bt` reads.
         let slot = direct_stack_slot(tested);
-        let (from, reg) = match (width.register(tested), slot) {
-            (Some(reg), _) => (b, reg),
-            (None, Some(slot)) => match parked_in(store, infos, b, slot) {
-                Some(parked) => parked,
-                None => continue,
-            },
-            (None, None) => continue,
+        let mut copy = None;
+        let found = match (width.register(tested), slot) {
+            (Some(reg), _) => carry_still_in_flag(store, infos, b, reg)
+                .map(|pair| (b, reg, pair))
+                .or_else(|| {
+                    let (at, source) = copied_in(store, infos, b, reg)?;
+                    let pair = carry_still_in_flag(store, infos, at, source)?;
+                    copy = Some((at, reg));
+                    Some((at, source, pair))
+                }),
+            (None, Some(slot)) => parked_in(store, infos, b, slot).and_then(|(at, reg)| {
+                carry_still_in_flag(store, infos, at, reg).map(|pair| (at, reg, pair))
+            }),
+            (None, None) => None,
         };
-        let Some((j, k, byte)) = carry_still_in_flag(store, infos, from, reg) else {
+        let Some((from, reg, (j, k, byte))) = found else {
             continue;
         };
         let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
@@ -661,12 +674,54 @@ pub(super) fn forward_carry_flag(store: &mut LineStore, infos: &mut [LineInfo]) 
         changed = true;
         // The boolean, if that was its last reader. A parked one is still
         // read by the store that parked it: [`drop_unread_carries`] looks
-        // again when the stores nobody reads are gone.
+        // again when the stores nobody reads are gone. A copied one is
+        // read by the copy, which goes first if the `bt` was all that read
+        // the register it wrote.
         if from == b {
+            drop_boolean_if_unread(store, infos, lv, (j, k), reg, byte);
+        } else if let Some((at, copied_into)) = copy
+            && rewritable(infos, &[at])
+            && provably_dead_lv(lv, store, infos, at, copied_into, &[at])
+        {
+            mark_nop(&mut infos[at]);
+            lv.refresh_at(store, infos, at);
             drop_boolean_if_unread(store, infos, lv, (j, k), reg, byte);
         }
     }
     changed
+}
+
+/// The line that copied a register into `reg`, and the register it copied
+/// (`movq %rax, %rbp`), when at line `at` `reg` still holds the copy and
+/// no flag has been written since.
+///
+/// The allocator gives a carry out a register of its own where the next
+/// link is not the next thing computed, and the emitter makes it in `%rax`
+/// and moves it there: `setc %cl; movzbl %cl, %eax; movq %rax, %rbp; ...;
+/// btl $0, %ebp`. Bit 0 of the copy is bit 0 of what was copied, by a move
+/// of a word or of half a word; from the copy to `at` nothing but
+/// flag-neutral straight-line code that leaves `reg` alone.
+fn copied_in(
+    store: &LineStore,
+    infos: &[LineInfo],
+    at: usize,
+    reg: RegId,
+) -> Option<(usize, RegId)> {
+    let mut k = at;
+    loop {
+        k = prev_real(store, infos, k)?;
+        let info = infos[k];
+        let t = info.trimmed(store.get(k));
+        if info.is_barrier() || info.pinned || flags_effect(t) != FlagsEffect::Neutral {
+            return None;
+        }
+        if !may_write(&info, t, reg) {
+            continue;
+        }
+        let (width, src, dst) = sized(t, "mov")?;
+        let source = width.register(src)?;
+        return (width.register(dst) == Some(reg) && source != reg).then_some((k, source));
+    }
 }
 
 /// Drop the boolean made by the `setc` and the extension at `lines`, the

@@ -80,7 +80,7 @@ allowed to be written in between, seeds 10 and 16 do. A change to the
 generator changes what a seed is; choose the window again then. The limb
 loops are drawn from a stream of their own (the programs without them are
 what they were before there were any), and their window is seeds 9 to 16
-too: 32 of its 64 loops are split, in ten of the eleven spellings of a loop
+too: 33 of its 64 loops are split, in ten of the eleven spellings of a loop
 that the pass takes (the eleventh, `while (n-- > 0)`, has its split loop in
 `carry_chain_adders.c`, where the shape gate holds it). The ways to read a
 borrow out of a double word are drawn from a stream of their own as well:
@@ -158,7 +158,7 @@ ADDERS = (0, 1, 2, 4, 5, 6, 7)
 # adder, a count that is known and small) and loops it does not take yet
 # (`docs/x86-carry-chain.md` lists them). The number goes up with the pass
 # and never down. Other windows are counted and not judged.
-MUST_SPLIT = 32
+MUST_SPLIT = 33
 
 
 class Program:
