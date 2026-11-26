@@ -30,17 +30,27 @@
 //!           and for all of them where the guard said no
 //! ```
 //!
-//! and the chain then runs through the four limbs of a trip: the carry
-//! leaves the flag once in four limbs.
+//! and the chain then runs through the four limbs of a trip. The main loop
+//! counts its own trips down to zero and steps by constants, and neither
+//! needs the carry flag (`dec`, `lea`): the x86 peephole keeps the carry in
+//! the flag round its back edge as well
+//! (`multiword::keep_carry_round_loop`), and the loop is the chain: 0.26 s.
 //!
 //! # Which loops
 //!
 //! Exactly one block of work, tested at the top (`for`, `while`: a header
-//! that is phis and the compare, and a latch) or at the bottom (`do ...
+//! that is phis and the test, and a latch) or at the bottom (`do ...
 //! while`: one block). One way in, one way out. A counter stepped by one,
 //! up or down, compared with something the loop does not change. The work
 //! is loads, stores and arithmetic: nothing that calls, traps into the
 //! kernel or is volatile ([`plan_split`] has the list).
+//!
+//! The header of a loop tested at the top may hold two things besides the
+//! compare, both of them the test's own ([`header_work`]): the counter
+//! narrowed (`for (int i = 0; i < n; i++) r[i] = ...` arrives with a
+//! 64-bit counter, widened to index with, that the test reads through its
+//! truncation), and the counter's step (`while (n-- > 0)` steps before it
+//! asks).
 //!
 //! And a carry: a header phi that is the carry in of exactly one full
 //! adder in the body and receives that adder's carry out
@@ -71,6 +81,19 @@
 //! untouched, which is the loop the source wrote. An inclusive test (`<=`,
 //! `>=`) is taken only against a constant that has a neighbour, as the
 //! exclusive test against that.
+//!
+//! A counter that the test reads narrowed counts in the narrow type. The
+//! truncation of a sum is the sum of the truncations, so what the test
+//! sees steps by one modulo 2^32 from the truncation of the first value,
+//! and `d` is taken from that. The 64-bit counter is carried through the
+//! copies as the loop had it, whatever its upper half is.
+//!
+//! A step in the header is the first thing of an iteration. The loop ran
+//! step, test, work, step, test, work, ..., step, test; the copies run step
+//! and work four times, in that order, and the step of the test that
+//! leaves is `L`'s own, as is every value the header computes for whoever
+//! reads it behind the loop: a loop tested at the top is left through
+//! `L`'s header and no other way.
 //!
 //! *The main loop* runs `d >> 2` trips, which it counts down by itself.
 //! Each trip is four consecutive iterations of `L` that `L` would have
@@ -146,8 +169,17 @@ struct Plan {
     /// order in the direction of the step.
     cont: IrCmpOp,
     limit: Operand,
-    /// The counter's width.
+    /// The type the test counts in: the counter's own, or the narrower one
+    /// the test reads the counter in.
+    count_ty: IrType,
+    /// The test reads the counter narrowed (`for (int i = 0; i < n; i++)
+    /// r[i] = ...`, whose counter was widened to index with).
+    narrowed: bool,
+    /// The width of `count_ty`.
     bits: u32,
+    /// The counter's step stands in the header, in front of the test
+    /// (`while (n-- > 0)`): its place among the header's instructions.
+    header_step: Option<usize>,
     /// An iteration reads the counter, or its next value, for something
     /// other than counting (an index, say).
     counter_read: bool,
@@ -156,12 +188,94 @@ struct Plan {
     live_out: Vec<(Value, IrType)>,
 }
 
+impl Plan {
+    /// One iteration: the counter's step where it stands in the header,
+    /// and the work.
+    fn iteration(&self, func: &IrFunction) -> Vec<Instruction> {
+        iteration_of(
+            self.header_step
+                .map(|at| &func.blocks[self.header].instructions[at]),
+            &func.blocks[self.work_block].instructions[self.work.clone()],
+        )
+        .into_owned()
+    }
+}
+
+/// `work` with `step` in front of it, if there is one.
+fn iteration_of<'a>(
+    step: Option<&'a Instruction>,
+    work: &'a [Instruction],
+) -> std::borrow::Cow<'a, [Instruction]> {
+    match step {
+        Some(step) => std::iter::once(step).chain(work).cloned().collect(),
+        None => std::borrow::Cow::Borrowed(work),
+    }
+}
+
 fn counter_bits(ty: IrType) -> Option<u32> {
     match ty {
         IrType::I32 | IrType::U32 => Some(32),
         IrType::I64 | IrType::U64 => Some(64),
         _ => None,
     }
+}
+
+/// The counter of `inst`, if `inst` is a counter narrowed for its test: a
+/// conversion of a 64-bit value to 32 bits. Returns the value and the type
+/// it is narrowed to.
+fn narrowed_counter(inst: &Instruction) -> Option<(Value, IrType)> {
+    match inst {
+        Instruction::Cast {
+            src: Operand::Value(src),
+            from_ty,
+            to_ty,
+            ..
+        } if counter_bits(*from_ty) == Some(64) && counter_bits(*to_ty) == Some(32) => {
+            Some((*src, *to_ty))
+        }
+        _ => None,
+    }
+}
+
+/// What the header of a loop tested at the top holds behind its phis, as
+/// places among `extra`.
+#[derive(Default)]
+struct HeaderWork {
+    /// The compare the loop branches on (`while (n)` has none).
+    test: Option<usize>,
+    /// The counter narrowed for the test.
+    narrowed: Option<usize>,
+    /// The step of a phi (`while (n-- > 0)` steps before it asks).
+    step: Option<usize>,
+}
+
+/// The header of a loop tested at the top, behind its phis: `extra`, with
+/// `cond` what it branches on. `None` if anything stands there but the
+/// test, a phi narrowed and the step of a phi: it would run once an
+/// iteration, and once more, and is in no copy.
+fn header_work(extra: &[Instruction], phis: &[HeaderPhi], cond: Value) -> Option<HeaderWork> {
+    let mut found = HeaderWork::default();
+    for (at, inst) in extra.iter().enumerate() {
+        let is_phi = |v: Value| phis.iter().any(|phi| phi.dest == v);
+        let steps_a_phi = |dest: Value| {
+            phis.iter().any(|phi| {
+                phi.back == Operand::Value(dest)
+                    && stepped(inst, phi.dest, phi.ty, phi.dest, 1).is_some()
+            })
+        };
+        let place = match inst {
+            Instruction::Cmp { dest, .. } if *dest == cond => &mut found.test,
+            Instruction::Cast { .. } if narrowed_counter(inst).is_some_and(|(v, _)| is_phi(v)) => {
+                &mut found.narrowed
+            }
+            Instruction::BinOp { dest, .. } if steps_a_phi(*dest) => &mut found.step,
+            _ => return None,
+        };
+        if place.replace(at).is_some() {
+            return None;
+        }
+    }
+    Some(found)
 }
 
 /// `value` read as a signed number of `bits` bits.
@@ -233,9 +347,9 @@ fn header_phis(head: &BasicBlock, pre: BlockId, latch: BlockId) -> Option<Vec<He
 /// What one iteration defines, if it is loads, stores and arithmetic --
 /// each run as often and in the order the loop ran them -- with an
 /// unsigned comparison among them (a carry is one) and no reader of
-/// `header_test`, the compare of a top-tested loop, which belongs to the
-/// header and is in no copy.
-fn plain_work(work: &[Instruction], header_test: Option<Value>) -> Option<FxHashSet<u32>> {
+/// `header_own`: the compare of a top-tested loop and the counter narrowed
+/// for it, which belong to the header and are in no copy.
+fn plain_work(work: &[Instruction], header_own: &[Value]) -> Option<FxHashSet<u32>> {
     let mut defined: FxHashSet<u32> = FxHashSet::default();
     let mut compares_unsigned = false;
     for inst in work {
@@ -257,9 +371,9 @@ fn plain_work(work: &[Instruction], header_test: Option<Value>) -> Option<FxHash
             }
             _ => return None,
         }
-        let mut reads_test = false;
-        inst.for_each_used_value(|v| reads_test |= header_test == Some(Value(v)));
-        if reads_test {
+        let mut reads_header = false;
+        inst.for_each_used_value(|v| reads_header |= header_own.contains(&Value(v)));
+        if reads_header {
             return None;
         }
         if let Some(dest) = inst.dest() {
@@ -426,89 +540,128 @@ fn plan_split(
     if exit == header_label || exit == latch_label {
         return None;
     }
-    let (work_block, work) = if bottom_tested {
-        (header, phi_count..head.instructions.len())
+    let extra = &head.instructions[phi_count..];
+    let (work_block, work, top) = if bottom_tested {
+        (
+            header,
+            phi_count..head.instructions.len(),
+            HeaderWork::default(),
+        )
     } else {
         // The header is its phis and its test (a compare, or the counter
-        // itself); the latch comes straight back.
-        if head.instructions.len() > phi_count + 1
-            || !matches!(func.blocks[latch].terminator, Terminator::Branch(to) if to == header_label)
-        {
+        // itself), with what the test is made of; the latch comes straight
+        // back.
+        if !matches!(func.blocks[latch].terminator, Terminator::Branch(to) if to == header_label) {
             return None;
         }
-        (latch, 0..func.blocks[latch].instructions.len())
+        let top = header_work(extra, &phis, *cond)?;
+        (latch, 0..func.blocks[latch].instructions.len(), top)
     };
     if work.is_empty() || work.len() > MAX_WORK {
         return None;
     }
-    let work_insts = &func.blocks[work_block].instructions[work.clone()];
+    // One iteration: the work, behind the counter's step where that stands
+    // in the header. There it runs in front of the test, so once more than
+    // the work does -- for the test that leaves, and that one is the
+    // header's own, of the loop as it was.
+    let iteration = iteration_of(
+        top.step.map(|at| &extra[at]),
+        &func.blocks[work_block].instructions[work.clone()],
+    );
+    let work_insts: &[Instruction] = &iteration;
     // The test: a compare in the header, or a value that is itself the
     // condition (`while (n)`: anything but zero goes on).
     let zero = Operand::Const(IrConst::I64(0));
     let branched_on = Operand::Value(*cond);
-    let (op, lhs, rhs, test_ty) = match head.instructions[phi_count..]
-        .iter()
-        .find(|inst| inst.dest() == Some(*cond))
-    {
+    let (op, lhs, rhs, test_ty) = match extra.iter().find(|inst| inst.dest() == Some(*cond)) {
         Some(Instruction::Cmp {
             op, lhs, rhs, ty, ..
         }) => (*op, lhs, rhs, Some(*ty)),
-        // At the top the header has nothing but its test: whatever else
-        // stood there would run once an iteration and is in no copy.
-        Some(_) if !bottom_tested => return None,
-        None if !bottom_tested && head.instructions.len() != phi_count => return None,
         _ => (IrCmpOp::Ne, &branched_on, &zero, None),
     };
-    // At the top a compare's result belongs to the header, not to an
-    // iteration: no copy has it.
-    let header_test = (!bottom_tested && test_ty.is_some()).then_some(*cond);
+    // At the top the compare and the narrowed counter belong to the
+    // header, not to an iteration: no copy has them.
+    let header_own: Vec<Value> = [top.test, top.narrowed]
+        .into_iter()
+        .flatten()
+        .filter_map(|at| extra[at].dest())
+        .collect();
 
-    let defined = plain_work(work_insts, header_test)?;
+    let defined = plain_work(work_insts, &header_own)?;
     let phi_at = |v: Value| phis.iter().position(|phi| phi.dest == v);
     // Round the loop a phi receives a constant, a value of the iteration,
     // another phi, or something from outside the loop.
     if phis
         .iter()
-        .any(|phi| matches!(phi.back, Operand::Value(v) if header_test == Some(v)))
+        .any(|phi| matches!(phi.back, Operand::Value(v) if header_own.contains(&v)))
     {
         return None;
     }
     let invariant = |operand: &Operand| match operand {
         Operand::Const(_) => true,
         Operand::Value(v) => {
-            !defined.contains(&v.0) && phi_at(*v).is_none() && header_test != Some(*v)
+            !defined.contains(&v.0) && phi_at(*v).is_none() && !header_own.contains(v)
         }
+    };
+    // The counter behind the conversion that narrows it for the test, in
+    // the header of a loop tested at the top and in the iteration of one
+    // tested at the bottom.
+    let narrowing = |v: Value| -> Option<(Value, IrType)> {
+        let inst = if bottom_tested {
+            work_insts.iter().find(|inst| inst.dest() == Some(v))
+        } else {
+            top.narrowed
+                .map(|at| &extra[at])
+                .filter(|inst| inst.dest() == Some(v))
+        };
+        narrowed_counter(inst?)
     };
 
     // The counter: a phi stepped by one, compared -- itself at the top, its
-    // next value at the bottom -- with something the loop leaves alone.
-    let (counter, tests_next, up, limit, cont) = [(lhs, rhs, op), (rhs, lhs, op.swapped())]
-        .into_iter()
-        .find_map(|(tested, limit, op)| {
-            let Operand::Value(tested) = tested else {
-                return None;
-            };
-            if !invariant(limit) {
-                return None;
-            }
-            // At the bottom the source tests the stepped counter (`--n !=
-            // 0`) and the optimizer may have made that the counter itself
-            // against the limit one step back (`n != 1`).
-            let (counter, tests_next) = phis.iter().enumerate().find_map(|(at, phi)| {
-                if phi.dest == *tested {
-                    Some((at, false))
-                } else if bottom_tested
-                    && matches!(phi.back, Operand::Value(next) if next == *tested)
-                {
-                    Some((at, true))
-                } else {
-                    None
+    // next value at the bottom, either of them as it is or narrowed --
+    // with something the loop leaves alone.
+    let (counter, tests_next, up, limit, cont, narrow_to) =
+        [(lhs, rhs, op), (rhs, lhs, op.swapped())]
+            .into_iter()
+            .find_map(|(tested, limit, op)| {
+                let Operand::Value(tested) = tested else {
+                    return None;
+                };
+                if !invariant(limit) {
+                    return None;
                 }
+                let (tested, narrow_to) = match narrowing(*tested) {
+                    Some((counter, to)) => (counter, Some(to)),
+                    None => (*tested, None),
+                };
+                // At the bottom the source tests the stepped counter (`--n
+                // != 0`) and the optimizer may have made that the counter
+                // itself against the limit one step back (`n != 1`).
+                let (counter, tests_next) = phis.iter().enumerate().find_map(|(at, phi)| {
+                    if phi.dest == tested {
+                        Some((at, false))
+                    } else if bottom_tested
+                        && matches!(phi.back, Operand::Value(next) if next == tested)
+                    {
+                        Some((at, true))
+                    } else {
+                        None
+                    }
+                })?;
+                let up = step_by_one(&phis[counter], work_insts)?;
+                Some((counter, tests_next, up, limit, op, narrow_to))
             })?;
-            let up = step_by_one(&phis[counter], work_insts)?;
-            Some((counter, tests_next, up, limit, op))
-        })?;
-    let ty = phis[counter].ty;
+    // What the header holds besides its test is the test's own: the
+    // counter it reads narrowed, and the counter's step.
+    if top.narrowed.is_some() && narrow_to.is_none() {
+        return None;
+    }
+    if let Some(at) = top.step
+        && Some(phis[counter].back.clone()) != extra[at].dest().map(Operand::Value)
+    {
+        return None;
+    }
+    let ty = narrow_to.unwrap_or(phis[counter].ty);
     let bits = counter_bits(ty)?;
     if test_ty.is_some_and(|test_ty| counter_bits(test_ty) != Some(bits)) {
         return None;
@@ -557,7 +710,10 @@ fn plan_split(
     let own_test = (bottom_tested && test_ty.is_some()).then_some(*cond);
     let is_test = |v: Value| own_test == Some(v);
     let test_is_read = work_insts.iter().any(|inst| reads(inst, &is_test)) || handed_on(&is_test);
-    let counter_read = handed_on(&is_count)
+    // A counter the test reads narrowed is carried as it is: what it is
+    // behind the main loop is not a matter of the count alone.
+    let counter_read = narrow_to.is_some()
+        || handed_on(&is_count)
         || work_insts.iter().any(|inst| {
             let counts_only = inst.dest() == Some(counter_next)
                 || (!test_is_read && inst.dest().is_some_and(is_test));
@@ -608,7 +764,10 @@ fn plan_split(
         up,
         cont,
         limit,
+        count_ty: ty,
+        narrowed: narrow_to.is_some(),
         bits,
+        header_step: top.step.map(|at| phi_count + at),
         counter_read,
         live_out,
     })
@@ -875,14 +1034,29 @@ struct Labels {
 /// the body and before the step, the test passes once more.
 fn guard_of(plan: &Plan, names: &mut Names) -> (Vec<Instruction>, Value, Value) {
     let counter = &plan.phis[plan.counter];
-    let ty = counter.ty;
+    let ty = plan.count_ty;
     let constant = |value: i64| Operand::Const(IrConst::from_i64(value, ty));
     let mut insts = Vec::new();
+    // The counter's first value as the test reads it. A narrowed counter
+    // counts in the narrow type: what the test sees of it steps by one
+    // there, from this.
+    let first = if plan.narrowed {
+        let first = names.fresh();
+        insts.push(Instruction::Cast {
+            dest: first,
+            src: counter.init.clone(),
+            from_ty: counter.ty,
+            to_ty: ty,
+        });
+        Operand::Value(first)
+    } else {
+        counter.init.clone()
+    };
     let mut distance = names.fresh();
     let (near, far) = if plan.up {
-        (counter.init.clone(), plan.limit.clone())
+        (first.clone(), plan.limit.clone())
     } else {
-        (plan.limit.clone(), counter.init.clone())
+        (plan.limit.clone(), first.clone())
     };
     insts.push(Instruction::BinOp {
         dest: distance,
@@ -923,7 +1097,7 @@ fn guard_of(plan: &Plan, names: &mut Names) -> (Vec<Instruction>, Value, Value) 
         insts.push(Instruction::Cmp {
             dest: near_side,
             op: plan.cont,
-            lhs: counter.init.clone(),
+            lhs: first,
             rhs: plan.limit.clone(),
             ty,
         });
@@ -1037,10 +1211,9 @@ fn main_loop_of(
     labels: &Labels,
     trips: Value,
 ) -> MainLoop {
-    let ty = plan.phis[plan.counter].ty;
+    let ty = plan.count_ty;
     let constant = |value: i64| Operand::Const(IrConst::from_i64(value, ty));
-    let work_insts: Vec<Instruction> =
-        func.blocks[plan.work_block].instructions[plan.work.clone()].to_vec();
+    let work_insts = plan.iteration(func);
     let main_phis: Vec<Value> = plan.phis.iter().map(|_| names.fresh()).collect();
     let mut body = Vec::with_capacity(work_insts.len() * COPIES as usize + plan.phis.len() + 2);
     // A constant a phi receives round the loop is read by the copies under
@@ -1356,7 +1529,7 @@ fn apply(func: &mut IrFunction, plan: &Plan) -> BlockId {
     };
     let header_label = func.blocks[plan.header].label;
     let pre_label = func.blocks[plan.pre].label;
-    let ty = plan.phis[plan.counter].ty;
+    let ty = plan.count_ty;
     let constant = |value: i64| Operand::Const(IrConst::from_i64(value, ty));
 
     let (mut guard_insts, distance, split) = guard_of(plan, &mut names);

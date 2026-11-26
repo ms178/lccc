@@ -128,7 +128,8 @@ enum Limit {
 /// the limit); 10 the counter, 11 the carry, 12 to 14 the pointers, 9 and
 /// 15 to 17 the phis of `more`; 20 to 22 the addresses or the stepped
 /// pointers; 30 to 38 the adder, 35 its sum and 38 its carry out; 40 the
-/// stepped counter, 41 the test, 46 the stepped second counter of `more`.
+/// stepped counter, 41 the test, 46 the stepped second counter of `more`,
+/// 47 the counter narrowed for the test.
 /// Blocks: 0 the way in, 1 the header, 2 the latch of a loop tested at the
 /// top, 3 behind the loop.
 #[derive(Clone, Copy, Debug)]
@@ -153,6 +154,13 @@ struct Limbs {
     /// goes down by five. And behind the loop everything of it is read;
     /// otherwise the carry alone.
     more: bool,
+    /// The test reads the counter narrowed to this type (value 47), and
+    /// the limit is of it: `for (int i = 0; i < n; i++)` with the counter
+    /// widened to index with. `ty` is the wide type then.
+    narrowed: Option<IrType>,
+    /// Tested at the top, the counter's step stands in the header in front
+    /// of the test: `while (n-- > 0)`.
+    step_in_header: bool,
 }
 
 impl Limbs {
@@ -168,6 +176,8 @@ impl Limbs {
             tests_next: false,
             limit: Limit::Constant(1),
             more: false,
+            narrowed: None,
+            step_in_header: false,
         }
     }
 
@@ -183,16 +193,19 @@ impl Limbs {
             tests_next: false,
             limit: Limit::Argument,
             more: false,
+            narrowed: None,
+            step_in_header: false,
         }
     }
 
     fn build(&self) -> IrFunction {
         use IrBinOp::{Add, Or, Shl, Sub, Xor};
         let ty = self.ty;
+        let test_ty = self.narrowed.unwrap_or(ty);
         let latch = if self.bottom { 1 } else { 2 };
         let limit = match self.limit {
             Limit::Argument => v(5),
-            Limit::Constant(value) => typed(value, ty),
+            Limit::Constant(value) => typed(value, test_ty),
         };
         let mut phis = vec![
             phi(10, ty, vec![(v(4), 0), (v(40), latch)]),
@@ -243,22 +256,36 @@ impl Limbs {
             phis.push(phi(9, U64, vec![(wide(1000), 0), (v(46), latch)]));
             work.push(bin(46, Sub, v(9), wide(5), U64));
         }
-        work.push(bin(
-            40,
-            if self.up { Add } else { Sub },
-            v(10),
-            typed(1, ty),
-            ty,
-        ));
-        let tested = if self.bottom && self.tests_next {
-            v(40)
+        let step = bin(40, if self.up { Add } else { Sub }, v(10), typed(1, ty), ty);
+        // What the header of a loop tested at the top holds in front of
+        // its test.
+        let mut asked = Vec::new();
+        if self.step_in_header && !self.bottom {
+            asked.push(step);
         } else {
-            v(10)
+            work.push(step);
+        }
+        let tested = if self.bottom && self.tests_next {
+            40
+        } else {
+            10
+        };
+        let tested = match self.narrowed {
+            Some(narrow) => {
+                let narrowed = cast(47, tested, ty, narrow);
+                if self.bottom {
+                    work.push(narrowed);
+                } else {
+                    asked.push(narrowed);
+                }
+                v(47)
+            }
+            None => v(tested),
         };
         let (cond, test, goes_on_true) = match self.test {
-            Test::Goes(op) => (v(41), Some(cmp(41, op, tested, limit, ty)), true),
-            Test::Swapped(op) => (v(41), Some(cmp(41, op, limit, tested, ty)), true),
-            Test::Leaves(op) => (v(41), Some(cmp(41, op, tested, limit, ty)), false),
+            Test::Goes(op) => (v(41), Some(cmp(41, op, tested, limit, test_ty)), true),
+            Test::Swapped(op) => (v(41), Some(cmp(41, op, limit, tested, test_ty)), true),
+            Test::Leaves(op) => (v(41), Some(cmp(41, op, tested, limit, test_ty)), false),
             Test::Itself => (tested, None, true),
         };
         let leave_or_stay = |stay: u32| {
@@ -276,6 +303,10 @@ impl Limbs {
         // are read through them, so that the plain `*p++` keeps steps
         // nothing but their phis read).
         let mut read: Vec<(u32, IrType)> = vec![(if self.bottom { 38 } else { 11 }, U64)];
+        if self.step_in_header && !self.bottom {
+            // `n` behind `while (n-- > 0)`: one step past the limit.
+            read.push((40, ty));
+        }
         if self.more {
             read.extend([
                 (11, U64),
@@ -322,7 +353,7 @@ impl Limbs {
             param(2, 1, PTR),
             param(3, 2, PTR),
             param(4, 3, ty),
-            param(5, 4, ty),
+            param(5, 4, test_ty),
         ];
         func.blocks
             .push(block(BlockId(0), way_in, Terminator::Branch(BlockId(1))));
@@ -333,6 +364,7 @@ impl Limbs {
             func.blocks.push(block(BlockId(1), body, leave_or_stay(1)));
         } else {
             let mut header = phis;
+            header.append(&mut asked);
             header.extend(test);
             func.blocks
                 .push(block(BlockId(1), header, leave_or_stay(2)));
@@ -809,6 +841,8 @@ fn every_shape(ty: IrType) {
                                 tests_next,
                                 limit: Limit::Argument,
                                 more,
+                                narrowed: None,
+                                step_in_header: false,
                             };
                             compared(&limbs, true, &counters(ty, up));
                         }
@@ -860,11 +894,267 @@ fn a_counter_that_is_its_own_test() {
                     tests_next,
                     limit: Limit::Argument,
                     more: pointers,
+                    narrowed: None,
+                    step_in_header: false,
                 };
                 compared(&limbs, true, &counts);
             }
         }
     }
+}
+
+/// `counters` of the narrow type under a wide first value: what is above
+/// the narrow type is the wide counter's own business.
+fn narrowed_counters(narrow: IrType, up: bool) -> Vec<(u64, u64)> {
+    counters(narrow, up)
+        .into_iter()
+        .enumerate()
+        .map(|(nth, (first, limit))| {
+            let above: u64 = [0, 1, 0x7fff_ffff, 0xffff_ffff][nth % 4];
+            (first | above << 32, limit)
+        })
+        .collect()
+}
+
+/// `for (int i = 0; i < n; i++) r[i] = ...`: the counter was widened to
+/// index with, and the test reads it narrowed. The count is the narrow
+/// type's -- what the test sees of the counter steps by one there -- and
+/// the wide counter is carried through the copies as it is.
+#[test]
+fn a_counter_the_test_reads_narrowed() {
+    for narrow in [IrType::I32, IrType::U32] {
+        for bottom in [false, true] {
+            for up in [true, false] {
+                for test in tests(up) {
+                    for tests_next in [false, true] {
+                        if tests_next && !bottom {
+                            continue;
+                        }
+                        for pointers in [false, true] {
+                            let limbs = Limbs {
+                                ty: if up { I64 } else { U64 },
+                                bottom,
+                                pointers,
+                                stepped_first: false,
+                                up,
+                                test,
+                                tests_next,
+                                limit: Limit::Argument,
+                                more: pointers == up,
+                                narrowed: Some(narrow),
+                                step_in_header: false,
+                            };
+                            compared(&limbs, true, &narrowed_counters(narrow, up));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // `while ((int)n)`: the narrowed counter is its own test.
+    for bottom in [false, true] {
+        let limbs = Limbs {
+            ty: I64,
+            bottom,
+            up: false,
+            test: Test::Itself,
+            tests_next: bottom,
+            limit: Limit::Argument,
+            narrowed: Some(IrType::U32),
+            ..Limbs::mini()
+        };
+        let counts: Vec<(u64, u64)> = (0..=13)
+            .chain([0xffff_ffff, 0xffff_fffa])
+            .map(|n| (n | 5 << 32, 77))
+            .collect();
+        compared(&limbs, true, &counts);
+    }
+    // Against a constant, inclusive: the strict test against the constant
+    // beside it, in the narrow type.
+    let limbs = Limbs {
+        ty: I64,
+        test: Test::Goes(IrCmpOp::Sle),
+        limit: Limit::Constant(9),
+        narrowed: Some(IrType::I32),
+        ..Limbs::mini()
+    };
+    compared(
+        &limbs,
+        true,
+        &[
+            (0, 0),
+            (3, 0),
+            (6, 0),
+            (7, 0),
+            (1 << 32, 0),
+            (9, 0),
+            (10, 0),
+        ],
+    );
+
+    // The narrowed counter is the header's: an iteration that reads it, or
+    // a phi that receives it, has no copy of it.
+    let mut func = Limbs {
+        narrowed: Some(IrType::I32),
+        ..Limbs::mini()
+    }
+    .build();
+    let (work, start) = work_of(&mut func, false);
+    work.insert(start, cast(150, 47, IrType::I32, U64));
+    left_alone(func, "the narrowed counter read by the work");
+    let mut func = Limbs {
+        narrowed: Some(IrType::I32),
+        ..Limbs::mini()
+    }
+    .build();
+    func.blocks[1].instructions.insert(
+        2,
+        phi(
+            150,
+            IrType::I32,
+            vec![(typed(0, IrType::I32), 0), (v(47), 2)],
+        ),
+    );
+    left_alone(func, "the narrowed counter handed round the loop");
+    // Narrowed, but not what the test reads.
+    let mut func = Limbs::mini().build();
+    func.blocks[1]
+        .instructions
+        .insert(2, cast(47, 10, I64, IrType::I32));
+    left_alone(func, "a narrowed counter the test does not read");
+    // To 16 bits: no counter this pass counts in.
+    let mut func = Limbs {
+        narrowed: Some(IrType::I32),
+        ..Limbs::mini()
+    }
+    .build();
+    for inst in &mut func.blocks[1].instructions {
+        match inst {
+            Instruction::Cast { to_ty, .. } => *to_ty = IrType::I16,
+            Instruction::Cmp { ty, .. } => *ty = IrType::I16,
+            _ => {}
+        }
+    }
+    left_alone(func, "a counter narrowed to 16 bits");
+}
+
+/// `while (n-- > 0)`: the counter's step stands in the header in front of
+/// the test, and runs once more than the work does. It is the first thing
+/// of an iteration; the one more is the header's own, of the loop as it
+/// was, and what is read of it behind the loop is that.
+#[test]
+fn a_step_in_the_header_is_the_first_thing_of_an_iteration() {
+    for ty in TYPES {
+        for up in [false, true] {
+            for test in tests(up) {
+                for pointers in [false, true] {
+                    for more in [false, true] {
+                        let limbs = Limbs {
+                            ty,
+                            bottom: false,
+                            pointers,
+                            stepped_first: false,
+                            up,
+                            test,
+                            tests_next: false,
+                            limit: Limit::Argument,
+                            more,
+                            narrowed: None,
+                            step_in_header: true,
+                        };
+                        compared(&limbs, true, &counters(ty, up));
+                    }
+                }
+            }
+        }
+        // `while (n--)`.
+        let limbs = Limbs {
+            ty,
+            up: false,
+            test: Test::Itself,
+            limit: Limit::Argument,
+            step_in_header: true,
+            ..Limbs::mini()
+        };
+        let counts: Vec<(u64, u64)> = (0..=13)
+            .chain([cut(u64::MAX, ty), cut(u64::MAX - 5, ty)])
+            .map(|n| (n, 77))
+            .collect();
+        compared(&limbs, true, &counts);
+    }
+    // And with the counter narrowed for the test: `while ((int)n-- > 0)`.
+    for more in [false, true] {
+        let limbs = Limbs {
+            ty: I64,
+            up: false,
+            test: Test::Goes(IrCmpOp::Sgt),
+            limit: Limit::Constant(0),
+            more,
+            narrowed: Some(IrType::I32),
+            step_in_header: true,
+            ..Limbs::mini()
+        };
+        compared(&limbs, true, &narrowed_counters(IrType::I32, false));
+    }
+
+    let stepping = Limbs {
+        up: false,
+        test: Test::Goes(IrCmpOp::Sgt),
+        limit: Limit::Constant(0),
+        step_in_header: true,
+        ..Limbs::mini()
+    };
+    // The header is `[counter, carry, step, test]`.
+    let header_of = |func: &IrFunction| -> Vec<Instruction> { func.blocks[1].instructions.clone() };
+    assert!(
+        matches!(
+            &header_of(&stepping.build())[2..],
+            [Instruction::BinOp { .. }, Instruction::Cmp { .. }]
+        ),
+        "the header this test is about"
+    );
+    // `while (--n > 0)`: the test reads the stepped counter.
+    let mut func = stepping.build();
+    if let Instruction::Cmp { lhs, .. } = &mut func.blocks[1].instructions[3] {
+        *lhs = v(40);
+    }
+    left_alone(func, "a test of the counter stepped in the header");
+    // `while (--n)`.
+    let mut func = stepping.build();
+    func.blocks[1].instructions.truncate(3);
+    func.blocks[1].terminator = Terminator::CondBranch {
+        cond: v(40),
+        true_label: BlockId(2),
+        false_label: BlockId(3),
+    };
+    left_alone(func, "the counter stepped in the header as its own test");
+    // The step of a phi that is not the counter.
+    let pointers = Limbs {
+        pointers: true,
+        ..Limbs::mini()
+    };
+    let mut func = pointers.build();
+    let (work, start) = work_of(&mut func, false);
+    let step = work.remove(start);
+    assert!(matches!(
+        step,
+        Instruction::BinOp {
+            dest: Value(20),
+            ..
+        }
+    ));
+    func.blocks[1].instructions.insert(5, step);
+    left_alone(func, "a pointer stepped in the header");
+    // Two steps.
+    let mut func = Limbs {
+        pointers: true,
+        ..stepping
+    }
+    .build();
+    let (work, start) = work_of(&mut func, false);
+    let step = work.remove(start);
+    func.blocks[1].instructions.insert(5, step);
+    left_alone(func, "two steps in the header");
 }
 
 /// `<=` and `>=` against a constant are the strict test against the
@@ -932,6 +1222,8 @@ fn an_inclusive_test_is_taken_against_a_constant_with_a_neighbour() {
                     tests_next: up,
                     limit: Limit::Constant(limit),
                     more: false,
+                    narrowed: None,
+                    step_in_header: false,
                 };
                 compared(&limbs, splits, &counts);
                 // The same test against the argument: no neighbour is

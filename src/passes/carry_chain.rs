@@ -162,6 +162,18 @@ fn const_bit(operand: &Operand) -> Option<bool> {
     }
 }
 
+/// Whether a logical shift right of a `ty` by `count` leaves the top bit
+/// and nothing else: a 32- or 64-bit word by one less than its width. (The
+/// narrower types are promoted before C shifts them.)
+fn top_bit_down(ty: IrType, count: &Operand) -> bool {
+    let bits = match ty {
+        IrType::I32 | IrType::U32 => 32,
+        IrType::I64 | IrType::U64 => 64,
+        _ => return false,
+    };
+    matches!(count, Operand::Const(c) if c.to_i64() == Some(bits - 1))
+}
+
 fn is_integer(ty: IrType) -> bool {
     matches!(
         ty,
@@ -235,6 +247,21 @@ fn booleans(func: &IrFunction, facts: &Facts) -> FxHashSet<u32> {
                     rhs,
                     ty,
                 } if is_integer(*ty) => (*dest, vec![lhs, rhs]),
+                // The top bit of a word moved to the bottom (`p >> 63`,
+                // the sign of a limb as a carry in), and a bit test, which
+                // is `(v >> n) & 1` by definition: bits whatever `v` is.
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::LShr,
+                    rhs,
+                    ty,
+                    ..
+                } if top_bit_down(*ty, rhs) => (*dest, Vec::new()),
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::BitTest,
+                    ..
+                } => (*dest, Vec::new()),
                 Instruction::BinOp {
                     dest,
                     op: IrBinOp::Add,
@@ -2060,13 +2087,61 @@ mod tests {
                 U64,
             ),
             bin(20, IrBinOp::Or, v(19), v(10), U64),
+            // The top bit moved down is a bit; any other shift is not, nor
+            // is the arithmetic one (0 or -1), nor the top of a narrower
+            // word than the type says.
+            bin(
+                21,
+                IrBinOp::LShr,
+                v(0),
+                Operand::Const(IrConst::I32(63)),
+                U64,
+            ),
+            bin(
+                22,
+                IrBinOp::LShr,
+                v(0),
+                Operand::Const(IrConst::I32(62)),
+                U64,
+            ),
+            bin(
+                23,
+                IrBinOp::AShr,
+                v(0),
+                Operand::Const(IrConst::I32(63)),
+                U64,
+            ),
+            bin(
+                24,
+                IrBinOp::LShr,
+                v(0),
+                Operand::Const(IrConst::I32(31)),
+                U64,
+            ),
+            bin(
+                25,
+                IrBinOp::LShr,
+                v(0),
+                Operand::Const(IrConst::I32(31)),
+                IrType::U32,
+            ),
+            bin(
+                26,
+                IrBinOp::LShr,
+                v(0),
+                Operand::Const(IrConst::I32(15)),
+                IrType::U16,
+            ),
+            bin(27, IrBinOp::BitTest, v(0), v(1), U64),
+            bin(28, IrBinOp::Or, v(21), v(27), U64),
+            bin(29, IrBinOp::LShr, v(0), v(1), U64),
         ];
         let func = function(insts, v(17));
         let set = booleans(&func, &Facts::of(&func));
-        for bit in [10, 11, 12, 13, 17, 18] {
+        for bit in [10, 11, 12, 13, 17, 18, 21, 25, 27, 28] {
             assert!(set.contains(&bit), "%{bit} is a bit");
         }
-        for word in [0, 1, 14, 15, 16, 19, 20] {
+        for word in [0, 1, 14, 15, 16, 19, 20, 22, 23, 24, 26, 29] {
             assert!(!set.contains(&word), "%{word} is not");
         }
     }
