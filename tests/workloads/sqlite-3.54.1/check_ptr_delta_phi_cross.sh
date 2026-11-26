@@ -8,6 +8,7 @@ CLANG=${CLANG:-clang-23}
 GCC=${GCC:-gcc-16}
 SRC="$ROOT/tests/workloads/sqlite-3.54.1/ptr_delta_phi.c"
 NEGATIVE="$ROOT/tests/workloads/sqlite-3.54.1/ptr_delta_phi_negative.c"
+NEGATIVE_ADD="$ROOT/tests/workloads/sqlite-3.54.1/ptr_delta_phi_negative_add.c"
 for tool in python3 timeout readelf "$CLANG" "$GCC" "$BIN/lccc" "$BIN/lccc-i686" \
             "$BIN/lccc-arm" "$BIN/lccc-riscv"; do
     command -v "$tool" > /dev/null || { echo "missing compiler/tool: $tool" >&2; exit 2; }
@@ -77,29 +78,37 @@ for arch in x86_64 i686 aarch64 riscv64; do
         echo "$arch: varint pass toggle did not remove the pointer subtraction" >&2
         exit 1
     fi
-    # A second source exercises a *negative* pointer-width Sub(base, 7) arm.
-    # This is a measured negative CONTROL: folding it reduced x86 instruction
-    # count but made the host benchmark slower. Require an unchanged function
-    # with the same pointer difference rather than extending the proven pass.
-    timeout --kill-after=5s 120 "$cc" "${flags[@]}" "${archflags[@]}" \
-        -S "$NEGATIVE" -o "$work/$arch-negative-on.s"
-    CCC_DISABLE_PASSES=ptr_delta_phi timeout --kill-after=5s 120 \
-        "$cc" "${flags[@]}" "${archflags[@]}" -S "$NEGATIVE" -o "$work/$arch-negative-off.s"
-    timeout --kill-after=5s 120 "${ref[@]}" "${flags[@]}" \
-        -S "$NEGATIVE" -o "$work/$arch-negative-ref.s"
-    for mode in on off ref; do
-        grep -q '^guarded_byte_delta:' "$work/$arch-negative-$mode.s" || {
-            echo "missing negative-offset decoder in $arch/$mode assembly" >&2; exit 1;
-        }
-        sed -n '/^guarded_byte_delta:/,/^\.size[[:space:]]*guarded_byte_delta,/p' \
-            "$work/$arch-negative-$mode.s" > "$work/$arch-negative-$mode.func"
+    # Two encodings of a backward step: Sub(base, 7) and GEP/Add(base, -7).
+    # Both shrank x86 assembly yet regressed in separate 31-pair host screens.
+    # Require the *function* to remain identical under the pass toggle and
+    # retain its pointer subtraction on every supported target.
+    for shape in negative negative-add; do
+        source=$NEGATIVE
+        symbol=guarded_byte_delta
+        if [[ $shape == negative-add ]]; then
+            source=$NEGATIVE_ADD
+            symbol=guarded_negative_add_delta
+        fi
+        timeout --kill-after=5s 120 "$cc" "${flags[@]}" "${archflags[@]}" \
+            -S "$source" -o "$work/$arch-$shape-on.s"
+        CCC_DISABLE_PASSES=ptr_delta_phi timeout --kill-after=5s 120 \
+            "$cc" "${flags[@]}" "${archflags[@]}" -S "$source" -o "$work/$arch-$shape-off.s"
+        timeout --kill-after=5s 120 "${ref[@]}" "${flags[@]}" \
+            -S "$source" -o "$work/$arch-$shape-ref.s"
+        for mode in on off ref; do
+            grep -q "^$symbol:" "$work/$arch-$shape-$mode.s" || {
+                echo "missing $shape function in $arch/$mode assembly" >&2; exit 1;
+            }
+            sed -n "/^$symbol:/,/^\\.size[[:space:]]*$symbol,/p" \
+                "$work/$arch-$shape-$mode.s" > "$work/$arch-$shape-$mode.func"
+        done
+        if ! cmp -s "$work/$arch-$shape-on.func" "$work/$arch-$shape-off.func" ||
+            ! grep -Eq "$pointer_sub" "$work/$arch-$shape-on.func"; then
+            echo "$arch: $shape negative control changed under the pass toggle" >&2
+            exit 1
+        fi
     done
-    if ! cmp -s "$work/$arch-negative-on.func" "$work/$arch-negative-off.func" ||
-        ! grep -Eq "$pointer_sub" "$work/$arch-negative-on.func"; then
-        echo "$arch: negative-control shape changed under the pass toggle" >&2
-        exit 1
-    fi
-    echo "$arch: varint fold plus unchanged negative control, C/SSA/warning gates: PASS"
+    echo "$arch: varint fold plus both unchanged backward controls, C/SSA/warning gates: PASS"
 done
 
 # A normal Linux/x86_64 host can often execute 32-bit static ELF without a
@@ -142,14 +151,16 @@ ASM
                 "$work/decoder.c" -o "$work/i686-$variant-decoder.o"
             "${environment[@]}" "${compiler[@]}" "${opts[@]}" -c \
                 "$NEGATIVE" -o "$work/i686-$variant-negative.o"
+            "${environment[@]}" "${compiler[@]}" "${opts[@]}" -c \
+                "$NEGATIVE_ADD" -o "$work/i686-$variant-negative-add.o"
             ld -m elf_i386 -o "$work/i686-$variant" "$work/i686-entry.o" \
                 "$work/i686-oracle.o" "$work/i686-$variant-decoder.o" \
-                "$work/i686-$variant-negative.o"
+                "$work/i686-$variant-negative.o" "$work/i686-$variant-negative-add.o"
             timeout --kill-after=5s 30 "$work/i686-$variant" || {
-                rc=$?; echo "i686: $variant failed varint/negative-offset GCC oracle (exit $rc)" >&2; exit 1;
+                rc=$?; echo "i686: $variant failed varint/backward-step GCC oracle (exit $rc)" >&2; exit 1;
             }
         done
-        echo 'i686: 90,000 varints and 50,000 deltas x four compilers/modes: PASS (freestanding IA32)'
+        echo 'i686: 90,000 varints and 100,000 deltas x four compilers/modes: PASS (freestanding IA32)'
     else
         echo 'i686: runtime unavailable on this host; cross C/SSA/codegen gate passed'
     fi
@@ -209,9 +220,11 @@ ASM
             "$work/decoder.c" -o "$work/$arch-$variant-decoder.o"
         "${environment[@]}" "${compiler[@]}" "${opts[@]}" -c \
             "$NEGATIVE" -o "$work/$arch-$variant-negative.o"
+        "${environment[@]}" "${compiler[@]}" "${opts[@]}" -c \
+            "$NEGATIVE_ADD" -o "$work/$arch-$variant-negative-add.o"
         "$cc" -nostdlib -static "$work/$arch-entry.o" "$work/$arch-oracle.o" \
             "$work/$arch-$variant-decoder.o" "$work/$arch-$variant-negative.o" \
-            -o "$work/$arch-$variant"
+            "$work/$arch-$variant-negative-add.o" -o "$work/$arch-$variant"
         readelf -h "$work/$arch-$variant" | grep -qE "Machine: *$machine$" || {
             echo "$arch/$variant: incorrect ELF machine" >&2; exit 1;
         }
@@ -219,8 +232,8 @@ ASM
             echo "$arch/$variant: not freestanding (dynamic loader)" >&2; exit 1;
         fi
         timeout --kill-after=5s 30 "$qemu" "$work/$arch-$variant" || {
-            rc=$?; echo "$arch/$variant failed varint/negative-offset Clang oracle (exit $rc)" >&2; exit 1;
+            rc=$?; echo "$arch/$variant failed varint/backward-step Clang oracle (exit $rc)" >&2; exit 1;
         }
     done
-    echo "$arch: 90,000 varints and 50,000 deltas x Clang/LCCC-on/LCCC-off: PASS (static QEMU)"
+    echo "$arch: 90,000 varints and 100,000 deltas x Clang/LCCC-on/LCCC-off: PASS (static QEMU)"
 done

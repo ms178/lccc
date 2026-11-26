@@ -382,9 +382,9 @@ fn repeated_subtractions_share_one_phi_and_keep_debug_metadata_aligned() {
 }
 
 #[test]
-fn negative_offset_and_copy_chains_preserve_signed_offsets() {
+fn positive_offset_and_copy_chains_preserve_the_delta() {
     let mut f = diamond();
-    f.blocks[1].instructions[0] = gep(3, 0, Operand::Const(IrConst::I32(-7)));
+    f.blocks[1].instructions[0] = gep(3, 0, Operand::Const(IrConst::I32(7)));
     f.blocks[3].instructions.insert(
         1,
         Instruction::Copy {
@@ -405,9 +405,31 @@ fn negative_offset_and_copy_chains_preserve_signed_offsets() {
             } => Some(incoming),
             _ => None,
         })
-        .expect("signed integer phi");
-    assert_eq!(incoming[0].0, Operand::Const(IrConst::I64(-7)));
+        .expect("integer offset phi");
+    assert_eq!(incoming[0].0, Operand::Const(IrConst::I64(7)));
     assert_valid(&f);
+}
+
+#[test]
+fn negative_gep_even_through_copies_is_an_unchanged_negative_control() {
+    // GEP(base, -n) is mathematically legal but the guarded host benchmark
+    // measured a regression, just like the previously rejected Sub(base, n).
+    for offset in [IrConst::I32(-7), IrConst::I64(-7)] {
+        let mut f = diamond();
+        f.blocks[1].instructions[0] = gep(3, 0, Operand::Const(offset));
+        f.blocks[3].instructions.insert(
+            1,
+            Instruction::Copy {
+                dest: value(6),
+                src: v(4),
+            },
+        );
+        f.blocks[3].instructions[2] = sub(5, 6, 0, IrType::I64);
+        let before = format!("{:?}", f.blocks);
+        assert_eq!(run(&mut f), 0);
+        assert_eq!(format!("{:?}", f.blocks), before);
+        assert_valid(&f);
+    }
 }
 
 #[test]
@@ -452,9 +474,9 @@ fn pointer_width_add_matches_aarch64_riscv_and_commuted_addresses() {
     for commuted in [false, true] {
         let mut f = diamond();
         let (lhs, rhs) = if commuted {
-            (Operand::Const(IrConst::I64(-7)), v(0))
+            (Operand::Const(IrConst::I64(7)), v(0))
         } else {
-            (v(0), Operand::Const(IrConst::I64(-7)))
+            (v(0), Operand::Const(IrConst::I64(7)))
         };
         f.blocks[1].instructions[0] = Instruction::BinOp {
             dest: value(3),
@@ -474,7 +496,7 @@ fn pointer_width_add_matches_aarch64_riscv_and_commuted_addresses() {
         });
         assert!(phi.is_some(), "missing new integer phi");
         let phi = phi.unwrap_or(&[]);
-        assert_eq!(phi[0].0, Operand::Const(IrConst::I64(-7)));
+        assert_eq!(phi[0].0, Operand::Const(IrConst::I64(7)));
         assert_valid(&f);
     }
 }
@@ -500,6 +522,37 @@ fn pointer_width_add_i686_rewrites_without_truncating_offsets() {
     f.blocks[1].instructions[0] = add(3, 0, Operand::Const(IrConst::I64(1i64 << 40)), IrType::I32);
     f.blocks[3].instructions[1] = sub(5, 4, 0, IrType::I32);
     assert_eq!(run(&mut f), 0, "I64 offset must not silently wrap on i686");
+}
+
+#[test]
+fn negative_add_is_not_a_backdoor_around_the_backward_step_gate() {
+    for (width, ty, constant) in [
+        (8, IrType::I64, IrConst::I64(-7)),
+        (4, IrType::I32, IrConst::I32(-7)),
+    ] {
+        let _width = TargetSize::set(width);
+        for commuted in [false, true] {
+            let mut f = diamond();
+            f.return_type = ty;
+            let offset = Operand::Const(constant);
+            f.blocks[1].instructions[0] = if commuted {
+                Instruction::BinOp {
+                    dest: value(3),
+                    op: IrBinOp::Add,
+                    lhs: offset,
+                    rhs: v(0),
+                    ty,
+                }
+            } else {
+                add(3, 0, offset, ty)
+            };
+            f.blocks[3].instructions[1] = sub(5, 4, 0, ty);
+            let before = format!("{:?}", f.blocks);
+            assert_eq!(run(&mut f), 0, "width={width}, commuted={commuted}");
+            assert_eq!(format!("{:?}", f.blocks), before);
+            assert_valid(&f);
+        }
+    }
 }
 
 #[test]

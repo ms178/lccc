@@ -12,9 +12,12 @@
 //! This pass deliberately does NOT speculate about arbitrary pointers: only a
 //! uniquely defined, acyclic tree of pointer phis/copies/constant addresses
 //! rooted at the exact same SSA base is accepted. Variable offsets, a different base, phis
-//! with non-pointer types, cycles, and offsets that do not fit the subtraction
-//! type all leave the original IR unchanged. Existing pointer phis remain if
-//! they have another use. Run in SSA immediately before phi elimination.
+//! with non-pointer types, cycles, negative offsets, and offsets that do not
+//! fit the subtraction type all leave the original IR unchanged. Backward
+//! address steps (even when encoded as `Add(base, -n)`/GEP rather than `Sub`)
+//! made a guarded host workload slower despite smaller assembly. Existing
+//! pointer phis remain if they have another use. Run in SSA immediately before
+//! phi elimination.
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
@@ -42,13 +45,18 @@ struct Plan {
 }
 
 fn offset_constant(op: Operand, ty: IrType) -> Option<i64> {
-    match (ty, op) {
+    let n = match (ty, op) {
         (IrType::I64, Operand::Const(IrConst::I64(n))) => Some(n),
         (IrType::I64, Operand::Const(IrConst::I32(n))) => Some(i64::from(n)),
         (IrType::I32, Operand::Const(IrConst::I32(n))) => Some(i64::from(n)),
         (IrType::I32, Operand::Const(IrConst::I64(n))) => i32::try_from(n).ok().map(i64::from),
         _ => None,
-    }
+    }?;
+    // A backward arm can lower as either Add(base, -n) or GEP(base, -n),
+    // not just Sub(base, n). The guarded Add/GEP host screen was slower with
+    // the fold in 25/31 pairs; accepting it here bypassed the Sub negative
+    // control. Keep zero/forward steps and leave backward steps untouched.
+    (n >= 0).then_some(n)
 }
 
 fn materialize_constant(n: i64, ty: IrType) -> Operand {
@@ -112,10 +120,11 @@ impl Matcher<'_> {
             {
                 offset_constant(*offset, self.ty).map(Arm::Constant)
             }
-            // Deliberately skip `Sub(base, constant)` backward steps here:
-            // a guarded three-arm candidate shrank x86 code but REGRESSED
-            // 31-pair host VM timing. The negative-control regression keeps
-            // that case out until a backend-aware improvement is measured.
+            // Deliberately skip `Sub(base, constant)` backward steps here.
+            // offset_constant also rejects equivalent negative Add/GEP arms:
+            // both guarded three-arm variants shrank x86 code but REGRESSED
+            // in separate 31-pair host screens. Keep them as negative controls
+            // until a backend-aware improvement is measured.
             Instruction::Phi {
                 ty: IrType::Ptr,
                 incoming,

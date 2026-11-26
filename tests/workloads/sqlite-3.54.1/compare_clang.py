@@ -39,6 +39,20 @@ def no_warnings(paths: list[pathlib.Path]) -> None:
                 raise ValueError(f"diagnostic in {path}:{number}: {line}")
 
 
+def run_speedtest(command: list[str], log: pathlib.Path, *, cwd: pathlib.Path) -> None:
+    # Build logs deliberately combine stdout/stderr for diagnostics, but a
+    # speedtest's verification hash lives on stdout: joining streams let a
+    # runtime warning slip into a "PASS" report. Preserve each stream and
+    # require silence just as the GCC/LCCC and paired workload gates do.
+    result = subprocess.run(command, cwd=cwd, capture_output=True, timeout=180)
+    log.write_bytes(result.stdout)
+    err = log.with_suffix(".err")
+    err.write_bytes(result.stderr)
+    if result.returncode or result.stderr:
+        raise RuntimeError(f"speedtest exited {result.returncode} or wrote stderr: "
+                           f"{log} (stderr: {err})")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--baseline", type=pathlib.Path, required=True)
@@ -47,8 +61,14 @@ def main() -> None:
     args = ap.parse_args()
     baseline = args.baseline.resolve()
     output = args.out.resolve()
-    if baseline == output or not shutil.which(args.clang):
-        ap.error("distinct output directory and an installed Clang required")
+    if baseline == output:
+        ap.error("output directory must differ from the validated baseline")
+    output.mkdir(parents=True, exist_ok=True)
+    # Invalidate BEFORE inspecting inputs, checking Clang availability, or
+    # rejecting a retained build tree: failed reruns cannot leave an old PASS.
+    (output / "manifest.json").unlink(missing_ok=True)
+    if not shutil.which(args.clang):
+        ap.error("an installed Clang is required")
     manifest = json.loads((baseline / "manifest.json").read_text())
     if manifest.get("status") != "PASS" or manifest.get("version") != "3.54.1":
         raise ValueError("expected validated SQLite 3.54.1 baseline")
@@ -60,8 +80,6 @@ def main() -> None:
     if build.exists():
         raise ValueError(f"Clang build tree already exists (refuse stale objects): {build}")
     build.mkdir()
-    output.mkdir(parents=True, exist_ok=True)
-    (output / "manifest.json").unlink(missing_ok=True)
     clang = str(pathlib.Path(shutil.which(args.clang) or args.clang).resolve())
     cc_env = dict(os.environ, CC=clang, CFLAGS=manifest["cflags"],
                   CPPFLAGS=manifest["cppflags"], LDFLAGS="-Wl,-z,relro -Wl,-z,now")
@@ -94,9 +112,9 @@ def main() -> None:
     for testset, expected in manifest["speedtest1"].items():
         db = build / f"clang-{testset}.db"
         text = output / f"bench-{testset}-clang.txt"
-        logged([str(build / "speedtest1"), "--size", str(manifest["speedtest_size"]),
-                "--nosync", "--testset", testset, "--verify", str(db)], text,
-               cwd=build, timeout=180)
+        run_speedtest([str(build / "speedtest1"), "--size", str(manifest["speedtest_size"]),
+                       "--nosync", "--testset", testset, "--verify", str(db)], text,
+                      cwd=build)
         run = parse_run(text)
         if (run["verification_hash"] != expected["verification_hash"] or
                 run["verification_bytes"] != expected["verified_bytes"] or

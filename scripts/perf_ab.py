@@ -8,7 +8,7 @@ Supports:
 3. Noise-resistant shared-VM metrics (interleaved alternating AB/BA rounds,
    empty-process floor exclusion, geometric mean speedup calculation, and
    statistical bounds).
-4. Output verification on every run (ensuring zero miscompilations or crashes).
+4. Output verification on every run (exit code, stdout identity, and no runtime stderr).
 5. JSON and Markdown report export.
 6. Static instruction-count A/B with a behaviour-identity gate
    (`--metric insns`, absorbed from the deleted `peephole_ab.py`): both arms
@@ -312,11 +312,11 @@ def build_binary(
         return False, str(e)
 
 
-def run_once(path: str) -> tuple[float, int, bytes]:
-    """Return elapsed milliseconds, exit status, and stdout for one run."""
+def run_once(path: str) -> tuple[float, int, bytes, bytes]:
+    """Return elapsed milliseconds, status, stdout AND stderr for one run."""
     t0 = time.perf_counter()
     p = subprocess.run([path], capture_output=True, timeout=900)
-    return (time.perf_counter() - t0) * 1000.0, p.returncode, p.stdout
+    return (time.perf_counter() - t0) * 1000.0, p.returncode, p.stdout, p.stderr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -613,7 +613,7 @@ def measure_floor(tmp: str) -> float:
         return 0.5
     try:
         floor_samples = [run_once(floor_bin) for _ in range(15)]
-        return min(elapsed for elapsed, rc, _ in floor_samples if rc == 0)
+        return min(elapsed for elapsed, rc, _, err in floor_samples if rc == 0 and not err)
     except Exception:
         return 0.5
 
@@ -849,9 +849,12 @@ def main() -> int:
                         order = (("B", b_bin), ("A", a_bin))
 
                     for side, binary in order:
-                        elapsed, returncode, stdout = run_once(binary)
+                        elapsed, returncode, stdout, stderr = run_once(binary)
                         if returncode != 0:
                             failure = f"{src.stem}: {side} exited non-zero ({returncode})"
+                            break
+                        if stderr:
+                            failure = f"{src.stem}: {side} wrote runtime stderr ({stderr[:160]!r})"
                             break
                         if expected_stdout is None:
                             expected_stdout = stdout

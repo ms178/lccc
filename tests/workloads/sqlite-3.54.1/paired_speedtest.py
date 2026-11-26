@@ -77,12 +77,20 @@ def main() -> None:
     ap.add_argument("--repeats", type=int, default=7)
     ap.add_argument("--out", type=pathlib.Path, required=True)
     args = ap.parse_args()
+    args.out = args.out.resolve()
+    protected = {root.resolve() / name for root in (args.enabled, args.disabled)
+                 for name in ("manifest.json", "work-path.txt")}
+    if args.out in protected:
+        ap.error("output may not overwrite an input manifest or work path")
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    # A failed rerun must not leave its predecessor's PASS report on disk.
+    # Invalidate even for a newly invalid testset/repeat configuration.
+    args.out.unlink(missing_ok=True)
     if args.repeats < 1 or not args.sets or len(args.sets) != len(set(args.sets)):
         ap.error("positive repeats and distinct nonempty testsets required")
     a, a_bin = input_build(args.enabled)
     b, b_bin = input_build(args.disabled)
     identity(a, b, args.sets)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
     raw = args.out.parent / (args.out.stem + "-raw")
     raw.mkdir(exist_ok=True)
     results = {}

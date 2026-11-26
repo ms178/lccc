@@ -26,6 +26,15 @@ RECIPE_COMMIT=0516be29c004aa2a64e8a66ba84a3eda154ccd6e
 RECIPE_SHA256=74e7677d9728114cf6a6d2caca42942f40454824e839dabf0922a80995212ed1
 RECIPE_PATCH_SHA256=55746d93b0df4b349c4aa4f09535746dac3530f9fd6de241c9f38e2c92e8ee97
 
+# Even an early prerequisite failure must not leave an older PASS manifest.
+# Resolve the artifact directory before any tool, compiler, swap or recipe
+# checks can abort; keep all other inputs untouched on such failures.
+mkdir -p -- "$ARTIFACT_DIR"
+ARTIFACT_DIR=$(cd -- "$ARTIFACT_DIR" && pwd -P)
+rm -f -- "$ARTIFACT_DIR/manifest.json"
+# shellcheck source=tests/workloads/sqlite-3.54.1/integrity_gate.sh
+source "$ROOT/tests/workloads/sqlite-3.54.1/integrity_gate.sh"
+
 for tool in curl unzip patch sha256sum python3 make timeout realpath "$GCC"; do
     command -v "$tool" >/dev/null || { echo "missing required command: $tool" >&2; exit 2; }
 done
@@ -64,8 +73,6 @@ ARTIFACT_DIR=$(realpath "$ARTIFACT_DIR")
 RECIPE_DIR=$(realpath "$RECIPE_DIR")
 LCCC=$(realpath "$LCCC")
 LCCC_LD=$(realpath "$LCCC_LD")
-# An interrupted rerun must never leave a prior successful PASS manifest.
-rm -f -- "$ARTIFACT_DIR/manifest.json"
 if ! python3 "$ROOT/tests/workloads/sqlite-3.54.1/test_summarize.py" \
     > "$ARTIFACT_DIR/summary-selftest.log" 2>&1; then
     cat "$ARTIFACT_DIR/summary-selftest.log" >&2
@@ -222,9 +229,10 @@ for testset in $SPEED_SETS; do
                 echo "unexpected speedtest stderr: $testset/$rep/$key" >&2; exit 1;
             }
             grep -q '^Verification Hash: ' "$out" || { echo "no speedtest verification: $out" >&2; exit 1; }
-            [[ $("$WORK/build-$key/sqlite3" -batch -bail "$db" 'PRAGMA integrity_check;') == ok ]] || {
-                echo "speedtest DB failed integrity_check: $db" >&2; exit 1;
-            }
+            integrity_out="$ARTIFACT_DIR/integrity-$testset-$rep-$key.txt"
+            integrity_err="$ARTIFACT_DIR/integrity-$testset-$rep-$key.err"
+            sqlite_speedtest_integrity "$WORK/build-$key/sqlite3" "$db" \
+                "$integrity_out" "$integrity_err"
             # Only hashes and raw timing logs are consumed after integrity.
             # Retaining 36 verified databases per build cost ~284 MiB in this
             # bounded run and needlessly crowded the constrained build host.

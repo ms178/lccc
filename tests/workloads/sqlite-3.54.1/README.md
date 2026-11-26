@@ -53,12 +53,17 @@ python3 scripts/perf_ab.py --env CCC_DISABLE_PASSES=ptr_delta_phi \
   --only ptr_delta_phi_bench --reps 11 --cflag=-march=x86-64-v3 \
   --json target/sqlite-3.54.1/varint-ab.json \
   tests/workloads/sqlite-3.54.1/ptr_delta_phi_bench.c
-# Negative control: this backward pointer step is intentionally NOT folded.
-# A proposed fold regressed host timing despite smaller x86 assembly.
+# Two backward-step negative controls: Sub(base, 7) and GEP/Add(base, -7)
+# are intentionally NOT folded. Experimental variants of each regressed host
+# timing despite smaller x86 assembly. Their final on/off code is identical.
 python3 scripts/perf_ab.py --env CCC_DISABLE_PASSES=ptr_delta_phi \
   --only ptr_delta_phi_negative_bench --reps 15 --cflag=-march=x86-64-v3 \
   --json target/sqlite-3.54.1/negative-control-ab.json \
   tests/workloads/sqlite-3.54.1/ptr_delta_phi_negative_bench.c
+python3 scripts/perf_ab.py --env CCC_DISABLE_PASSES=ptr_delta_phi \
+  --only ptr_delta_phi_negative_add_bench --reps 15 --cflag=-march=x86-64-v3 \
+  --json target/sqlite-3.54.1/negative-add-control-ab.json \
+  tests/workloads/sqlite-3.54.1/ptr_delta_phi_negative_add_bench.c
 
 # Controlled full-project comparison: SAME LCCC binary/C flags/source.
 # Keep both builds so the paired gate can run each on fresh databases.
@@ -100,8 +105,9 @@ PMU/hardware-speed claim. The separate
 `ptr_delta_phi_bench.c` includes the 3.54.1 decoder fixture verbatim, runs the
 90,000-case independent oracle before every timing, and then calls the decoder
 on a cache-resident, mixed-length corpus. `perf_ab.py` alternates A/B order and
-compares complete output on *every* sample. Its VM times are a screen, not
-PMU instruction counts or proof of end-to-end speedup. For full-project A/B,
+requires zero exit status, empty runtime stderr and identical complete stdout
+on *every* sample. Its VM times are a screen, not PMU instruction counts or
+proof of end-to-end speedup. For full-project A/B,
 `paired_speedtest.py` refuses different compiler hashes, source, flags,
 verification hashes or pass settings, alternates the **measurement** order, and
 runs `integrity_check` on every fresh database. It saves each raw run and
@@ -109,15 +115,15 @@ reports both pooled medians and medians of paired ratios; treat small VM
 differences as noise, not as CPU-cycle or native Raptor Lake evidence. The
 four-target checker proves the **varint** pointer-subtraction instruction
 disappears from x86-64, i686, AArch64 and RISC-V 64 output with the pass.
-It also checks that a guarded `p - 7` pointer-phi **negative control** retains
-its original codegen in both modes: a broader fold was functionally sound but
-*slower* in an interleaved x86 host screen, so static shrinkage is not enough.
-On compatible Linux/x86-64 hosts, it additionally runs 90,000 varints and
-50,000 guarded deltas in freestanding **i686** binaries built with GCC, Clang
-and LCCC pass-on/off against a separate GCC-compiled oracle. When pinned QEMU
-user-mode emulators are on PATH, it executes the same two sets on **AArch64
-and RISC-V 64** with Clang/LCCC pass-on/off against a separately Clang-compiled
-oracle.
+It also checks that guarded `p -= 7` and `p += -7` pointer-phi **negative
+controls** retain their original codegen in both modes: broader folds were
+functionally sound but *slower* in separate interleaved x86 host screens, so
+static shrinkage is not enough. On compatible Linux/x86-64 hosts, it runs
+90,000 varints and 100,000 guarded deltas (50,000 per backward encoding) in
+freestanding **i686** binaries built with GCC, Clang and LCCC pass-on/off
+against a separate GCC-compiled oracle. When pinned QEMU user-mode emulators
+are on PATH, it executes the same cases on **AArch64 and RISC-V 64** with
+Clang/LCCC pass-on/off against a separately Clang-compiled oracle.
 Their emulated functional results do **not** prove native-target speed.
 If QEMU is missing the script explicitly reports those runtimes as skipped.
 The optional `compare_clang.py` builds the same retained, patched release with
