@@ -1881,17 +1881,48 @@ fn kept(body: &str) -> (bool, String) {
 /// [`kept`], with `mark` applied to the line infos first (a pin, a
 /// volatile access).
 fn kept_unless(body: &str, mark: impl Fn(&mut [LineInfo])) -> (bool, String) {
+    let (changed, out) = kept_with_directives(body, mark);
+    let out = out
+        .lines()
+        .filter(|line| !line.starts_with(".cfi"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (changed, out)
+}
+
+/// [`kept_unless`], with the unwind directives of `body` where the pass
+/// left them. The store and the infos stay one line for one line, whatever
+/// the pass added.
+fn kept_with_directives(body: &str, mark: impl Fn(&mut [LineInfo])) -> (bool, String) {
     let text = format!("foo:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
     let mut store = LineStore::new(text);
     let mut infos: Vec<_> = (0..store.len())
         .map(|i| classify_line(store.get(i)))
         .collect();
+    let as_read: Vec<LineKind> = infos.iter().map(|info| info.kind).collect();
     mark(&mut infos);
+    let marked = infos
+        .iter()
+        .zip(&as_read)
+        .any(|(info, kind)| info.kind != *kind);
     let changed = keep_carry_round_loop(&mut store, &mut infos);
+    assert_eq!(store.len(), infos.len(), "a line without its info");
+    // Every line is what its info says it is, the added one too (unless
+    // the test said otherwise of a line itself).
+    for (i, info) in infos.iter().enumerate() {
+        if !info.is_nop() && !marked {
+            assert_eq!(
+                info.kind,
+                classify_line(store.get(i)).kind,
+                "line {i} is not what its info says: {}",
+                store.get(i)
+            );
+        }
+    }
     let out = (0..store.len())
         .filter(|&i| !infos[i].is_nop())
         .map(|i| store.get(i).trim_ascii())
-        .filter(|line| !line.starts_with(".cfi") && *line != "foo:")
+        .filter(|line| !matches!(*line, "foo:" | ".cfi_startproc" | ".cfi_endproc"))
         .collect::<Vec<_>>()
         .join("\n");
     (changed, out)
@@ -1975,6 +2006,19 @@ impl Loop<'_> {
              movq 8(%rdx), %rax\n    {adder} 8(%r9), %rax\n    movl $0, {low}\n    setc {byte}\n\
              {bottom}{count}{jump}{behind}"
         )
+    }
+
+    /// [`Loop::limbs`] as the block layout leaves the main loop of a split
+    /// limb loop where the order the pass appended its blocks in is the
+    /// one emitted: behind the function's `ret`, entered by a `jmp` and
+    /// left by one, and saying its frame again.
+    fn behind_the_ret() -> Self {
+        Loop {
+            way_in: "    jmp .LBB7\n.LBB9:\n    movq %r8, %rcx\n    xorl %eax, %eax\n    ret\n",
+            top: "    .cfi_def_cfa_offset 40\n    movq (%rdx), %rax\n",
+            behind: "    jmp .LBB9",
+            ..Loop::limbs()
+        }
     }
 
     /// The loop keeps its carry in the flag, and computes what it did.
@@ -2307,6 +2351,218 @@ fn a_carry_stays_in_the_flag_round_a_limb_loop() {
     }
 }
 
+/// The main loop of a split limb loop behind the function's `ret`: one
+/// `jmp` enters it, and the carry goes into the flag in front of that.
+#[test]
+fn a_loop_entered_by_a_jump_takes_its_carry_in_front_of_the_jump() {
+    let behind = Loop::behind_the_ret;
+    let out = behind().is_kept();
+    assert_eq!(
+        lines(&out)[3..],
+        [
+            "movl $3, %r11d",
+            "btl $0, %r8d",
+            "jmp .LBB7",
+            ".LBB9:",
+            "movq %r8, %rcx",
+            "xorl %eax, %eax",
+            "ret",
+            ".LBB7:",
+            "movq (%rdx), %rax",
+            "adcq (%r9), %rax",
+            "movq %rax, (%r10)",
+            "movq 8(%rdx), %rax",
+            "adcq 8(%r9), %rax",
+            "movq %rax, 8(%r10)",
+            "leaq 16(%r10), %r10",
+            "leaq 16(%r9), %r9",
+            "leaq 16(%rdx), %rdx",
+            "decq %r11",
+            "jne .LBB7",
+            "movl $0, %r8d",
+            "setc %r8b",
+            "jmp .LBB9",
+        ],
+        "{out}"
+    );
+    // The label keeps its place, and the block's frame is said in front of
+    // every instruction of it, as it was.
+    let (changed, whole) = kept_with_directives(&behind().text(), |_| {});
+    assert!(changed);
+    assert!(
+        whole.contains("ret\n.LBB7:\n.cfi_def_cfa_offset 40\nmovq (%rdx), %rax\nadcq (%r9), %rax"),
+        "{whole}"
+    );
+    assert_eq!(
+        whole.matches(".cfi_def_cfa_offset 40").count(),
+        1,
+        "{whole}"
+    );
+    // Without a frame to say, with more than one directive for it, and
+    // with a borrow, another register and a carry out in a second one.
+    for top in [
+        "    movq (%rdx), %rax\n",
+        "    .cfi_restore_state\n    .cfi_def_cfa_offset 40\n    movq (%rdx), %rax\n",
+    ] {
+        let out = Loop { top, ..behind() }.is_kept();
+        assert!(
+            out.contains("movl $3, %r11d\nbtl $0, %r8d\njmp .LBB7\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ret\n.LBB7:\nmovq (%rdx), %rax\nadcq (%r9), %rax"),
+            "{out}"
+        );
+    }
+    let out = Loop {
+        adder: "sbbq",
+        carry: "rbp",
+        way_in: "    jmp .LBB7\n.LBB9:\n    movq %rbp, %rcx\n    xorl %eax, %eax\n    ret\n",
+        ..behind()
+    }
+    .is_kept();
+    assert!(out.contains("btl $0, %ebp\njmp .LBB7\n"), "{out}");
+    assert!(
+        out.contains("jne .LBB7\nmovl $0, %ebp\nsetc %bpl\njmp .LBB9"),
+        "{out}"
+    );
+    let out = kept_the_same(
+        &behind()
+            .text()
+            .replace(
+                "movl $0, %r8d\n    setc %r8b",
+                "movl $0, %r13d\n    setc %r13b",
+            )
+            .replace(
+                "    testq %r11, %r11\n",
+                "    movq %r13, %r8\n    testq %r11, %r11\n",
+            ),
+    );
+    assert!(
+        out.contains("jne .LBB7\nmovl $0, %r13d\nsetc %r13b\nmovq %r13, %r8\njmp .LBB9"),
+        "{out}"
+    );
+
+    // A carry in cleared in front of the jump is the flag the clearing
+    // left: no `bt`, and no line added.
+    let cleared = Loop {
+        way_in: "    xorl %r8d, %r8d\n    jmp .LBB7\n.LBB9:\n    movq %r8, %rcx\n    xorl %eax, %eax\n    ret\n",
+        ..behind()
+    };
+    let out = cleared.is_kept();
+    assert!(!out.contains("bt"), "{out}");
+    assert!(out.contains("xorl %r8d, %r8d\njmp .LBB7\n"), "{out}");
+    assert_eq!(lines(&out).len(), lines(&cleared.text()).len() - 3, "{out}");
+    // Cleared further up, another register cleared, or cleared on one of
+    // two ways to the jump: it is tested, in front of the jump and behind
+    // the label the other way arrives at.
+    for (way_in, made) in [
+        (
+            "    xorl %r8d, %r8d\n    movq %rdx, %rcx\n    jmp .LBB7\n",
+            "movq %rdx, %rcx\nbtl $0, %r8d\njmp .LBB7\n",
+        ),
+        (
+            "    xorl %ecx, %ecx\n    jmp .LBB7\n",
+            "xorl %ecx, %ecx\nbtl $0, %r8d\njmp .LBB7\n",
+        ),
+        (
+            "    testq %rsi, %rsi\n    je .LBB5\n    xorl %r8d, %r8d\n.LBB5:\n    jmp .LBB7\n",
+            "xorl %r8d, %r8d\n.LBB5:\nbtl $0, %r8d\njmp .LBB7\n",
+        ),
+        (
+            "    testq %rsi, %rsi\n    je .LBB9\n    jmp .LBB7\n",
+            "je .LBB9\nbtl $0, %r8d\njmp .LBB7\n",
+        ),
+    ] {
+        let way_in = format!("{way_in}.LBB9:\n    movq %r8, %rcx\n    xorl %eax, %eax\n    ret\n");
+        let out = Loop {
+            way_in: &way_in,
+            ..behind()
+        }
+        .is_kept();
+        assert!(out.contains(made), "{out}");
+        assert_eq!(out.matches("btl").count(), 1, "{out}");
+    }
+
+    // What stands above the label is a jump through a register: no way in
+    // either, the label's address is taken nowhere.
+    let out = Loop {
+        way_in: "    jmp .LBB7\n.LBB9:\n    movq %r8, %rcx\n    xorl %eax, %eax\n    ret\n    jmp *%rcx\n",
+        ..behind()
+    }
+    .is_kept();
+    assert!(
+        out.contains("movl $3, %r11d\nbtl $0, %r8d\njmp .LBB7\n"),
+        "{out}"
+    );
+
+    // The jump stands directly above the label, or below the loop: the
+    // line that is added moves what stands behind it, and nothing else.
+    let out = Loop {
+        way_in: "    jmp .LBB7\n",
+        ..Loop::limbs()
+    }
+    .is_kept();
+    assert!(
+        out.contains("movl $3, %r11d\nbtl $0, %r8d\njmp .LBB7\n.LBB7:\nmovq (%rdx), %rax\nadcq"),
+        "{out}"
+    );
+    let below = Loop {
+        way_in: "    jmp .LBB1\n.LBB9:\n    movq %r8, %rcx\n    xorl %eax, %eax\n    ret\n",
+        behind: "    jmp .LBB9\n.LBB1:\n    jmp .LBB7",
+        ..behind()
+    };
+    let out = below.is_kept();
+    assert!(
+        out.ends_with(
+            "jne .LBB7\nmovl $0, %r8d\nsetc %r8b\njmp .LBB9\n.LBB1:\nbtl $0, %r8d\njmp .LBB7"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("movl $3, %r11d\njmp .LBB1\n.LBB9:"), "{out}");
+
+    // Two loops in one file, each with a line added above it: the second
+    // is found where the first one's line moved it to, and each is made
+    // what it is made alone. Then the same with the jumps below the loops.
+    for first in [behind(), below] {
+        let renamed = |text: &str| {
+            text.replace(".LBB7", ".LBB17")
+                .replace(".LBB9", ".LBB19")
+                .replace(".LBB1\n", ".LBB11\n")
+                .replace(".LBB1:", ".LBB11:")
+                .replace("%r8d", "%ebp")
+                .replace("%r8b", "%bpl")
+                .replace("%r8", "%rbp")
+        };
+        let first = first.text();
+        let second = renamed(&first);
+        let (changed, both) = kept(&format!("{first}\n{second}"));
+        assert!(changed);
+        assert_eq!(
+            both,
+            format!("{}\n{}", kept_the_same(&first), kept_the_same(&second)),
+            "{both}"
+        );
+        assert_eq!(both.matches("bt").count(), 2, "{both}");
+    }
+
+    // Far from its jump in, and from where its jump out goes, but within
+    // reach of both.
+    let filler = "    movq %rcx, %rsi\n".repeat(500);
+    let far = format!(
+        "    jmp .LBB7\n.LBB9:\n    movq %r8, %rcx\n    xorl %eax, %eax\n    ret\n{filler}    ret\n"
+    );
+    let out = Loop {
+        way_in: &far,
+        ..behind()
+    }
+    .is_kept();
+    assert!(
+        out.contains("movl $3, %r11d\nbtl $0, %r8d\njmp .LBB7\n"),
+        "{out}"
+    );
+}
+
 #[test]
 fn a_loop_whose_carry_cannot_stay_in_the_flag_is_left_alone() {
     let limbs = Loop::limbs;
@@ -2468,15 +2724,135 @@ fn a_loop_whose_carry_cannot_stay_in_the_flag_is_left_alone() {
     }
     .stays("two branches to the label");
     Loop {
-        way_in: "    jmp .LBB7\n",
-        ..limbs()
-    }
-    .stays("no way in from above");
-    Loop {
         way_in: "    .p2align 4\n",
         ..limbs()
     }
     .stays("an aligned label");
+    // A label that the file defines twice names no one place, whichever
+    // way the loop is entered.
+    Loop {
+        behind: "    movq %r8, %rcx\n    xorl %eax, %eax\n    ret\n.LBB7:\n    ret",
+        ..limbs()
+    }
+    .stays("a label defined twice");
+    Loop {
+        behind: "    jmp .LBB9\n.LBB7:\n    ret",
+        ..Loop::behind_the_ret()
+    }
+    .stays("a label defined twice, entered by a jump");
+    // Entered by a jump, and by something else as well: a second jump, a
+    // conditional one, the line above (which falls in, or is a call that
+    // may come back), a taken address; or by nothing that can be told.
+    let behind = Loop::behind_the_ret;
+    let tail = ".LBB9:\n    movq %r8, %rcx\n    xorl %eax, %eax\n    ret\n";
+    for (way_in, why) in [
+        (
+            "    testq %rsi, %rsi\n    je .LBB5\n    jmp .LBB7\n.LBB5:\n    jmp .LBB7\n",
+            "two jumps into the loop",
+        ),
+        (
+            "    testq %rsi, %rsi\n    je .LBB7\n    jmp .LBB7\n",
+            "a jump and a branch into the loop",
+        ),
+        (
+            "    testq %rsi, %rsi\n    jne .LBB7\n",
+            "a branch into the loop and no jump",
+        ),
+        (
+            "    leaq .LBB7(%rip), %rcx\n    jmp .LBB7\n",
+            "the label's address taken",
+        ),
+        (
+            "    leaq .LBB7(%rip), %rcx\n    jmp *%rcx\n",
+            "entered through its address",
+        ),
+        ("    jmp *%rcx\n", "entered by nothing that names it"),
+        ("", "entered by nothing at all"),
+    ] {
+        let way_in = format!("{way_in}{tail}");
+        Loop {
+            way_in: &way_in,
+            ..behind()
+        }
+        .stays(why);
+    }
+    for (above, why) in [
+        (
+            "    movq %r8, %rcx\n",
+            "a jump in, and the line above falls in",
+        ),
+        ("    call abort\n", "a jump in, and a call above"),
+        (
+            "    ret\n    .p2align 4\n",
+            "a jump in, and an aligned label",
+        ),
+        (
+            "    ret\n    .byte 0x90\n",
+            "a jump in, and data above the label",
+        ),
+    ] {
+        let way_in = format!("    jmp .LBB7\n.LBB9:\n    movq %r8, %rcx\n{above}");
+        Loop {
+            way_in: &way_in,
+            ..behind()
+        }
+        .stays(why);
+    }
+    // The jump in is too far above the loop to be looked for; so is the
+    // label of the jump out, each alone. Half as far, either is found.
+    for (lines_between, found) in [(500, true), (1100, false)] {
+        let filler = "    movq %rcx, %rsi\n".repeat(lines_between);
+        let jump_in = format!("    jmp .LBB7\n{filler}    ret\n");
+        let jump_out = format!("    jmp .LBB1\n{tail}{filler}.LBB1:\n");
+        for (way_in, top, behind) in [
+            (
+                &jump_in,
+                "    .cfi_def_cfa_offset 40\n    movq (%rdx), %rax\n",
+                "    movq %r8, %rcx\n    xorl %eax, %eax\n    ret",
+            ),
+            (&jump_out, "    movq (%rdx), %rax\n", "    jmp .LBB9"),
+        ] {
+            let far = Loop {
+                way_in,
+                top,
+                behind,
+                ..limbs()
+            };
+            if found {
+                far.is_kept();
+            } else {
+                far.stays("a jump out of reach");
+            }
+        }
+    }
+    // The jump is inline assembly, or a line that was deleted.
+    let body = behind().text();
+    let jump = 2 + lines(&body)
+        .iter()
+        .position(|line| *line == "jmp .LBB7")
+        .expect("the jump");
+    let (changed, out) = kept_unless(&body, |infos| infos[jump].kind = LineKind::InlineAsm);
+    assert!(!changed, "{out}");
+    let (changed, out) = kept_unless(&body, |infos| infos[jump].kind = LineKind::Nop);
+    assert!(!changed, "{out}");
+    // The frame said behind the label of a loop that the line above falls
+    // into: the `bt` would stand above the label and the directive with it.
+    Loop {
+        top: "    .cfi_def_cfa_offset 40\n    movq (%rdx), %rax\n",
+        ..limbs()
+    }
+    .stays("unwind directives behind a label that moves");
+    // Entered by a jump, with a directive that is not the block's frame
+    // behind the label, or one further down.
+    for top in [
+        "    .p2align 4\n    movq (%rdx), %rax\n",
+        "    .byte 0x90\n    movq (%rdx), %rax\n",
+        "    .cfi_def_cfa_offset 40\n    .p2align 4\n    movq (%rdx), %rax\n",
+        "    movq (%rdx), %rax\n    .cfi_def_cfa_offset 40\n",
+        "    .cfi_def_cfa_offset 40\n    movq (%rdx), %rax\n    .cfi_def_cfa_offset 48\n",
+    ] {
+        Loop { top, ..behind() }.stays("a directive in a loop entered by a jump");
+    }
     // Not one straight run: a label, a call, a push inside.
     for top in [
         "    movq (%rdx), %rax\n.LBB8:\n",

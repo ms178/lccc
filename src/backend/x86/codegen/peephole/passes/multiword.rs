@@ -80,11 +80,12 @@
 //!   that do not name it lie between), and the scratch byte, which is no
 //!   longer written, dead behind the extension.  A `mov` of an immediate
 //!   writes no flag;
-//! * the carry kept round a loop needs the loop to have one way in, round
-//!   and out, the carry's register named by nothing in it but the `bt` and
-//!   the `mov $0; setc`, no flag written from the `setc` to the first
-//!   adder but by the count, and the flags dead behind the loop (the list
-//!   is at [`keep_carry_round_loop`]).
+//! * the carry kept round a loop needs the loop to have one way in (the
+//!   line above, or one `jmp` where the layout put the loop behind a `ret`),
+//!   one way round and one out, the carry's register named by nothing in it
+//!   but the `bt` and the `mov $0; setc`, no flag written from the `setc`
+//!   to the first adder but by the count, and the flags dead behind the
+//!   loop (the list is at [`keep_carry_round_loop`]).
 //!
 //! No rewrite deletes or duplicates a memory access the program made, and
 //! none touches a pinned line or one flagged as a volatile access.  The
@@ -925,33 +926,138 @@ fn widen_carries_once(
 /// loops `passes::limb_unroll` writes have about twenty.
 const CARRY_LOOP_LINES: usize = 64;
 
-/// The lines of the loop that the `jne` at `j` closes, when it is one
-/// straight run from its own label: the label first and the `jne` last,
-/// and between them instructions alone -- no label, branch, call, push,
-/// pop or inline assembly, and no directive but the debugger's line marks,
-/// which are not among the lines and stay where they are.
-fn straight_loop(store: &LineStore, infos: &[LineInfo], j: usize) -> Option<Vec<usize>> {
+/// A loop that is one straight run from its own label to the `jne` that
+/// closes it.
+struct StraightLoop {
+    /// The label first and the `jne` last, and between them instructions
+    /// alone: no label, branch, call, push, pop or inline assembly.
+    lines: Vec<usize>,
+    /// Between the label and the first instruction the block says its
+    /// frame again (`.cfi_def_cfa_offset 40`: it was laid out behind a
+    /// `ret`). Those lines are not among `lines` and stay where they are,
+    /// so every instruction stays behind them only if the label stays in
+    /// its place as well.
+    unwind_behind_label: bool,
+}
+
+/// The loop that the `jne` at `j` closes, if it is a [`StraightLoop`]. No
+/// directive stands among its instructions: the debugger's line marks are
+/// not among the lines in the first place and stay where they are, and
+/// anything else (unwind state, alignment, data) would trade places with
+/// the instructions round it.
+fn straight_loop(store: &LineStore, infos: &[LineInfo], j: usize) -> Option<StraightLoop> {
     let (mnem, target) = mnemonic(infos[j].trimmed(store.get(j)))?;
     if !matches!(mnem, "jne" | "jnz") {
         return None;
     }
     let mut lines = vec![j];
+    let mut unwind_behind_label = false;
     let mut k = j;
     loop {
         k = prev_real(store, infos, k)?;
         let info = infos[k];
         let t = info.trimmed(store.get(k));
+        // Unwind directives emit nothing into the loop. Directly behind
+        // the label they are passed; from the first of them upwards
+        // nothing may follow but more of them and the label.
+        if steps_over_line(&info, t) && t.starts_with(".cfi_") {
+            unwind_behind_label = true;
+            continue;
+        }
         lines.push(k);
         if info.kind == LineKind::Label {
             lines.reverse();
-            return (label_text(t) == target).then_some(lines);
+            return (label_text(t) == target).then_some(StraightLoop {
+                lines,
+                unwind_behind_label,
+            });
         }
-        // The lines trade places: a directive among them (unwind state,
-        // alignment, data) would be moved with them.
         // DIRECTIVE-LAW: bails
-        if info.kind == LineKind::Directive || info.is_barrier() || lines.len() > CARRY_LOOP_LINES {
+        if info.kind == LineKind::Directive
+            || unwind_behind_label
+            || info.is_barrier()
+            || lines.len() > CARRY_LOOP_LINES
+        {
             return None;
         }
+    }
+}
+
+/// How far from a loop the `jmp` into it and the label of the `jmp` out of
+/// it are looked for. The main loop of a split limb loop stands behind
+/// the old loop and the function's `ret`: some dozen lines below its way
+/// in in a function that is the loop, the rest of the function below it
+/// in one that is more.
+const LOOP_REACH: usize = 1024;
+
+/// How a loop is entered, and whether the carry's register was cleared on
+/// the way (`xorl r, r`, which leaves CF clear as well: no `bt` is needed
+/// for such a carry in).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WayIn {
+    /// The line above the label falls into it, and nothing else enters.
+    Falls { cleared: bool },
+    /// One `jmp`, at this line, and the line above the label does not fall
+    /// in: the layout put the loop behind a `ret` or another jump.
+    Jumps { from: usize, cleared: bool },
+}
+
+/// The one way into the loop whose label, `label` with the number `number`,
+/// stands at line `top` and is named by the `jne` that closes it, or
+/// `None` where there are more, or one that cannot be told.
+fn way_in(
+    store: &LineStore,
+    infos: &[LineInfo],
+    top: usize,
+    (label, number): (&str, u32),
+    carry: RegId,
+    labels: &mut Option<LabelCounts>,
+) -> Option<WayIn> {
+    let (mentions, duplicate) = labels.get_or_insert_with(|| label_mention_counts(store, infos));
+    if duplicate.contains(&number) {
+        return None;
+    }
+    let mentions = *mentions.get(&number)?;
+    // `xorl r, r`, spelled without building it.
+    let name = Width::L.name(carry);
+    let cleared = |line: usize| {
+        infos[line]
+            .trimmed(store.get(line))
+            .strip_prefix("xorl ")
+            .and_then(|rest| rest.strip_prefix(name))
+            .and_then(|rest| rest.strip_prefix(", "))
+            == Some(name)
+    };
+    let above = prev_real(store, infos, top)?;
+    match infos[above].kind {
+        // No way in from above; the other mention has to be the jump.
+        LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret if mentions == 2 => {
+            let jumps_here = |line: &usize| {
+                infos[*line].kind == LineKind::Jmp
+                    && extract_jump_target(infos[*line].trimmed(store.get(*line))) == Some(label)
+            };
+            let window =
+                top.saturating_sub(LOOP_REACH)..store.len().min(top.saturating_add(LOOP_REACH));
+            let from = window.into_iter().find(jumps_here)?;
+            // What stands in front of the jump is in front of the loop.
+            // The first line of a file has nothing in front of it.
+            let before = prev_real(store, infos, from)?;
+            Some(WayIn::Jumps {
+                from,
+                cleared: cleared(before),
+            })
+        }
+        // A directive above the label (an alignment, data, another
+        // section) is no line to fall in from, nor is inline assembly.
+        // DIRECTIVE-LAW: bails
+        LineKind::Jmp
+        | LineKind::JmpIndirect
+        | LineKind::Ret
+        | LineKind::InlineAsm
+        | LineKind::Directive => None,
+        _ => (mentions == 1).then(|| WayIn::Falls {
+            cleared: cleared(above),
+        }),
     }
 }
 
@@ -972,10 +1078,6 @@ fn counts_down(t: &str) -> Option<(Width, RegId, bool)> {
     };
     Some((width, width.register(operand)?, true))
 }
-
-/// How far above a `jmp` its label may be for [`flags_dead_behind`] to
-/// look there.
-const LOOP_EXIT_WINDOW: usize = 256;
 
 /// True when the flags are dead from line `from` on: down the lines
 /// ([`flags_dead_after`], which follows a jump down only), or through one
@@ -1000,7 +1102,7 @@ fn flags_dead_behind(store: &LineStore, infos: &[LineInfo], from: usize) -> bool
                         .map(str::trim_ascii)
                         == Some(target)
             };
-            return (n.saturating_sub(LOOP_EXIT_WINDOW)..n)
+            return (n.saturating_sub(LOOP_REACH)..n)
                 .rev()
                 .find(names_target)
                 .is_some_and(|label| flags_dead_after(store, infos, label + 1));
@@ -1042,16 +1144,29 @@ fn stepped_by_lea(t: &str) -> Option<String> {
     })
 }
 
+/// What [`keep_carry_round_loop`] makes of a loop.
+struct KeptRound {
+    /// The loop's lines, and the text each of them gets (`None`: the line
+    /// goes).
+    lines: Vec<usize>,
+    made: Vec<Option<String>>,
+    /// The `bt` that goes in front of the jump into the loop: that jump's
+    /// line, and the text.
+    in_front_of_jump: Option<(usize, String)>,
+}
+
 /// What [`keep_carry_round_loop`] makes of the loop that the `jne` at `j`
-/// closes: its lines, and the text each of them gets (`None`: the line
-/// goes).
+/// closes.
 fn carry_kept_round(
     store: &LineStore,
     infos: &[LineInfo],
     j: usize,
     labels: &mut Option<LabelCounts>,
-) -> Option<(Vec<usize>, Vec<Option<String>>)> {
-    let lines = straight_loop(store, infos, j)?;
+) -> Option<KeptRound> {
+    let StraightLoop {
+        lines,
+        unwind_behind_label,
+    } = straight_loop(store, infos, j)?;
     let text = |n: usize| infos[lines[n]].trimmed(store.get(lines[n]));
     let neutral = |n: usize| flags_effect(text(n)) == FlagsEffect::Neutral;
     let last = lines.len() - 1;
@@ -1132,24 +1247,20 @@ fn carry_kept_round(
         return None;
     }
 
-    // Nothing but the line above enters the loop, and that one does.
-    let label = local_label(label_text(text(0)))?;
-    let (mentions, duplicate) = labels.get_or_insert_with(|| label_mention_counts(store, infos));
-    if mentions.get(&label) != Some(&1) || duplicate.contains(&label) {
-        return None;
-    }
-    let above = prev_real(store, infos, lines[0])?;
-    // A directive above the label (an alignment, data, another section)
-    // is no line to fall in from.
-    // DIRECTIVE-LAW: bails
-    if matches!(
-        infos[above].kind,
-        LineKind::Jmp
-            | LineKind::JmpIndirect
-            | LineKind::Ret
-            | LineKind::InlineAsm
-            | LineKind::Directive
-    ) {
+    // One way in: the line above, or one jump.
+    let label = label_text(text(0));
+    let way_in = way_in(
+        store,
+        infos,
+        lines[0],
+        (label, local_label(label)?),
+        carry,
+        labels,
+    )?;
+    // Where the line above falls in, the `bt` takes the label's place and
+    // the label the next line's: unwind directives between the two would
+    // end up above the label, and the `bt` above them.
+    if unwind_behind_label && matches!(way_in, WayIn::Falls { .. }) {
         return None;
     }
     // Behind the loop the flags are the `dec`'s and the last adder's
@@ -1158,19 +1269,28 @@ fn carry_kept_round(
         return None;
     }
 
-    // The carry in of a register that was just cleared is the flag the
-    // clearing left: no `bt` is needed for it.
-    let cleared = format!("xorl {0}, {0}", Width::L.name(carry));
-    let cleared = infos[above].trimmed(store.get(above)) == cleared;
     let whole = |n: usize| Some(store.get(lines[n]).to_string());
     let stepped = |n: usize| match stepped_by_lea(text(n)) {
         Some(lea) if n > set => Some(lea),
         _ => whole(n),
     };
     let mut made: Vec<Option<String>> = Vec::with_capacity(lines.len());
-    if !cleared {
-        made.push(whole(bt));
-    }
+    // The carry in of a register that was just cleared is the flag the
+    // clearing left: no `bt` is needed for it. Any other goes into the
+    // flag in front of the loop: above the label, or in front of the jump.
+    let in_front_of_jump = match way_in {
+        WayIn::Falls { cleared } => {
+            if !cleared {
+                made.push(whole(bt));
+            }
+            None
+        }
+        WayIn::Jumps { cleared: true, .. } => None,
+        WayIn::Jumps {
+            from,
+            cleared: false,
+        } => Some((from, store.get(lines[bt]).to_string())),
+    };
     made.extend((0..count).filter(|&n| !moved(n)).map(stepped));
     made.push(if is_dec {
         whole(count)
@@ -1185,7 +1305,11 @@ fn carry_kept_round(
     made.extend([whole(last), whole(zero), whole(set)]);
     made.extend(copy.map(whole));
     made.resize(lines.len(), None);
-    Some((lines, made))
+    Some(KeptRound {
+        lines,
+        made,
+        in_front_of_jump,
+    })
 }
 
 /// Keep the carry of a limb loop in the flag round its back edge:
@@ -1227,12 +1351,39 @@ fn carry_kept_round(
 /// the label's place and the label the next, the `mov $0; setc` end up
 /// behind the `jne`.
 ///
+/// A loop that the layout put behind a `ret` (the main loop of a split
+/// limb loop stands behind the loop it was made of, wherever the order the
+/// pass appended its blocks in is the one emitted) is entered by a `jmp`
+/// and by nothing else. Its `bt` goes in front of that `jmp`, which is the
+/// one line this pass adds to the file; the label stays where it is, with
+/// the unwind directives that say the block's frame again behind it:
+///
+/// ```text
+///     movq  %rdi, %r8                   movq  %rdi, %r8
+///                                       btl   $0, %ebp
+///     jmp   .LBB23                      jmp   .LBB23
+///     ...                               ...
+///     ret                               ret
+/// .LBB23:                           .LBB23:
+///     .cfi_def_cfa_offset 40            .cfi_def_cfa_offset 40
+///     movq  (%r9), %rax          ->     movq  (%r9), %rax
+///     btl   $0, %ebp
+///     adcq  (%r11), %rax                adcq  (%r11), %rax
+/// ```
+///
 /// Sound because, with `r` the carry's register:
 ///
-/// * the loop is one straight run from its label to the `jne`, the label
-///   is named by that `jne` alone and the line above it falls into it: one
-///   way in, through the `bt`, one way round, one way out, through the
-///   `mov $0; setc`;
+/// * the loop is one straight run from its label to the `jne`, with one
+///   way in, one way round and one way out, through the `mov $0; setc`.
+///   The way in is the line above, where that falls into the label and the
+///   `jne` alone names it; or one `jmp`, where the line above is a `jmp`
+///   or a `ret`, and the `jne` and that `jmp` are all that name the label
+///   in the file (so its address is taken nowhere either). In front of the
+///   `jmp` the `bt` runs exactly when the loop is entered, and it reads
+///   the `r` the `bt` on top read on the first trip: no line between the
+///   two names `r`. The flags it writes over were dead there -- from the
+///   `jmp` to the first adder nothing reads a flag, and the old `bt` and
+///   that adder between them write all six;
 /// * no line of the loop but the `bt`, the `mov $0` and the `setc` names
 ///   `r`: nothing reads it while it is not kept up to date, and it is the
 ///   carry in at the `bt` in front as it was at the `bt` on top. The carry
@@ -1258,20 +1409,39 @@ fn carry_kept_round(
 /// Ice Lake-SP the loop above runs 2,048 limbs in 0.26 s where it took
 /// 0.38 s. The pass asks for no tuning target;
 /// `CCC_PEEPHOLE_SKIP=carry_loop` switches it off.
-pub(super) fn keep_carry_round_loop(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+pub(super) fn keep_carry_round_loop(store: &mut LineStore, infos: &mut Vec<LineInfo>) -> bool {
     let mut changed = false;
     let mut labels = None;
-    for j in 0..store.len() {
-        if infos[j].is_nop() || infos[j].kind != LineKind::CondJmp {
-            continue;
-        }
-        let Some((lines, made)) = carry_kept_round(store, infos, j, &mut labels) else {
+    let mut j = 0;
+    while j < store.len() {
+        let kept = (!infos[j].is_nop() && infos[j].kind == LineKind::CondJmp)
+            .then(|| carry_kept_round(store, infos, j, &mut labels))
+            .flatten();
+        j += 1;
+        let Some(KeptRound {
+            lines,
+            made,
+            in_front_of_jump,
+        }) = kept
+        else {
             continue;
         };
         for (&line, text) in lines.iter().zip(made) {
             match text {
                 Some(text) => replace_line(store, &mut infos[line], line, text),
                 None => mark_nop(&mut infos[line]),
+            }
+        }
+        // The one line this pass adds: every line from the jump on moves
+        // down by one, the rest of this scan among them when the jump
+        // stands above the loop (as `local_patterns`' hoist of an `lea`
+        // onto the way into a loop does it).
+        if let Some((from, bt)) = in_front_of_jump {
+            let info = classify_line(&bt);
+            store.insert_line(from, bt);
+            infos.insert(from, info);
+            if from < j {
+                j += 1;
             }
         }
         changed = true;
