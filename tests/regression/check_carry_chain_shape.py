@@ -136,6 +136,8 @@ SHAPES: dict[str, tuple[int, int, int]] = {
     "lib_int_add_n": (5, 2, 43),
     "lib_while_sub_n": (5, 2, 61),
     "lib_topbit_add_n": (5, 2, 51),
+    "lib_guarded_add_n": (5, 1, 71),
+    "lib_guarded_sub_n": (5, 1, 71),
     "lib_count_n": (0, 0, 35),
     "lib_count_carried_n": (0, 0, 27),
     "two_add_ssaaaa": (1, 0, 7),
@@ -172,6 +174,10 @@ FOUR_A_TRIP = (
     "lib_int_add_n",
     "lib_while_sub_n",
     "lib_topbit_add_n",
+    # Behind a guard: the main loop stands behind the function's `ret` and
+    # is entered by a jump, in front of which the carry goes into the flag.
+    "lib_guarded_add_n",
+    "lib_guarded_sub_n",
 )
 LINKS_A_TRIP = 4
 

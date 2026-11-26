@@ -953,6 +953,42 @@ static NOINLINE u64 lib_topbit_add_n(u64 *r, const u64 *a, const u64 *b, long n,
     return c;
 }
 
+/* A loop behind a guard, as a function that also takes no limbs writes
+ * it, with the carry in an `unsigned`. The block layout puts the main loop
+ * of the split behind the function's `ret`: one `jmp` enters it, and the
+ * carry goes into the flag in front of that. */
+static NOINLINE u64 lib_guarded_add_n(u64 *r, const u64 *a, const u64 *b, long n, u64 q)
+{
+    unsigned c = 0;
+    if (n > 0) {
+        unsigned long m = (unsigned long)n;
+        do {
+            unsigned long long x = *a++, y = *b++, s, t;
+            u64 c1 = __builtin_add_overflow(x, y, &s);
+            u64 c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+            c = c1 | c2;
+            *r++ = t;
+        } while (--m != 0);
+    }
+    return (u64)c + q;
+}
+
+static NOINLINE u64 lib_guarded_sub_n(u64 *r, const u64 *a, const u64 *b, long n, u64 q)
+{
+    unsigned c = 0;
+    if (n > 0) {
+        unsigned long m = (unsigned long)n;
+        do {
+            unsigned long long x = *a++, y = *b++, d, e;
+            u64 c1 = __builtin_sub_overflow(x, y, &d);
+            u64 c2 = __builtin_sub_overflow(d, (unsigned long long)c, &e);
+            c = c1 | c2;
+            *r++ = e;
+        } while (--m != 0);
+    }
+    return (u64)c + q;
+}
+
 /* Not adders: the carries of three words a trip are counted (0, 1 or 2),
  * and the count is what goes round. */
 static NOINLINE u64 lib_count_n(u64 *r, const u64 *a, const u64 *b, const u64 *w, long n)
@@ -1464,6 +1500,10 @@ static void libraries(const u64 *a, const u64 *b)
         expect_limbs("lib_int_add_n, high half", r, want, LIMBS);
         expect("lib_int_add_n, none", lib_int_add_n(r, a, b, -(long long)n - 1), 0);
         expect_limbs("lib_int_add_n, none", r, want, LIMBS);
+        expect("lib_guarded_add_n carry", lib_guarded_add_n(r, a, b, n, 40), want_c + 40);
+        expect_limbs("lib_guarded_add_n", r, want, LIMBS);
+        expect("lib_guarded_add_n, none", lib_guarded_add_n(r, a, b, -(long)n, 7), 7);
+        expect_limbs("lib_guarded_add_n, none", r, want, LIMBS);
         for (unsigned in = 0; in < 2; in++) {
             /* Last with no carry in: `want` is what the loops below go on from. */
             unsigned first = !in;
@@ -1494,6 +1534,10 @@ static void libraries(const u64 *a, const u64 *b)
         expect_limbs("lib_while_sub_n", r, want, LIMBS);
         expect("lib_while_sub_n, none", lib_while_sub_n(r, a, b, -(long)n - 1), -2 * ((u64)n + 1));
         expect_limbs("lib_while_sub_n, none", r, want, LIMBS);
+        expect("lib_guarded_sub_n borrow", lib_guarded_sub_n(r, a, b, n, 40), want_c + 40);
+        expect_limbs("lib_guarded_sub_n", r, want, LIMBS);
+        expect("lib_guarded_sub_n, none", lib_guarded_sub_n(r, a, b, -(long)n, 7), 7);
+        expect_limbs("lib_guarded_sub_n, none", r, want, LIMBS);
 #if HAVE_INT128
         expect("lib_i128_sub_n borrow", lib_i128_sub_n(r, a, b, n), want_c);
         expect_limbs("lib_i128_sub_n", r, want, LIMBS);

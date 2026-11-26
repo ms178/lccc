@@ -340,13 +340,34 @@ and the count an `lea`, and moves the `bt` in front of the loop and the
 `mov $0; setc` behind it. A carry in that the line above the loop cleared
 needs no `bt`: the `xor` cleared the flag with the register.
 
+"In front of the loop" is the line above its label where that line falls
+into it. A function that guards its loop (`if (n > 0) do ... while (--n)`)
+is laid out with the main loop behind its `ret`, entered by one `jmp` from
+the guard. There the `bt` goes in front of that `jmp` -- the one line the
+pass adds to a file -- and the label stays where it is, with the unwind
+directive that says the block's frame again behind it. Of the 305 loops
+with four links in a row in the programs of seeds 1 to 80, 246 kept the
+carry in the flag before this and 299 do.
+
 It does so where all of this holds, `r` being the carry's register:
 
 * the loop is one straight run from its label to its `jne`: no label,
   branch, call, push, pop or inline assembly in it, no directive that
   emits anything;
-* that `jne` is the only line of the file that names the label (no second
-  way in, no table, no address taken) and the line above falls into it;
+* one way in. Either the line above falls into the label and that `jne` is
+  the only line of the file that names it (no second way in, no table, no
+  address taken); or the line above is a `jmp` or a `ret`, and the `jne`
+  and one `jmp` within 1,024 lines are all that name it. A label the file
+  defines twice is refused. In front of that `jmp` the `bt` runs exactly
+  when the loop is entered and reads the register the `bt` on top read on
+  the first trip; the flags it writes over were dead there, because from
+  the `jmp` to the first adder nothing reads one;
+* between the label and the first instruction there may be unwind
+  directives (`.cfi_def_cfa_offset 40`: the block stands behind a `ret`
+  that popped the frame), where the loop is entered by a jump: the label
+  and they stay in place and every instruction of the loop stays behind
+  them. Where the line above falls in, the `bt` takes the label's place,
+  and such a loop is left alone;
 * no line of the loop names `r` but the `bt`, the `mov $0` and the `setc`:
   nothing reads it while it is not kept up to date. Where the allocator
   took the carry out in another register and copied it into `r`
@@ -365,9 +386,13 @@ It does so where all of this holds, `r` being the carry's register:
   `dec`'s and the last carry now): down the lines, or through the one jump
   up into the old loop, which the flag oracle does not follow by itself.
 
-Each of them fails a unit test when it is taken out (32 mutants, all
-killed; four of the first 25 also make the limb fuzz differ from GCC, the
-others are code the compiler does not write in those programs). The unit tests run
+Each of them fails a unit test when it is taken out: 55 mutants, 53
+killed (four of the first 25 also make the limb fuzz differ from GCC, the
+others are code the compiler does not write in those programs). The two
+that live are the bookkeeping of the scan after the line is added: without
+it the scan looks a second time at the branch of the loop it just rewrote,
+which is no candidate any more, and with it applied where no line moved it
+skips the `mov $0` that now stands behind that branch. The unit tests run
 the loop as a program, before and after, on the model of the registers,
 memory, CF and ZF, from 400 states.
 
@@ -382,6 +407,12 @@ does not since: the carry flag is renamed apart from the other five.
 | mini-gmp `mpn_add_n` | 0.375 | 0.275 | |
 | mini-gmp `mpn_sub_n` | 0.378 | 0.268 | |
 | `unsigned __int128` sum | 0.375 | 0.262 | |
+| guarded `do ... while`, `__builtin_add_overflow` | 0.390 | 0.262 | |
+| the same with `__builtin_sub_overflow` | 0.387 | 0.259 | |
+
+The last two are entered by a jump (GCC 16.2 runs them in 1.252 s and
+1.238 s, Clang 23.1.5 in 0.992 s both, the loops left whole in 0.467 s and
+0.502 s).
 
 The peephole does not ask for a split loop, only for one that counts
 down: `do { ... } while (--n)` left whole keeps its carry in the flag too
@@ -391,9 +422,10 @@ to 0.510 s). The old loop of a split, which runs the `d & 3` limbs that are
 left, is as it was where it is counted against its limit by a compare or
 has two ways in. `CCC_PEEPHOLE_SKIP=carry_loop` switches the peephole off.
 
-**What it costs.** Code: a split loop is 43 to 63 instructions where it was
-14 to 22 (the seventeen limb loops of the fixture: 819 instructions for
-278; Clang, which unrolls them too, has 689, GCC, which does not, 383). The pass
+**What it costs.** Code: a split loop is 43 to 71 instructions where it was
+14 to 22 (the nineteen limb loops of the fixture: 961 instructions for
+322; Clang, which unrolls most of them too, has 723, GCC, which does not,
+430). The pass
 does not run at `-Os`, nor where the carry pass does not. Short numbers pay
 for the guard, 409.6 million limbs in numbers of `N` limbs, seconds
 (measured with the carry taken out and in once a trip):
@@ -425,12 +457,12 @@ of the old code, so that one is where the code lay and not what it is.
 
 Instructions per function at `-O2` over the adder functions of
 `tests/regression/carry_chain_adders.c` that all four compilers keep as
-functions (89 of them): before the work, now, GCC, Clang. The first column
+functions (91 of them): before the work, now, GCC, Clang. The first column
 is of the 86 there were when it was measured.
 
 | | before | one `adc` a trip | lccc | GCC 16.2 | Clang 23.1.5 |
 |---|---:|---:|---:|---:|---:|
-| all 89 | 1,987 (86) | 1,273 | 1,814 | 1,246 | 1,562 |
+| all 91 | 1,987 (86) | 1,317 | 1,956 | 1,293 | 1,596 |
 | the 72 that are no limb loop | | 995 | 995 | 863 | 873 |
 | `hdr_add4` (4 limbs, `_addcarry_u64`) | 46 | 13 | 13 | 13 | 13 |
 | `hdr_sub4` | 65 | 16 | 16 | 14 | 14 |
@@ -447,6 +479,8 @@ is of the 86 there were when it was measured.
 | `lib_int_add_n` (`int` index against `(int)n`) | | 16 | 43 | 22 | 42 |
 | `lib_while_sub_n` (`while (n-- > 0)`, `n` read behind) | | 19 | 61 | 32 | 49 |
 | `lib_topbit_add_n` (carry in `p >> 63`) | | 17 | 51 | 21 | 38 |
+| `lib_guarded_add_n` (`if (n > 0) do ... while (--m)`) | | 22 | 71 | 23 | 17 |
+| `lib_guarded_sub_n` | | 22 | 71 | 24 | 17 |
 | `two_acc3` (`c[0] += lo; hi += c[0] < lo; ...`) | 13 | 9 | 9 | 5 | 5 |
 | `two_add_ssaaaa` (GMP `longlong.h`) | 7 | 7 | 7 | 5 | 5 |
 
@@ -498,11 +532,16 @@ All four programs print the same checksum for each loop.
   flag. Counting them down to zero is the loop optimizer's part (the main
   loop was built that way, and a loop the source counts down is kept in
   the flag by the peephole as it is).
-* **A main loop the layout enters by a jump.** Of the 308 loops of seeds 1
-  to 80 that have four links in a row, 246 keep the carry in the flag. 55
-  of the others are entered by a `jmp` from the guard, because the old
-  loop was laid out in front of them: their label has two mentions and the
-  line above does not fall in.
+* **Six loops of 305** with four links in a row (seeds 1 to 80) still make
+  a boolean of the carry. In two the chain is broken inside the trip by a
+  copy of the carry (the first item; round the loop it is kept). In two
+  the carry out reaches its register through `%rax` and a temporary that
+  the trip uses for other things; in one through a `movslq`; and in one a
+  32-bit index is scaled by `shl` between the label and the first adder,
+  which writes the flags.
+* **The loop for the rest** behind a split one has two ways in (from the
+  guard and from behind the main loop) and is left as it was: at most
+  three limbs a call.
 * **A trip with more than its limb** (`h += t`) is not split, which is
   right as long as the copies would take the carry out for every limb
   (table above). Keeping the chain there needs the other work moved out of
@@ -535,14 +574,14 @@ All four programs print the same checksum for each loop.
 
 | | |
 |---|---|
-| `tests/regression/carry_chain_adders.c` | 95 functions in every spelling above, alone, in chains, in loops, across branches and calls, with constants, with either result unused, with a result stored over an operand; each result checked against an adder that computes in 32-bit halves. In the regression corpus. |
-| `tests/regression/check_carry_chain_shape.py` | The assembly of those functions: the number of `adc`/`sbb` in each, exactly; no `setc`/`bt` inside a straight chain; no more instructions than today. 91 functions, 70 with a chain, 165 links; and for the 17 limb loops (the library spellings, a counter the test reads narrowed, a count stepped before it is asked, a carry in that is the top bit of a word), four `adc`/`sbb` in a row in straight-line code, exactly, in a loop that makes no boolean of the carry and holds nothing but moves, `lea`, the four and a `dec` behind them. With `carry` off 61 of the pins break, with `limb_unroll` off all 17 of the trips and with the `carry_loop` peephole off all 17 of the loops, which are the negative controls. |
+| `tests/regression/carry_chain_adders.c` | 97 functions in every spelling above, alone, in chains, in loops, across branches and calls, with constants, with either result unused, with a result stored over an operand; each result checked against an adder that computes in 32-bit halves. In the regression corpus. |
+| `tests/regression/check_carry_chain_shape.py` | The assembly of those functions: the number of `adc`/`sbb` in each, exactly; no `setc`/`bt` inside a straight chain; no more instructions than today. 93 functions, 72 with a chain, 175 links; and for the 19 limb loops (the library spellings, a counter the test reads narrowed, a count stepped before it is asked, a carry in that is the top bit of a word, a loop behind a guard that the layout enters by a jump), four `adc`/`sbb` in a row in straight-line code, exactly, in a loop that makes no boolean of the carry and holds nothing but moves, `lea`, the four and a `dec` behind them. With `carry` off 63 of the pins break, with `limb_unroll` off all 19 of the trips and with the `carry_loop` peephole off all 19 of the loops, which are the negative controls; the head before the jump was followed fails on the two guarded loops. |
 | `tests/regression/check_carry_chain_fuzz.py` | Random adders (see the file's header): programs of ten functions assembled from the pieces above and from pieces that make them *not* adders, compared with GCC's program line by line through every optimization level and with the pass, the peephole and register allocation off in turn. One planted wrong carry as the negative control. CI runs eight programs (seeds 9 to 16) and the fixture through seven configurations. The window was chosen by breaking the compiler: with the compare behind a store allowed to name memory, seeds 13 and 14 differ from GCC (and the fixture reports 9,214 failures); with the registers it names allowed to be written in between, seeds 10 and 16 do. Run by hand through all fourteen configurations without a difference: 2,400 functions of the generator as it was before the accumulator forms (seeds 1 to 240), and 240 of the present one (seeds 1 to 24), whose programs GCC at `-O0`, GCC at `-O2` and Clang with every undefined-behaviour and integer check trapping print alike (seeds 1 to 40). |
 | `tests/regression/check_carry_chain_fuzz.py --limbs` | Random limb loops: programs of eight loops, each one adder a trip in one of fourteen spellings of a counted loop (up, down, `while (m)`, `do ... while (--m)`, from a start that may be behind the limit, to a constant, through an index, through stepped pointers or both, with the counter, the pointers and the last limb read behind the loop). Every other loop is plain, an adder the optimizer knows and nothing else in the trip; the rest are any spelling, now and then with a sum, a call or an edited carry in the trip. Compared with GCC's program through the seven configurations and with the split off; one planted wrong carry as the negative control; and a floor under the share of the loops that are split (31 of the 64 of seeds 9 to 16). `--census` lists the loops. Run by hand through all fifteen configurations without a difference: 960 loops, 466 of them split (seeds 1 to 120). |
 | `src/passes/carry_chain.rs` | 22 unit tests: each spelling, and each refusal. |
 | `src/passes/limb_unroll_tests.rs` | 18 unit tests. The loops are run on a machine for the IR, as they were and split: every shape (top and bottom tested, index and pointers, up and down, every test, 32 and 64 bits, signed and unsigned, a counter the test reads narrowed, a step in the header) over the counts from nothing to three trips and a remainder and the values where a counter wraps, with the result apart, in place and one limb above an operand; the two runs agree load by load and store by store. And each refusal. |
 | `src/backend/x86/codegen/alu_carry_tests.rs` | The emitter, executed on a model: every home of `x`, `y` and `c`. |
-| `peephole/passes/multiword_tests.rs` | The flag forwarding (from a register and from a slot of the frame), the unread carry and the carry taken out in place, executed before and after on a model of the registers, memory and CF; their refusals. The carry kept round a loop, run as a program on that model with ZF, labels and `jne`: every spelling of the count, either width, a borrow, steps by `add` and `sub`, a carry in that was cleared, the way out through a jump up; and 40 loops it has to leave alone, one for each condition and more. |
+| `peephole/passes/multiword_tests.rs` | The flag forwarding (from a register and from a slot of the frame), the unread carry and the carry taken out in place, executed before and after on a model of the registers, memory and CF; their refusals. The carry kept round a loop, run as a program on that model with ZF, labels and `jne`: every spelling of the count, either width, a borrow, steps by `add` and `sub`, a carry in that was cleared, the way out through a jump up; a loop behind a `ret` that is entered by a jump (the `bt` in front of the jump, above the loop and below it, directly above the label, behind a label another way arrives at; none for a carry cleared there; the unwind directives behind the label in place; two loops in one file); and the loops it has to leave alone, one for each condition and more, among them what is no single jump in: two jumps, a branch, a taken address, a jump out of reach, a label defined twice. |
 | `src/backend/live_range.rs` | A value that is dead from a loop's header to its latch is no span of that loop; alive at either, or without hole data, it is one. What a copy carries round a loop: the phi, the value copied back and up to three definitions between them, not through another phi, and a web with any of its members; the floor takes the next cheapest register instead. |
 | `tests/regression/check_loop_carried_homes.py` | The two programs the span rule alone made slower, at `-O2`: the state of `zstd_count`'s generator is not stored to the frame where it is computed and not loaded from it on the way back to the multiplication; `csv_field_sum`'s digit loop has no register move and ten instructions. The matchers first refuse the code that had the defects, kept as five witnesses; the head as it was pushed without the two changes fails with five findings. |
 | `src/backend/regalloc.rs` | A temporary in a phi's register takes the register the back-edge source leaves, also with a value around the loop in it; not when it begins or ends where that piece of the source's life does, not for a source in a copy group or in a pair applied before, not into a register of neither pool; and the veto of `CCC_PHI_COALESCE_SKIP` moves nothing. Each condition fails its test when taken out (twelve mutants). |
