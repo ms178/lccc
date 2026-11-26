@@ -10,6 +10,9 @@ random from the pieces such code is made of:
   expression with the `t < x || (c && t == x)` carry, a double-width sum,
   `__builtin_add_overflow`, `__builtin_addcll`, `_addcarry_u64`, an
   increment under a branch;
+* of a double-width difference, the borrow read out of its high half:
+  the low bit, `!= 0`, negated, the top bit, the sign of a signed double
+  word, and that sign as a `signed char` negated (fiat-crypto);
 * the comparisons, against either operand, spelled `<`, `>`, `!(>=)`,
   `!(<=)` -- and now and then against an operand that makes it no carry
   at all;
@@ -29,7 +32,9 @@ random from the pieces such code is made of:
   that are no carry (`<=`, the operands the other way round).
 
 Nothing in a program is undefined: every word is unsigned, and a carry kept
-in a signed type is only converted, compared and edited bit by bit. So
+in a signed type is only converted, compared and edited bit by bit. (The
+signed double word is the difference of words converted to it, which it
+holds; its shift to the right is the arithmetic one, as GCC defines it.) So
 what it prints is what C says it prints, and GCC's program is the witness.
 lccc compiles the same source at every optimization level and with the
 carry pass, the peephole and register allocation switched off in turn;
@@ -75,9 +80,13 @@ allowed to be written in between, seeds 10 and 16 do. A change to the
 generator changes what a seed is; choose the window again then. The limb
 loops are drawn from a stream of their own (the programs without them are
 what they were before there were any), and their window is seeds 9 to 16
-too: 31 of its 64 loops are split, in ten of the eleven spellings of a loop
+too: 32 of its 64 loops are split, in ten of the eleven spellings of a loop
 that the pass takes (the eleventh, `while (n-- > 0)`, has its split loop in
-`carry_chain_adders.c`, where the shape gate holds it).
+`carry_chain_adders.c`, where the shape gate holds it). The ways to read a
+borrow out of a double word are drawn from a stream of their own as well:
+of the window, the programs of seeds 9, 10 and 13 to 16 are to the letter
+what they were, seeds 11 and 12 read one borrow another way, and the limb
+loops of all eight are what they were.
 """
 
 from __future__ import annotations
@@ -149,13 +158,14 @@ ADDERS = (0, 1, 2, 4, 5, 6, 7)
 # adder, a count that is known and small) and loops it does not take yet
 # (`docs/x86-carry-chain.md` lists them). The number goes up with the pass
 # and never down. Other windows are counted and not judged.
-MUST_SPLIT = 31
+MUST_SPLIT = 32
 
 
 class Program:
     """One generated translation unit."""
 
     def __init__(self, seed: int, functions: int, limb_loops: int = 0):
+        self.seed = seed
         self.r = random.Random(seed)
         self.count = 0
         self.functions: list[tuple[str, str, str]] = []  # (name, kind, word type)
@@ -250,6 +260,23 @@ class Program:
             op = "-" if sub else "+"
             carry = self.pick(f"({t} >> {bits}) & 1", f"({t} >> {bits}) != 0") if sub else f"({word})({t} >> {bits})"
             lines = [f"{wide} {t} = ({wide}){x} {op} {y} {op} {cw};", f"{out} = ({word}){t}; {c} = {carry};"]
+            # The other ways a borrow is read out of the high half of the
+            # difference, which is 0 or all ones: negated, its top bit, the
+            # sign of a signed double word, and that sign as a signed char
+            # negated (fiat-crypto). Chosen from a stream of their own, one
+            # time in two, so that every other choice of the program is the
+            # one it was.
+            aside = random.Random(f"the borrow of {t} in {self.seed}")
+            if sub and aside.random() < 0.5:
+                signed = "__int128" if bits == 64 else "long long"
+                difference = f"({signed}){x} - ({signed}){y} - ({signed}){cw}"
+                lines = aside.choice([
+                    [lines[0], f"{out} = ({word}){t}; {c} = -({word})({t} >> {bits});"],
+                    [lines[0], f"{out} = ({word}){t}; {c} = ({word})({t} >> {2 * bits - 1});"],
+                    [f"{signed} {t} = {difference};", f"{out} = ({word}){t}; {c} = {t} < 0;"],
+                    [f"{signed} {t} = {difference};",
+                     f"{out} = ({word}){t}; {c} = (unsigned char)(0 - (signed char)({t} >> {bits}));"],
+                ])
             if guard:
                 # No `__int128` in 32-bit code: the same sum in two steps.
                 lines = (["#ifdef __SIZEOF_INT128__"] + lines + ["#else"] +

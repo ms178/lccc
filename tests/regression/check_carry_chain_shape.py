@@ -127,8 +127,17 @@ SHAPES: dict[str, tuple[int, int, int]] = {
     "lib_ossl_add_words": (5, 2, 63),
     "lib_ossl_sub_words": (0, 0, 30),
     "lib_i128_add_n": (5, 2, 43),
-    "lib_i128_sub_n": (1, 0, 21),
+    "lib_i128_sub_n": (5, 2, 43),
     "lib_i128_add3_n": (0, 0, 30),
+    "lib_i128_sub_neg_n": (5, 2, 43),
+    "lib_i128_sub_top_n": (5, 2, 43),
+    "lib_i128_sub_ne_n": (5, 2, 46),
+    "lib_i128_sub_signed_n": (5, 2, 46),
+    "lib_guarded_i128_sub_n": (5, 2, 67),
+    "lib_blst_add_n": (5, 2, 44),
+    "lib_blst_sub_n": (5, 2, 44),
+    "lib_fiat_add4": (3, 0, 16),
+    "lib_fiat_sub4": (3, 0, 16),
     "lib_ovf_add_n": (5, 2, 43),
     "lib_ovf_sub_n": (5, 2, 43),
     "lib_bool_add_n": (5, 2, 47),
@@ -178,6 +187,16 @@ FOUR_A_TRIP = (
     # is entered by a jump, in front of which the carry goes into the flag.
     "lib_guarded_add_n",
     "lib_guarded_sub_n",
+    # The double word: the borrow read out of the high half of the
+    # difference, each way a source reads it, and blst's two loops.
+    "lib_i128_sub_n",
+    "lib_i128_sub_neg_n",
+    "lib_i128_sub_top_n",
+    "lib_i128_sub_ne_n",
+    "lib_i128_sub_signed_n",
+    "lib_guarded_i128_sub_n",
+    "lib_blst_add_n",
+    "lib_blst_sub_n",
 )
 LINKS_A_TRIP = 4
 

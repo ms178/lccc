@@ -853,6 +853,138 @@ static NOINLINE u64 lib_i128_add3_n(u64 *r, const u64 *a, const u64 *b, const u6
     }
     return c;
 }
+
+/* The high half of a double-word difference is 0 or all ones, and the
+ * borrow is read out of it one way or another. The other ways than
+ * `lib_i128_sub_n`'s low bit: negated, its top bit, whether it is anything
+ * at all, and the sign of the difference where the double word is signed. */
+static NOINLINE u64 lib_i128_sub_neg_n(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    u64 borrow = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned __int128 t = (unsigned __int128)a[i] - b[i] - borrow;
+        r[i] = (u64)t;
+        borrow = -(u64)(t >> 64);
+    }
+    return borrow;
+}
+
+static NOINLINE u64 lib_i128_sub_top_n(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    u64 borrow = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned __int128 t = (unsigned __int128)a[i] - b[i] - borrow;
+        r[i] = (u64)t;
+        borrow = (u64)(t >> 127);
+    }
+    return borrow;
+}
+
+static NOINLINE u64 lib_i128_sub_ne_n(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    u64 borrow = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned __int128 t = (unsigned __int128)a[i] - b[i] - borrow;
+        r[i] = (u64)t;
+        borrow = (t >> 64) != 0;
+    }
+    return borrow;
+}
+
+static NOINLINE u64 lib_i128_sub_signed_n(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    u64 borrow = 0;
+    for (long i = 0; i < n; i++) {
+        __int128 t = (__int128)a[i] - b[i] - borrow;
+        r[i] = (u64)t;
+        borrow = t < 0;
+    }
+    return borrow;
+}
+
+/* The same behind a guard: read behind a loop tested at the bottom, the
+ * comparison that asks for the borrow is part of the trip. */
+static NOINLINE u64 lib_guarded_i128_sub_n(u64 *r, const u64 *a, const u64 *b, long n, u64 q)
+{
+    u64 borrow = 0;
+    if (n > 0) {
+        long m = n;
+        do {
+            __int128 t = (__int128)*a++ - *b++ - borrow;
+            *r++ = (u64)t;
+            borrow = t < 0;
+        } while (--m != 0);
+    }
+    return borrow + q;
+}
+
+/* blst (`no_asm.h`): the carry is added to the second word in the double
+ * word, and of a difference the two subtrahends are. */
+static NOINLINE u64 lib_blst_add_n(u64 *ret, const u64 *a, const u64 *b, unsigned long n)
+{
+    unsigned __int128 limbx;
+    u64 carry;
+    unsigned long i;
+    for (carry = 0, i = 0; i < n; i++) {
+        limbx = a[i] + (b[i] + (unsigned __int128)carry);
+        ret[i] = (u64)limbx;
+        carry = (u64)(limbx >> 64);
+    }
+    return carry;
+}
+
+static NOINLINE u64 lib_blst_sub_n(u64 *ret, const u64 *a, const u64 *b, unsigned long n)
+{
+    unsigned __int128 limbx;
+    u64 borrow;
+    unsigned long i;
+    for (borrow = 0, i = 0; i < n; i++) {
+        limbx = a[i] - (b[i] + (unsigned __int128)borrow);
+        ret[i] = (u64)limbx;
+        borrow = (u64)(limbx >> 64) & 1;
+    }
+    return borrow;
+}
+
+/* fiat-crypto (`p256_64.c`): the borrow is the high half as a signed char,
+ * negated. Four of each in a row, as its field arithmetic has them. */
+static inline void fiat_addcarryx_u64(u64 *out1, u8 *out2, u8 arg1, u64 arg2, u64 arg3)
+{
+    unsigned __int128 x1 = ((arg1 + (unsigned __int128)arg2) + arg3);
+    u64 x2 = (u64)(x1 & 0xffffffffffffffffull);
+    u8 x3 = (u8)(x1 >> 64);
+    *out1 = x2;
+    *out2 = x3;
+}
+
+static inline void fiat_subborrowx_u64(u64 *out1, u8 *out2, u8 arg1, u64 arg2, u64 arg3)
+{
+    __int128 x1 = ((arg2 - (__int128)arg1) - arg3);
+    signed char x2 = (signed char)(x1 >> 64);
+    u64 x3 = (u64)(x1 & 0xffffffffffffffffull);
+    *out1 = x3;
+    *out2 = (u8)(0x0 - x2);
+}
+
+static NOINLINE u64 lib_fiat_add4(u64 *out, const u64 *a, const u64 *b)
+{
+    u8 c;
+    fiat_addcarryx_u64(&out[0], &c, 0x0, a[0], b[0]);
+    fiat_addcarryx_u64(&out[1], &c, c, a[1], b[1]);
+    fiat_addcarryx_u64(&out[2], &c, c, a[2], b[2]);
+    fiat_addcarryx_u64(&out[3], &c, c, a[3], b[3]);
+    return c;
+}
+
+static NOINLINE u64 lib_fiat_sub4(u64 *out, const u64 *a, const u64 *b)
+{
+    u8 c;
+    fiat_subborrowx_u64(&out[0], &c, 0x0, a[0], b[0]);
+    fiat_subborrowx_u64(&out[1], &c, c, a[1], b[1]);
+    fiat_subborrowx_u64(&out[2], &c, c, a[2], b[2]);
+    fiat_subborrowx_u64(&out[3], &c, c, a[3], b[3]);
+    return c;
+}
 #else
 #define HAVE_INT128 0
 #endif
@@ -1515,6 +1647,8 @@ static void libraries(const u64 *a, const u64 *b)
 #if HAVE_INT128
         expect("lib_i128_add_n carry", lib_i128_add_n(r, a, b, n), want_c);
         expect_limbs("lib_i128_add_n", r, want, LIMBS);
+        expect("lib_blst_add_n carry", lib_blst_add_n(r, a, b, (unsigned long)n), want_c);
+        expect_limbs("lib_blst_add_n", r, want, LIMBS);
 #endif
 
         want_c = ref_subn(want, a, b, n, 0);
@@ -1541,6 +1675,29 @@ static void libraries(const u64 *a, const u64 *b)
 #if HAVE_INT128
         expect("lib_i128_sub_n borrow", lib_i128_sub_n(r, a, b, n), want_c);
         expect_limbs("lib_i128_sub_n", r, want, LIMBS);
+        expect("lib_i128_sub_neg_n borrow", lib_i128_sub_neg_n(r, a, b, n), want_c);
+        expect_limbs("lib_i128_sub_neg_n", r, want, LIMBS);
+        expect("lib_i128_sub_top_n borrow", lib_i128_sub_top_n(r, a, b, n), want_c);
+        expect_limbs("lib_i128_sub_top_n", r, want, LIMBS);
+        expect("lib_i128_sub_ne_n borrow", lib_i128_sub_ne_n(r, a, b, n), want_c);
+        expect_limbs("lib_i128_sub_ne_n", r, want, LIMBS);
+        expect("lib_i128_sub_signed_n borrow", lib_i128_sub_signed_n(r, a, b, n), want_c);
+        expect_limbs("lib_i128_sub_signed_n", r, want, LIMBS);
+        expect("lib_guarded_i128_sub_n borrow", lib_guarded_i128_sub_n(r, a, b, n, 40), want_c + 40);
+        expect_limbs("lib_guarded_i128_sub_n", r, want, LIMBS);
+        expect("lib_guarded_i128_sub_n, none", lib_guarded_i128_sub_n(r, a, b, -(long)n, 7), 7);
+        expect_limbs("lib_guarded_i128_sub_n, none", r, want, LIMBS);
+        expect("lib_blst_sub_n borrow", lib_blst_sub_n(r, a, b, (unsigned long)n), want_c);
+        expect_limbs("lib_blst_sub_n", r, want, LIMBS);
+        if (n + 4 <= LIMBS) {
+            /* Four limbs from the `n`th on. */
+            want_c = ref_addn(want + n, a + n, b + n, 4, 0);
+            expect("lib_fiat_add4 carry", lib_fiat_add4(r + n, a + n, b + n), want_c);
+            expect_limbs("lib_fiat_add4", r, want, LIMBS);
+            want_c = ref_subn(want + n, a + n, b + n, 4, 0);
+            expect("lib_fiat_sub4 borrow", lib_fiat_sub4(r + n, a + n, b + n), want_c);
+            expect_limbs("lib_fiat_sub4", r, want, LIMBS);
+        }
 #endif
 
         {
