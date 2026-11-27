@@ -1370,6 +1370,15 @@ gate "x86-march-macro-parity" fast \
     python3 scripts/check_x86_march_macros.py "$LCCC" "${GCC16:-gcc-16}"
 gate "x86-mflag-macro-parity" fast \
     python3 scripts/check_x86_mflag_macros.py "$LCCC" --gcc "${GCC16:-gcc-16}"
+# The x86 `-m` options without code generation of their own: every spelling of
+# GCC 16.2's list is an arm of the driver or a row of the generated table
+# (docs/x86-machine-options.md), and the rows hold under both compilers.  The
+# second gate holds the rows that are implemented as a rule about the finished
+# text (-mharden-sls=, -mcld, notrack switch dispatch, the -pg names).
+gate "x86-mflag-policy" fast \
+    python3 scripts/gen_x86_mflag_policy.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "x86-mflag-effects" fast \
+    python3 tests/regression/check_x86_mflag_effects.py --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 # `-mprefer-vector-width=` is a cost-model request, so its gate is a codegen
 # gate, not a macro gate: it compares the register class lccc picks against
 # GCC for the same command line, proves the flag moves no predefined macro,

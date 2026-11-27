@@ -38,6 +38,7 @@
 //! | data-model / ABI requests — `-fshort-enums` | **hard error**, because ignoring one silently returns objects whose layout disagrees with the libraries they link against. `-funsigned-char`, `-fshort-wchar` and `-fpack-struct[=n]` are *not* here: all three are implemented (`char_is_unsigned()` / `set_short_wchar` / `Parser::set_pack_struct`), and `-fsigned-char` names the x86-64 SysV default LCCC already emits |
 //! | `-g<selector>` that GNU rejects (`-g4`, `-ggdb9`, `-gdwarf-9`, `-gz=bogus`, `-gno-bogus`, `-gbogus`) | **hard error** — the selector grammar is closed and was measured exhaustively, so a name outside it is a typo, not a newer GNU (GCC 14.2/16.2, Clang 23.1 and ICX all reject these) |
 //! | *off-requests* — `-Wno-<unknown>`, `-gno-<feature>`, `-fno-delete-null-pointer-checks` | **accepted silently**: the thing asked to be switched off does not exist here, so the requested state is already the state (all four reference compilers accept `-Wno-<unknown>`, measured; for the `-f` spelling, nine measured null-guard shapes keep their checks with and without the flag, pinned by `tests/regression/check_nullptr_check_policy.sh`) |
+//! | x86 `-m` options GCC 16.2 has and no arm implements — `-mlong-double-80`, `-mbranch-cost=`, `-mabi=ms`, `-mno-direct-extern-access`, … | decided per spelling and mode by a generated table (`x86_mflag_policy`, from `scripts/gen_x86_mflag_policy.py`; `docs/x86-machine-options.md`): **accepted** where it names what the compiler does, a **warning** where it chooses among equivalent code, a **hard error with the reason** where it asks for another layout, convention or record |
 //! | everything else unimplemented — `-f*`, `-m*`, `--*`, `-W<name>`, `-Werror=<name>`, `--param`, GNU-accepted `-g` selectors, presentation namespaces (`-fdiagnostics-*`, `-fmessage-length=`, `-fmax-errors=`, `-f*prefix-map=`) | **warning naming the option**, once per compilation; `LCCC_STRICT_OPTIONS=1` makes it fatal |
 //!
 //! The open option namespace cannot distinguish typos from newer GCC flags.
@@ -2011,6 +2012,17 @@ impl Driver {
             return Ok(true);
         }
 
+        // The x86 options GCC keeps as names for other options are read as
+        // those options, with GCC's warning (`x86_mflags::expand_aliases`).
+        let expanded_args = if matches!(self.target, Target::X86_64 | Target::I686) {
+            let (replaced, warnings) = super::x86_mflags::expand_aliases(&expanded_args)?;
+            for warning in warnings {
+                lccc::cli::stderr_line(format_args!("lccc: warning: {warning}"));
+            }
+            replaced
+        } else {
+            expanded_args
+        };
         self.parse_main_args(&expanded_args, strict_options)?;
 
         // i386 has a real SSE-only state: unlike x86-64's existing backend,
@@ -3252,25 +3264,37 @@ impl Driver {
                 // lccc aligns to natural ABI alignment which satisfies abi and
                 // compat; cacheline only ever OVER-aligns (a performance
                 // preference, not a semantic contract), so accepting is sound.
-                s if s.starts_with("-malign-data=") => {}
-                // -mharden-sls: straight-line-speculation hardening (INT3
-                // after RET/indirect JMP). Not implemented; silently ignoring
-                // would strip a requested mitigation.
-                s if s.starts_with("-mharden-sls=") && s != "-mharden-sls=none" => {
-                    return Err(
-                        "ccc: error: -mharden-sls straight-line-speculation hardening \
-                                not supported; disable CONFIG_MITIGATION_SLS"
-                            .to_string(),
-                    );
+                // On x86 the option and its values are `x86_mflag_policy`'s
+                // (an empty or unknown value is an error, as in GCC).
+                s if s.starts_with("-malign-data=") && !self.target_is_x86() => {}
+                // -mharden-sls=: an `int3` behind every return and every
+                // indirect jump, written into the finished text
+                // (`backend::x86_late_text`, where GCC's measured rules
+                // are). x86 only: on another target the option falls to
+                // the `-m` catch-all.
+                s if s.starts_with("-mharden-sls=")
+                    && matches!(self.target, Target::X86_64 | Target::I686) =>
+                {
+                    let value = &s["-mharden-sls=".len()..];
+                    self.harden_sls = crate::backend::x86_late_text::HardenSls::parse(value)
+                        .ok_or_else(|| {
+                            if value.is_empty() {
+                                "missing argument to '-mharden-sls='".to_string()
+                            } else {
+                                format!("unrecognized argument in option '{s}'")
+                            }
+                        })?;
                 }
-                "-mharden-sls=none" => {}
                 // -mavx10.1 / -mavx10.2 are handled by the ISA-flag path
                 // (`grant_avx10_family`). The `-256`/`-512` spellings are not
                 // GCC 16.2 options and fall through to the unsupported-option
                 // error below, exactly as GCC rejects them.
                 "-mxsave" | "-mno-xsave" => {}
                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
-                "-mcmodel=kernel" => self.code_model_kernel = true,
+                "-mcmodel=kernel" => {
+                    self.code_model_kernel = true;
+                    self.x86_code_model_name = Some("kernel");
+                }
                 // SA-YG-1: `-mcmodel=large` used to be silently folded into
                 // the SMALL model (`code_model_kernel = false`).  Every
                 // global address was then still emitted as `leaq sym(%rip)`
@@ -3290,8 +3314,18 @@ impl Driver {
                 }
                 "-mcmodel=small" | "-mcmodel=medlow" | "-mcmodel=medium" | "-mcmodel=medany" => {
                     self.code_model_kernel = false;
+                    self.x86_code_model_name = match args[i].as_str() {
+                        "-mcmodel=small" => Some("small"),
+                        "-mcmodel=medium" => Some("medium"),
+                        _ => None,
+                    };
                 }
-                arg if arg.starts_with("-mabi=") => {
+                // RISC-V's `-mabi=`. On x86 the option chooses the calling
+                // convention of every function (`sysv` or `ms`) and went
+                // here too, into a field nothing on x86 reads: `-mabi=ms`
+                // compiled System V code in silence. It is
+                // `x86_mflag_policy`'s there.
+                arg if arg.starts_with("-mabi=") && !self.target_is_x86() => {
                     self.riscv_abi = Some(arg["-mabi=".len()..].to_string());
                 }
                 arg if arg.starts_with("-march=") => {
@@ -3318,7 +3352,15 @@ impl Driver {
                             self.march_pre_sse_mmx = false;
                             self.march_fxsr = true;
                             match march {
-                                "x86-64" | "x86-64-v1" | "generic" => {}
+                                // GCC 16.2's words; `generic` named the
+                                // x86-64 baseline here.
+                                "generic" => {
+                                    return Err(
+                                        "'generic' CPU can be used only for '-mtune=' switch"
+                                            .to_string(),
+                                    );
+                                }
+                                "x86-64" | "x86-64-v1" => {}
                                 // Legacy 32-bit baselines (kernel REALMODE_CFLAGS
                                 // pass `-march=i386 -m16`). The i686 backend's
                                 // baseline output uses no instruction newer than
@@ -3554,6 +3596,68 @@ impl Driver {
                 }
                 arg if arg.starts_with("-mstack-protector-guard") => {
                     parse_stack_protector_guard_flag(&mut self.stack_protector_guard, arg)?;
+                }
+                // The `-mno-` forms of options with an arm above. They used
+                // to reach the blanket arm below, which changed nothing: the
+                // option given first stayed in force (`-mfentry -mno-fentry
+                // -pg` called `__fentry__`). `-mno-prefer-avx128` is 256 and
+                // not `none`: GCC 16.2 gives the negative of that alias the
+                // value 256 (measured with `-Q --help=target`).
+                "-mno-fentry" => self.mcount_submode.use_fentry = false,
+                "-mno-record-mcount" => self.mcount_submode.record = false,
+                "-mno-nop-mcount" => self.mcount_submode.nop = false,
+                "-mno-skip-rax-setup" => self.skip_rax_setup = false,
+                "-mno-soft-float" => self.no_x87 = false,
+                "-mno-prefer-avx128" => self.x86_prefer_vector_bits = Some(256),
+                "-mno-indirect-branch-cs-prefix" => self.indirect_branch_cs_prefix = false,
+                // The x86 options below have no meaning on another target,
+                // where they fall to the catch-alls as before.
+                //
+                // `keep` is GCC's default and ends an earlier thunk request.
+                "-mfunction-return=keep" if self.target_is_x86() => {
+                    self.function_return_thunk = false;
+                }
+                "-mindirect-branch=keep" if self.target_is_x86() => {
+                    self.indirect_branch_thunk = false;
+                    self.indirect_branch_thunk_inline = false;
+                }
+                // -mcld: `cld` in front of every string instruction the
+                // compiler writes (`backend::x86_late_text`).
+                "-mcld" if self.target_is_x86() => self.mcld = true,
+                "-mno-cld" if self.target_is_x86() => self.mcld = false,
+                // GCC's macro of the same name, and nothing else: no `asm`
+                // operand is given one of r16 to r31 here.
+                "-mapx-inline-asm-use-gpr32" if self.target_is_x86() => {
+                    self.apx_inline_asm_use_gpr32 = true;
+                }
+                "-mno-apx-inline-asm-use-gpr32" if self.target_is_x86() => {
+                    self.apx_inline_asm_use_gpr32 = false;
+                }
+                // -mfentry-name=NAME / -mfentry-section=NAME: the function a
+                // `-pg -mfentry` site calls and the section of the
+                // `-mrecord-mcount` records. A name lives as long as the
+                // compilation, so it is leaked into one.
+                arg if self.target_is_x86()
+                    && (arg.starts_with("-mfentry-name=")
+                        || arg.starts_with("-mfentry-section=")) =>
+                {
+                    let (option, value) =
+                        arg.split_at(arg.find('=').map_or(arg.len(), |at| at + 1));
+                    if value.is_empty() {
+                        return Err(format!("missing argument to '{option}'"));
+                    }
+                    let name: &'static str = Box::leak(value.to_string().into_boxed_str());
+                    if option == "-mfentry-name=" {
+                        self.mcount_submode.fentry_name = Some(name);
+                    } else {
+                        self.mcount_submode.record_section = Some(name);
+                    }
+                }
+                // An x86 machine option without code generation of its own:
+                // `x86_mflag_policy` decides it, once the last argument has
+                // been read (`resolve_x86_deferred_mflags`).
+                arg if self.target_is_x86() && super::x86_mflags::is_decided(arg) => {
+                    self.x86_deferred_mflags.push(arg.to_string());
                 }
                 // `-mno-<feature>` for an ISA extension LCCC never emits.
                 //
@@ -4551,6 +4655,14 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
         if let Some(dialect) = self.tls_dialect.as_deref() {
             check_tls_dialect(&self.target, dialect)?;
         }
+        self.resolve_x86_deferred_mflags(strict_options)?;
+        // IA-32 has one code model, `32`. GCC 16.2 refuses the others
+        // there; they were accepted and meant nothing.
+        if let (Target::I686, Some(model)) = (self.target, self.x86_code_model_name) {
+            return Err(format!(
+                "code model '{model}' not supported in the 32 bit mode"
+            ));
+        }
         self.stack_protector_guard
             .validate_for_target(self.target)?;
         let untrapped = self.sanitize_enabled.difference(self.sanitize_trap);
@@ -4566,6 +4678,80 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
             ));
         }
 
+        Ok(())
+    }
+
+    fn target_is_x86(&self) -> bool {
+        matches!(self.target, Target::X86_64 | Target::I686)
+    }
+
+    /// Judge the x86 machine options the argument loop set aside
+    /// (`x86_mflags`): the target is final now (`-m32` may have followed
+    /// them) and so is the ISA.
+    ///
+    /// GCC keeps one occurrence of an option: of `-mNAME` and `-mno-NAME`,
+    /// or of two values of `-mNAME=`, the last. So does this: an option
+    /// that would be refused and is taken back later on the command line
+    /// is no error. A value GCC does not have is one wherever it stands.
+    fn resolve_x86_deferred_mflags(&mut self, strict_options: bool) -> Result<(), String> {
+        use super::x86_mflags::{Context, Outcome, decide, key};
+        let deferred = std::mem::take(&mut self.x86_deferred_mflags);
+        if deferred.is_empty() {
+            return Ok(());
+        }
+        let strict = strict_options || std::env::var_os("LCCC_STRICT_MFLAGS").is_some();
+        let generic = |arg: &str| {
+            format!(
+                "unsupported machine option {arg}; LCCC refuses to silently ignore target-affecting -m flags"
+            )
+        };
+        if !self.target_is_x86() {
+            // `-mlittle-endian` behind the option: not an x86 command line
+            // after all, and the rule of the catch-alls applies.
+            return match deferred
+                .iter()
+                .find(|arg| strict || !arg.starts_with("-mno-"))
+            {
+                Some(arg) => Err(generic(arg)),
+                None => Ok(()),
+            };
+        }
+        let simd = !self.no_sse && !self.no_sse2;
+        let ctx = Context {
+            x86_64: self.target == Target::X86_64,
+            apx: self.enable_apxf,
+            crc32: (simd && self.enable_sse4_2) || self.crc32_held_by_general,
+            sse3: simd && self.enable_sse3,
+        };
+        for (at, arg) in deferred.iter().enumerate() {
+            let outcome = decide(arg, &ctx).ok_or_else(|| generic(arg))?;
+            if let Outcome::Invalid(text) = outcome {
+                return Err(text);
+            }
+            let superseded = deferred[at + 1..]
+                .iter()
+                .any(|later| key(later) == key(arg));
+            if superseded {
+                continue;
+            }
+            let unimplemented = || {
+                format!(
+                    "command-line option '{arg}' is not implemented by LCCC; LCCC_STRICT_OPTIONS is set"
+                )
+            };
+            match outcome {
+                Outcome::State | Outcome::Invalid(_) => {}
+                Outcome::Refused(text) => return Err(text),
+                Outcome::Hint(_) | Outcome::Ignored(_) if strict => return Err(unimplemented()),
+                Outcome::Hint(why) => lccc::cli::stderr_line(format_args!(
+                    "lccc: warning: '{arg}' is tolerated but not implemented: {why}, and LCCC \
+                     has one way (set LCCC_STRICT_OPTIONS=1 to make this an error)"
+                )),
+                Outcome::Ignored(text) => {
+                    lccc::cli::stderr_line(format_args!("lccc: warning: {text}"))
+                }
+            }
+        }
         Ok(())
     }
 
@@ -5942,6 +6128,8 @@ mod cli_tests {
                 use_fentry: true,
                 record: true,
                 nop: true,
+                fentry_name: None,
+                record_section: None,
             }
         );
         // Sub-modes alone stay inert (no instrumentation without -pg).
@@ -9634,6 +9822,363 @@ mod code_model_tests {
         assert!(
             parse(&["-mcmodel=large", "-mcmodel=small"]).is_err(),
             "the large arm must fire before a later flag rescues it"
+        );
+    }
+}
+
+/// The x86 machine options without code generation of their own
+/// (`x86_mflags`), as the whole driver treats them.
+#[cfg(test)]
+mod x86_mflag_policy_tests {
+    use super::*;
+    use crate::passes::loop_align::AlignControl;
+
+    fn parse_as(binary: &str, flags: &[&str], strict: bool) -> Result<Driver, String> {
+        let mut d = Driver::new();
+        let args: Vec<String> = std::iter::once(binary)
+            .chain(flags.iter().copied())
+            .chain(std::iter::once("x.c"))
+            .map(str::to_string)
+            .collect();
+        d.parse_cli_args_with_strict(&args, strict)?;
+        Ok(d)
+    }
+
+    fn parse(flags: &[&str]) -> Driver {
+        parse_as("ccc", flags, false).unwrap_or_else(|err| panic!("{flags:?} is refused: {err}"))
+    }
+
+    fn error(flags: &[&str]) -> String {
+        match parse_as("ccc", flags, false) {
+            Ok(_) => panic!("{flags:?} is accepted"),
+            Err(err) => err,
+        }
+    }
+
+    /// The `-mno-` form of an implemented option went to the blanket
+    /// `-mno-` arm, which changed nothing: the option given first stayed
+    /// in force.
+    #[test]
+    fn the_negative_of_an_implemented_option_takes_it_back() {
+        assert!(parse(&["-pg", "-mfentry"]).mcount_submode.use_fentry);
+        assert!(
+            !parse(&["-pg", "-mfentry", "-mno-fentry"])
+                .mcount_submode
+                .use_fentry
+        );
+        assert!(
+            parse(&["-mno-fentry", "-mfentry"])
+                .mcount_submode
+                .use_fentry
+        );
+        assert!(
+            !parse(&["-mrecord-mcount", "-mno-record-mcount"])
+                .mcount_submode
+                .record
+        );
+        assert!(
+            !parse(&["-mnop-mcount", "-mno-nop-mcount"])
+                .mcount_submode
+                .nop
+        );
+        assert!(
+            parse(&["-mno-nop-mcount", "-mnop-mcount"])
+                .mcount_submode
+                .nop
+        );
+        assert!(parse(&["-mskip-rax-setup"]).skip_rax_setup);
+        assert!(!parse(&["-mskip-rax-setup", "-mno-skip-rax-setup"]).skip_rax_setup);
+        assert!(parse(&["-msoft-float"]).no_x87);
+        assert!(!parse(&["-msoft-float", "-mno-soft-float"]).no_x87);
+        assert!(parse(&["-mindirect-branch-cs-prefix"]).indirect_branch_cs_prefix);
+        assert!(
+            !parse(&[
+                "-mindirect-branch-cs-prefix",
+                "-mno-indirect-branch-cs-prefix"
+            ])
+            .indirect_branch_cs_prefix
+        );
+        assert!(parse(&["-mfunction-return=thunk-extern"]).function_return_thunk);
+        assert!(
+            !parse(&["-mfunction-return=thunk-extern", "-mfunction-return=keep"])
+                .function_return_thunk
+        );
+        let kept = parse(&[
+            "-mindirect-branch=thunk-extern",
+            "-mindirect-branch=thunk-inline",
+            "-mindirect-branch=keep",
+        ]);
+        assert!(!kept.indirect_branch_thunk && !kept.indirect_branch_thunk_inline);
+    }
+
+    /// GCC 16.2 (`-Q --help=target`): the negative of the alias
+    /// `-mprefer-avx128` is 256, not `none`.
+    #[test]
+    fn the_negative_of_prefer_avx128_is_256() {
+        assert_eq!(
+            parse(&["-mprefer-avx128"]).x86_prefer_vector_bits,
+            Some(128)
+        );
+        assert_eq!(
+            parse(&["-mprefer-avx128", "-mno-prefer-avx128"]).x86_prefer_vector_bits,
+            Some(256)
+        );
+        assert_eq!(
+            parse(&["-mprefer-vector-width=512", "-mno-prefer-avx128"]).x86_prefer_vector_bits,
+            Some(256)
+        );
+    }
+
+    #[test]
+    fn harden_sls_takes_gccs_values_and_the_last_one_wins() {
+        use crate::backend::x86_late_text::HardenSls;
+        assert_eq!(parse(&[]).harden_sls, HardenSls::default());
+        let all = parse(&["-mharden-sls=all"]).harden_sls;
+        assert!(all.ret && all.indirect_jmp);
+        let ret = parse(&["-mharden-sls=all", "-mharden-sls=return"]).harden_sls;
+        assert!(ret.ret && !ret.indirect_jmp);
+        let jmp = parse(&["-m32", "-mharden-sls=indirect-jmp"]).harden_sls;
+        assert!(!jmp.ret && jmp.indirect_jmp);
+        assert_eq!(
+            parse(&["-mharden-sls=all", "-mharden-sls=none"]).harden_sls,
+            HardenSls::default()
+        );
+        assert_eq!(
+            error(&["-mharden-sls=ret"]),
+            "unrecognized argument in option '-mharden-sls=ret'"
+        );
+        assert_eq!(
+            error(&["-mharden-sls="]),
+            "missing argument to '-mharden-sls='"
+        );
+    }
+
+    #[test]
+    fn cld_and_the_names_of_the_profiling_call() {
+        assert!(!parse(&[]).mcld);
+        assert!(parse(&["-mcld"]).mcld);
+        assert!(!parse(&["-mcld", "-mno-cld"]).mcld);
+        let named = parse(&["-mfentry-name=my_entry", "-mfentry-section=.my_records"]);
+        assert_eq!(named.mcount_submode.fentry_symbol(), "my_entry");
+        assert_eq!(named.mcount_submode.record_section_name(), ".my_records");
+        let plain = parse(&[]);
+        assert_eq!(plain.mcount_submode.fentry_symbol(), "__fentry__");
+        assert_eq!(plain.mcount_submode.record_section_name(), "__mcount_loc");
+        assert_eq!(
+            error(&["-mfentry-name="]),
+            "missing argument to '-mfentry-name='"
+        );
+        assert_eq!(
+            error(&["-mfentry-section="]),
+            "missing argument to '-mfentry-section='"
+        );
+        assert!(parse(&["-mapx-inline-asm-use-gpr32"]).apx_inline_asm_use_gpr32);
+        assert!(
+            !parse(&[
+                "-mapx-inline-asm-use-gpr32",
+                "-mno-apx-inline-asm-use-gpr32"
+            ])
+            .apx_inline_asm_use_gpr32
+        );
+    }
+
+    /// What names the state is implemented: the strict policy accepts it.
+    /// A hint is accepted with a warning and refused under the strict
+    /// policy, which is how a capability probe tells the two apart.
+    #[test]
+    fn a_state_passes_the_strict_policy_and_a_hint_does_not() {
+        for flag in [
+            "-mlong-double-80",
+            "-mtls-direct-seg-refs",
+            "-masm=att",
+            "-mfpmath=sse",
+            "-mglibc",
+            "-mno-stackrealign",
+            "-mabi=sysv",
+            "-malign-data=abi",
+        ] {
+            assert!(parse_as("ccc", &[flag], false).is_ok(), "{flag}");
+            assert!(parse_as("ccc", &[flag], true).is_ok(), "{flag} (strict)");
+        }
+        for flag in [
+            "-mstv",
+            "-mno-push-args",
+            "-mbranch-cost=2",
+            "-mtune-ctrl=use_leave",
+            "-maccumulate-outgoing-args",
+            "-malign-data=cacheline",
+            "-mmpx",
+        ] {
+            assert!(parse_as("ccc", &[flag], false).is_ok(), "{flag}");
+            let err = parse_as("ccc", &[flag], true)
+                .err()
+                .unwrap_or_else(|| panic!("{flag} passes the strict policy"));
+            assert!(err.contains("is not implemented by LCCC"), "{flag}: {err}");
+        }
+    }
+
+    /// `-mabi=ms` was stored in RISC-V's field and compiled System V
+    /// code; the `-mno-` forms below asked for what the compiler does not
+    /// do and passed in silence.
+    #[test]
+    fn what_was_ignored_in_silence_is_refused() {
+        for (flag, part) in [
+            ("-mabi=ms", "Microsoft calling convention"),
+            ("-mno-direct-extern-access", "GOT"),
+            ("-mno-tls-direct-seg-refs", "thread pointer"),
+            ("-mno-partial-vector-fp-math", "audited"),
+        ] {
+            let err = error(&[flag]);
+            assert!(
+                err.starts_with(&format!("unsupported machine option {flag}: "))
+                    && err.contains(part),
+                "{flag}: {err}"
+            );
+        }
+        assert_eq!(error(&["-mabi="]), "missing argument to '-mabi='");
+        assert_eq!(
+            error(&["-mabi=x"]),
+            "unrecognized argument in option '-mabi=x'"
+        );
+        assert_eq!(
+            error(&["-malign-data=x"]),
+            "unrecognized argument in option '-malign-data=x'"
+        );
+        assert_eq!(
+            error(&["-march=generic"]),
+            "'generic' CPU can be used only for '-mtune=' switch"
+        );
+        assert!(parse_as("ccc", &["-mtune=generic"], false).is_ok());
+    }
+
+    /// GCC keeps the last occurrence of an option. A refusal that is
+    /// taken back later on the command line is no refusal; a value GCC
+    /// does not have is an error wherever it stands.
+    #[test]
+    fn the_last_occurrence_is_the_one_judged() {
+        assert!(parse_as("ccc", &["-mstackrealign", "-mno-stackrealign"], true).is_ok());
+        assert!(parse_as("ccc", &["-masm=intel", "-masm=att"], true).is_ok());
+        assert!(parse_as("ccc", &["-mabi=ms", "-mabi=sysv"], true).is_ok());
+        assert!(error(&["-mno-stackrealign", "-mstackrealign"]).contains("realignment"));
+        assert!(error(&["-masm=att", "-masm=intel"]).contains("Intel syntax"));
+        assert_eq!(
+            error(&["-masm=bogus", "-masm=att"]),
+            "unrecognized argument in option '-masm=bogus'"
+        );
+        // Two options, each with its own last word.
+        assert!(error(&["-mpc32", "-mpc80"]).contains("crtprec32.o"));
+    }
+
+    /// `-m32` may follow the option it decides.
+    #[test]
+    fn the_mode_is_the_final_one() {
+        assert!(parse_as("ccc", &["-m128bit-long-double"], true).is_ok());
+        assert!(error(&["-m128bit-long-double", "-m32"]).contains("12-byte"));
+        assert!(parse_as("ccc", &["-m96bit-long-double", "-m32"], true).is_ok());
+        assert_eq!(
+            error(&["-m96bit-long-double"]),
+            "'-m96bit-long-double' is not compatible with this target"
+        );
+        assert!(parse_as("ccc", &["-mcmodel=32", "-m32"], true).is_ok());
+        assert_eq!(
+            error(&["-mcmodel=32"]),
+            "code model '32' not supported in the 64 bit mode"
+        );
+        for model in ["small", "medium", "kernel"] {
+            assert_eq!(
+                error(&["-m32", &format!("-mcmodel={model}")]),
+                format!("code model '{model}' not supported in the 32 bit mode")
+            );
+            assert!(parse_as("ccc", &[&format!("-mcmodel={model}")], true).is_ok());
+        }
+        // IA-32 computes `float` in SSE and `double` in the x87: neither
+        // of GCC's two pure modes.
+        assert!(error(&["-m32", "-mfpmath=sse"]).contains("not implemented"));
+        assert!(error(&["-m32", "-mfpmath=387"]).contains("not implemented"));
+        assert!(error(&["-mfpmath=387"]).contains("excess precision"));
+    }
+
+    #[test]
+    fn crc32_and_mwait_follow_the_extension_they_come_with() {
+        assert!(parse_as("ccc", &["-msse4.2", "-mcrc32"], true).is_ok());
+        assert!(parse_as("ccc", &["-mcrc32", "-march=nehalem"], true).is_ok());
+        assert!(parse_as("ccc", &["-mno-crc32"], true).is_ok());
+        assert!(error(&["-mcrc32"]).contains("use -msse4.2"));
+        assert!(error(&["-march=nehalem", "-mno-crc32"]).contains("use -mno-sse4.2"));
+        assert!(parse_as("ccc", &["-msse3", "-mmwait"], true).is_ok());
+        assert!(parse_as("ccc", &["-mno-mwait"], true).is_ok());
+        assert!(error(&["-mmwait"]).contains("use -msse3"));
+        assert!(error(&["-msse3", "-mno-mwait"]).contains("use -mno-sse3"));
+    }
+
+    #[test]
+    fn apx_features_are_all_or_none() {
+        assert!(parse_as("ccc", &["-mapx-features=none"], true).is_ok());
+        assert!(parse_as("ccc", &["-mno-apx-features=egpr"], true).is_ok());
+        assert!(error(&["-mapx-features=egpr"]).contains("as a whole"));
+        assert!(error(&["-mapxf", "-mapx-features=none"]).contains("as a whole"));
+    }
+
+    /// The options GCC keeps as names for other options act as those.
+    #[test]
+    fn an_alias_acts_as_the_option_it_stands_for() {
+        assert!(parse(&["-msse5"]).enable_avx);
+        assert!(!parse(&["-mavx", "-mno-sse5"]).enable_avx);
+        assert!(error(&["-mintel-syntax"]).contains("Intel syntax"));
+        assert!(parse_as("ccc", &["-mno-intel-syntax"], true).is_ok());
+        let off = parse(&["-mno-fused-madd"]);
+        assert!(matches!(off.fp_contract, FpContract::Off) && off.fp_contract_explicit);
+        let fast = parse(&["-ffp-contract=off", "-mfused-madd"]);
+        assert!(matches!(fast.fp_contract, FpContract::Fast) && fast.fp_contract_explicit);
+        assert!(matches!(
+            parse(&["-malign-functions=5"]).align_functions,
+            AlignControl::Custom { align: 32, .. }
+        ));
+        // An explicit `-falign-functions` wins on either side.
+        for flags in [
+            ["-malign-functions=5", "-falign-functions=64"],
+            ["-falign-functions=64", "-malign-functions=5"],
+        ] {
+            assert!(matches!(
+                parse(&flags).align_functions,
+                AlignControl::Custom { align: 64, .. }
+            ));
+        }
+        assert!(matches!(
+            parse(&["-malign-loops=0"]).align_loops,
+            AlignControl::Auto
+        ));
+        assert_eq!(
+            error(&["-malign-jumps=17"]),
+            "'-malign-jumps=17' is not between 0 and 16"
+        );
+    }
+
+    /// On another target none of this applies: an x86 option is the
+    /// error it always was, and its `-mno-` form passes as before.
+    #[test]
+    fn another_target_keeps_the_catch_alls() {
+        for flag in [
+            "-mcld",
+            "-mlong-double-80",
+            "-mstv",
+            "-mharden-sls=all",
+            "-mfentry-name=x",
+        ] {
+            let err = parse_as("aarch64-ccc", &[flag], false)
+                .err()
+                .unwrap_or_else(|| panic!("{flag} is accepted for AArch64"));
+            assert!(err.contains("unsupported machine option"), "{flag}: {err}");
+        }
+        assert!(parse_as("aarch64-ccc", &["-mno-cld"], false).is_ok());
+        // `-mlittle-endian` makes the command line an AArch64 one behind
+        // an option that was set aside for the x86 table.
+        let err = parse_as("ccc", &["-mlong-double-80", "-mlittle-endian"], false)
+            .err()
+            .expect("an x86 option on an AArch64 command line");
+        assert!(
+            err.contains("unsupported machine option -mlong-double-80"),
+            "{err}"
         );
     }
 }

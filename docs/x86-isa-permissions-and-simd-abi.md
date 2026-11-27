@@ -283,7 +283,29 @@ Not announced, and their options still refused: `prefetchi` (the
 instruction prefetches only through a RIP-relative operand, which the
 assembler-statement form does not produce: the intrinsic would be a
 no-operation), `kl`/`widekl`, `lwp`, `tbm`, `sse4a`, `fma4`, `xop`, the
-AMX sub-extensions and 3DNow!, whose intrinsics lccc does not have.
+AMX sub-extensions and 3DNow!, whose intrinsics lccc does not have. The
+refusal says so, and the `-mno-` form of each is accepted: none of
+their instructions is ever generated.
+
+Two extensions GCC has a bit of its own for ride another one here.
+`__CRC32__` and the `crc32` intrinsics are SSE4.2's, `_mm_monitor` and
+`_mm_mwait` are SSE3's. `-mcrc32` and `-mmwait` are therefore accepted
+where the parent is enabled and refused where it is not, and `-mno-crc32`
+and `-mno-mwait` the other way round: with SSE4.2 on, `-mno-crc32` used
+to pass in silence and leave `__CRC32__` defined, where GCC withdraws it.
+
+#### Machine options that are not ISA options
+
+Every other x86 `-m` spelling of GCC 16.2 (666 in all,
+`gcc --completion=-m`) that no arm of the driver takes is a row of a
+generated table, `docs/x86-machine-options.md`: accepted in silence where
+it names what the compiler does (`-mlong-double-80`, `-masm=att`,
+`-mtls-direct-seg-refs`, `-mfpmath=sse` on x86-64), a hint with a warning
+where it chooses among equivalent code (`-mbranch-cost=`,
+`-mtune-ctrl=`, `-mstv`), and refused with the reason where it asks for
+another layout, convention or record (`-mabi=ms`, `-mlong-double-64`,
+`-mno-direct-extern-access`, `-mneeded`). `scripts/gen_x86_mflag_policy.py`
+owns the table and holds it to both compilers.
 
 Known cost: lccc does not carry the carry flag from one `_addcarry_u64`
 to the next. A 2,048-limb addition takes 2.25 s where GCC 16.2 takes
@@ -434,6 +456,8 @@ instructions.
 | `scripts/check_x86_march_macros.py LCCC` | Every CPU, `-m64` and `-m32`: ISA, CPU-name and `-mtune=` macros against GCC |
 | `scripts/check_x86_mflag_macros.py LCCC [--pairs]` | Every `-m` ISA option, alone on six bases, plus the 24 ordered XSAVE/SSE-denial `CASCADES` that decide the option-layer mixes (`--pairs` widens it to every ordering): macros against GCC |
 | `scripts/check_x86_prefer_vector_width.py LCCC` | `-mprefer-vector-width=` codegen class per row against GCC, macro neutrality, rejection wording |
+| `scripts/gen_x86_mflag_policy.py --check --lccc LCCC --gcc GCC` | The table of machine options without code generation: every row under lccc (also under the strict policy), every spelling of GCC's list decided, nothing GCC refuses accepted, GCC's warnings word for word |
+| `tests/regression/check_x86_mflag_effects.py` | `-mharden-sls=`, `-mcld`, `notrack` on the jump of a `switch` under `-fcf-protection=branch`, the `-pg` names and negatives: shape per function against GCC, and the program run |
 | `x86_macro_gate_tests` (unit) | XSAVE precedence, the AES/PCLMUL/GFNI announcement split, the POPCNT unwind matrix, sticky `-mno-mmx`, `-mprefer-vector-width=` parsing |
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |
 | `check_target_attribute_isa.sh` | `target()` scoping, ordering, errors and intrinsic verdicts, re-measured on GCC |

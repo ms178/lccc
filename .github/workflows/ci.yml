@@ -2362,6 +2362,26 @@ jobs:
       run: >-
         python3 scripts/check_x86_mflag_macros.py target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
+    # Every x86 `-m` spelling GCC 16.2 has is either an arm of the driver or
+    # a row of the generated table (docs/x86-machine-options.md): accepted
+    # because it names what the compiler does, a hint, or refused with the
+    # reason. The check walks GCC's own list (`--completion=-m`), so a
+    # spelling that reaches the driver's last resort, an option GCC refuses
+    # and lccc accepts, and a warning that is not GCC's all fail here.
+    - name: Verify the x86 machine-option table against GCC 16.2
+      run: >-
+        python3 scripts/gen_x86_mflag_policy.py --check --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
+    # The options of that table that are implemented as a rule about the
+    # finished text: an int3 behind returns and indirect jumps
+    # (-mharden-sls=), cld in front of string instructions (-mcld), notrack
+    # on the jump of a switch under -fcf-protection=branch, the names and
+    # the negatives of the -pg family. Shape per function, GCC's shape
+    # beside it, and the program run with every rule on.
+    - name: Verify the x86 text-rule options against GCC 16.2
+      run: >-
+        python3 tests/regression/check_x86_mflag_effects.py --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
     - name: Verify x86 -mprefer-vector-width= against GCC 16.2
       run: >-
         python3 scripts/check_x86_prefer_vector_width.py target/fastbuild/lccc

@@ -7,6 +7,8 @@ so this table cannot drift from the binary: a row whose measured behaviour diffe
 or a document that differs from the table, fails the check.  The driver's policy is described at the
 top of `src/driver/cli.rs`; an option that is not listed here is governed by that policy's default
 (an unknown `-f` or `-W` option is accepted with a warning, an unknown `-m` option is an error).
+The x86 `-m` options have a table of their own, with every spelling GCC 16.2 has:
+`docs/x86-machine-options.md`.
 
 Regenerate with `python3 scripts/lccc_options_inventory.py --write` after changing the table.
 
@@ -33,6 +35,15 @@ Accepted **and** observed to do what it says.  The *Effect* column names the evi
 | `-madx -mrdseed -mclwb -mfsgsbase -mrdpid` | the scalar and system ISA options define GCC's macros (their intrinsics are in `x86gprintrin.h`; all 28 options are held to GCC by `check_x86_mflag_macros.py`) | macros: `__ADX__ 1`; `__RDSEED__ 1`; `__CLWB__ 1`; `__FSGSBASE__ 1`; `__RDPID__ 1` |
 | `-march=skylake -mno-adx` | a CPU's extensions are announced and an explicit `-mno-` removes one | macros: `__RDSEED__ 1`; `__XSAVEC__ 1`; absent `__ADX__` |
 | `-O2 -pg` | function entry calls `mcount` / `__fentry__` | asm: `mcount\|__fentry__` |
+| `-O2 -pg -mfentry -mfentry-name=my_entry` | the profiling call goes to the named function | asm: `call\s+my_entry`; absent `__fentry__` |
+| `-O2 -pg -mfentry -mno-fentry` | the later of `-mfentry` / `-mno-fentry` decides (`mcount`) | asm: `call\s+mcount`; absent `__fentry__` |
+| `-O2 -mharden-sls=all` | an `int3` behind every return and indirect jump | asm: `^\s*ret\n\s*int3$` |
+| `-O2 -mharden-sls=indirect-jmp` | `indirect-jmp` alone leaves a return bare | asm: `^\s*ret$`; absent `int3` |
+| `-O2 -mcld` | `cld` in front of a string instruction the compiler writes | asm: `^\s*cld\n\s*rep movsb$` |
+| `-O2 -fno-pic -fcf-protection=branch` | the jump of a `switch` is `notrack` (its case labels have no `endbr64`) | asm: `notrack\s+jmpq?\s+\*` |
+| `-mlong-double-80` | names the `long double` the compiler has (x87, 64-bit mantissa) | macros: `__LDBL_MANT_DIG__ 64`; `__SIZEOF_LONG_DOUBLE__ 16` |
+| `-O2 -mtls-direct-seg-refs` | names what the compiler does: a thread-local is read at `%fs:` | asm: `%fs:` |
+| `-mapx-inline-asm-use-gpr32` | defines GCC's macro of that name | macros: `__APX_INLINE_ASM_USE_GPR32__ 1` |
 | `-O2 -fno-omit-frame-pointer` | keeps the frame pointer (`pushq %rbp`) | asm: `pushq\s+%rbp` |
 | `-O2 -fno-asynchronous-unwind-tables` | no `.cfi_*` unwind directives | asm: absent `\.cfi_startproc` |
 | `-O2 -fpatchable-function-entry=2` | two `nop`s at entry and a `__patchable_function_entries` record | asm: `__patchable_function_entries`; `^\s*nop$` |
@@ -53,6 +64,8 @@ Accepted with a warning; the compiler does nothing with it.  Builds that pass th
 | `-Wshadow` | no shadowing diagnostics are produced | `tolerated but not implemented` |
 | `-Wmaybe-uninitialized` | no maybe-uninitialized diagnostics are produced | `tolerated but not implemented` |
 | `-gz` | debug sections are not compressed | `not supported` |
+| `-mbranch-cost=3` | a tuning preference, like the other hints of docs/x86-machine-options.md | `tolerated but not implemented` |
+| `-mno-vzeroupper` | `vzeroupper` stays where the compiler writes it | `tolerated but not implemented` |
 | `-fxyzzy-lccc-control` | unknown `-f` options are accepted with a warning (negative control) | `tolerated but not implemented` |
 | `-Wxyzzy-lccc-control` | unknown `-W` options are accepted with a warning (negative control) | `tolerated but not implemented` |
 
@@ -67,6 +80,9 @@ A hard error, because accepting it silently would change what the artifact is (s
 | `-fsanitize=address` | no sanitizer runtime | `-fsanitize=address is not supported` |
 | `-ftest-coverage` | no `.gcno`/`.gcda` output | `-ftest-coverage is not implemented` |
 | `-mstackrealign` | no stack realignment | `unsupported machine option -mstackrealign` |
+| `-mabi=ms` | the Microsoft convention is implemented for `ms_abi` functions only (the option was accepted and ignored) | `unsupported machine option -mabi=ms: ` |
+| `-mno-direct-extern-access` | external objects are addressed directly (the option was accepted and ignored) | `unsupported machine option -mno-direct-extern-access: ` |
+| `-mlong-double-64` | `long double` is the x87 format | `unsupported machine option -mlong-double-64: ` |
 | `-m32 -nostdlib -Wl,--emit-relocs` | the i686 linker cannot retain relocations | `--emit-relocs is not supported by the elf_i386` |
 | `-m32 -muintr` | user interrupts exist in 64-bit code only (GCC's words) | `'-muintr' not supported for 32-bit code` |
 | `-mxop` | no XOP code generation and no XOP intrinsics, so no `__XOP__` | `unsupported machine option -mxop` |

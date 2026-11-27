@@ -6532,7 +6532,8 @@ fn generate_function_body(
                 if mc.record {
                     let lbl = mcount_label.as_deref().unwrap();
                     cg.state().emit_fmt(format_args!(
-                        ".section __mcount_loc,\"a\",@progbits,{}",
+                        ".section {},\"a\",@progbits,{}",
+                        mc.record_section_name(),
                         lbl
                     ));
                     // Raw non-text `.section` emission: invalidate so the
@@ -6565,7 +6566,8 @@ fn generate_function_body(
                     if let Some(lbl) = &mcount_label {
                         cg.state().emit_fmt(format_args!("{}:", lbl));
                     }
-                    cg.state().emit("call __fentry__");
+                    cg.state()
+                        .emit_fmt(format_args!("call {}", mc.fentry_symbol()));
                 } else {
                     // Classic `call mcount`: deferred until AFTER the frame is
                     // set up (push %rbp; mov %rsp,%rbp) — the mcount ABI reads

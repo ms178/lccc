@@ -312,6 +312,22 @@ pub struct Driver {
     /// when mcount_pg is true (matching GCC: -pg is the trigger, the -m flags
     /// only configure how the call is emitted).
     pub(super) mcount_submode: crate::backend::McountInstrumentation,
+    /// `-mharden-sls=`: an `int3` behind returns and indirect jumps.
+    pub(super) harden_sls: crate::backend::x86_late_text::HardenSls,
+    /// `-mcld`: `cld` in front of the string instructions the compiler
+    /// writes.
+    pub(super) mcld: bool,
+    /// `-mapx-inline-asm-use-gpr32`: GCC's macro of that name. The
+    /// permission it stands for (r16 to r31 for `asm` operands) is not
+    /// used.
+    pub(super) apx_inline_asm_use_gpr32: bool,
+    /// The x86 machine options `x86_mflag_policy` decides, in the order
+    /// given. They are judged after the last argument: `-m32` may follow
+    /// them, and two of them depend on the ISA.
+    pub(super) x86_deferred_mflags: Vec<String>,
+    /// The x86-64 code model named last (`-mcmodel=small|medium|kernel`),
+    /// for the error IA-32 has for each of them.
+    pub(super) x86_code_model_name: Option<&'static str>,
     /// Set by -pg: activates function-entry mcount instrumentation using the
     /// configured mcount_submode. The kernel's CFLAGS_REMOVE mechanism strips
     /// -pg (e.g. for VDSO objects) leaving the sub-modes inert, matching GCC.
@@ -924,6 +940,11 @@ impl Driver {
             indirect_branch_thunk: false,
             patchable_function_entry: None,
             mcount_submode: crate::backend::McountInstrumentation::default(),
+            harden_sls: crate::backend::x86_late_text::HardenSls::default(),
+            mcld: false,
+            apx_inline_asm_use_gpr32: false,
+            x86_deferred_mflags: Vec::new(),
+            x86_code_model_name: None,
             mcount_pg: false,
             instrument_functions: false,
             cf_protection_branch: false,
@@ -2343,6 +2364,11 @@ impl Driver {
         }
         if self.resolved_abm() {
             preprocessor.define_macro("__ABM__", "1");
+        }
+        // GCC defines it for the option alone, in both modes and with or
+        // without APX (measured, 16.2).
+        if self.apx_inline_asm_use_gpr32 && matches!(self.target, Target::X86_64 | Target::I686) {
+            preprocessor.define_macro("__APX_INLINE_ASM_USE_GPR32__", "1");
         }
         // The scalar and system extensions (`__ADX__`, `__RDSEED__`,
         // `__CLWB__`, ...): the macro of each one that is enabled, from the
@@ -5090,6 +5116,8 @@ impl Driver {
                 None
             },
             cf_protection_branch: self.cf_protection_branch,
+            harden_sls: self.harden_sls,
+            cld: self.mcld,
             stack_clash_protection: self.stack_clash_protection,
             stack_protector_guard: (self.stack_protector_mode
                 != crate::backend::stack_protector::StackProtectorMode::None)
