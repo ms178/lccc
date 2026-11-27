@@ -173,6 +173,11 @@ CMP_MASK = [
     ("cmpeq_epi64_mask", "vpcmpq128", "__mmask8", False),
     ("cmp_epi64_mask", "vpcmpq128", "__mmask8", True),
 ]
+# `_MM_CMPINT_*` of the predicates GCC names.  3 (false) and 7 (true) have
+# no name of their own; `_mm*_cmp_ep*_mask` takes them as a number.
+CMP_PREDICATES = [
+    ("cmpeq", 0), ("cmplt", 1), ("cmple", 2), ("cmpneq", 4), ("cmpge", 5), ("cmpgt", 6),
+]
 MZ_LOAD = [
     ("maskz_loadu_epi8", "vmovdqu8_maskz_load512", "__m512i", "__mmask64", "M512I"),
     ("maskz_loadu_epi8", "vmovdqu8_maskz_load256", "__m256i", "__mmask32", "M256I"),
@@ -651,6 +656,23 @@ for name, mn, mty, has_imm in CMP_MASK:
     if has_imm:
         macro(f"{pfx}{name}(__a, __b, __imm)",
               f"({mty})__lccc_simd512_i_{mn}(__imm, __a, __b)")
+        # The predicates that have a name, and the forms that take a mask.
+        # `vpcmp` has one instruction per element type and takes the
+        # predicate as an immediate, so every name below is the builtin of
+        # this row with a number in front.  A `_mask_` form computes the
+        # compare in the lanes its mask selects and 0 in the others, which
+        # is the AND of the two masks.  lccc keeps a mask in a general
+        # register, so the AND is an `and` there; GCC moves the mask into a
+        # `k` register and compares under it (`vpcmpd ..., %k0{%k1}`).
+        element = name[len("cmp_"):-len("_mask")]
+        for predicate, imm in CMP_PREDICATES:
+            if predicate != "cmpeq":  # `cmpeq` is a row of its own above
+                macro(f"{pfx}{predicate}_{element}_mask(__a, __b)",
+                      f"({mty})__lccc_simd512_i_{mn}({imm}, __a, __b)")
+            macro(f"{pfx}mask_{predicate}_{element}_mask(__k, __a, __b)",
+                  f"({mty})((__k) & __lccc_simd512_i_{mn}({imm}, __a, __b))")
+        macro(f"{pfx}mask_cmp_{element}_mask(__k, __a, __b, __imm)",
+              f"({mty})((__k) & __lccc_simd512_i_{mn}(__imm, __a, __b))")
     else:
         macro(f"{pfx}{name}(__a, __b)",
               f"({mty})__lccc_simd512_i_{mn}(0, __a, __b)")

@@ -4,7 +4,7 @@
 # of the missing names (--list HEADER prints them).
 gcc 16.2.0
 callable 7502
-missing 6100
+missing 5812
 header adxintrin.h 6 0 e3b0c442
 header ammintrin.h 6 6 920b74f4
 header amxtileintrin.h 3 3 2f72485e
@@ -21,10 +21,10 @@ header avx512bitalgintrin.h 8 6 a33ef0fd
 header avx512bitalgvlintrin.h 16 16 5682a9c7
 header avx512bmmintrin.h 5 5 cafd0857
 header avx512bmmvlintrin.h 8 8 3dd19717
-header avx512bwintrin.h 323 261 5ec478fe
+header avx512bwintrin.h 323 213 c9b6098d
 header avx512cdintrin.h 14 14 1048c45c
 header avx512dqintrin.h 224 218 d225e85d
-header avx512fintrin.h 1395 1283 d26e8804
+header avx512fintrin.h 1395 1235 2e0f984d
 header avx512fp16intrin.h 563 563 32014ae6
 header avx512fp16vlintrin.h 341 341 10ad3daa
 header avx512ifmaintrin.h 6 6 da7b478c
@@ -33,9 +33,9 @@ header avx512vbmi2intrin.h 50 50 eeb6b66d
 header avx512vbmi2vlintrin.h 100 100 6d269f1d
 header avx512vbmiintrin.h 10 10 7efd977f
 header avx512vbmivlintrin.h 20 20 3ef14597
-header avx512vlbwintrin.h 501 477 6297b5fd
+header avx512vlbwintrin.h 501 381 afc690e2
 header avx512vldqintrin.h 177 177 741bfb61
-header avx512vlintrin.h 1253 1233 f9e097f7
+header avx512vlintrin.h 1253 1137 1504b3f9
 header avx512vnniintrin.h 12 10 c608cf9b
 header avx512vnnivlintrin.h 16 16 12b5c155
 header avx512vp2intersectintrin.h 2 2 252caaf0
