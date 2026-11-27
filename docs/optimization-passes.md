@@ -48,7 +48,18 @@ passes; the backend peepholes are documented per backend
   such a branch (`if_convert::branch_is_decided_on_entry`: a phi of the
   block with a constant arm, read directly or through casts and compares
   against constants; a select would write the constant, test it and compute
-  both arms on the way in that knew). The threader sends that way in to its
+  both arms on the way in that knew). One kind of such a branch is converted
+  all the same (`if_convert::resolves_on_every_entry`): the ways in that
+  decide it decide it the same, and on every other way -- there is one --
+  both arms give every phi the same constant, so the value is one arm's on
+  every way in and nothing is left to choose. `if (!arg) { ...; ok = names
+  != 0; p = 0; } else { ok = 1; p = saved; } return ok && p != 0;` is
+  `p != 0`, and the load of `names` is dead
+  (`tests/regression/check_llvm_guarded_folds.py`, `gf_phi`: 13 instructions
+  against 21); threaded, the way that tests kept the load and a branch
+  between two ways to the same answer. A branch every way in decides, and
+  ways in that decide it differently, stay the threader's. The threader
+  sends a deciding way in to its
   arm; a function that took a thread is cleaned up and asked again, up to
   four rounds, a level of nested conditions a round. The constant is read
   through what the helper's return type puts between the merge and its
@@ -125,7 +136,21 @@ passes; the backend peepholes are documented per backend
   contract for what it is — see `check_loop_store_motion.sh`'s `UNROLLED` arm
   and `check_seg_gs_runtime.sh`'s `CCC_DISABLE_PASSES=ipcp` shape build).
 - **DSE** (`dse.rs`) — same-block dead-store elimination with closed-alloca
-  escape analysis and byte-range kills (`CCC_NO_DSE`).
+  escape analysis and byte-range kills (`CCC_NO_DSE`). In a C volatile
+  object a volatile store is an event like a read: it hides nothing and ends
+  what the stores behind it can hide, so the initializer of `volatile struct
+  s v = {1, 2}; v.a = 3;` is written (GCC 16.2 and Clang 23.1 write it).
+- **Volatile objects** (`dse::close_volatile_objects`; no switch: it is what
+  the program says, at every level and with every pass disabled) — before
+  any pass, and once more behind the passes ahead of the backend, every load
+  and store whose address is in a C volatile object becomes a volatile
+  instruction, whatever the lowering wrote it as: the stores of an
+  initializer, the parts of a `_Complex`, a store a pass re-pointed from a
+  temporary. Where optimizing, what an initializer wrote twice (the zero
+  fill under the member stores) is first written once. From there on no
+  pass has to ask what an address is an address of, and the backends emit
+  each access in place and whole. Gate:
+  `tests/regression/check_volatile_access_semantics.sh`, items 7 and 8.
 - **Backedge PRE** — integer recurrences default-on (1.14x measured);
   FP variants gated (`CCC_BEPRE_FP=1` research).
 - **GlobalAddr CSE** (`global_addr_cse.rs`) — oracle-derived placement:

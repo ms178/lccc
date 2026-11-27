@@ -1878,6 +1878,18 @@ pub(crate) fn with_function_x86_vec_isa<R>(
     result
 }
 
+/// [`dse::close_volatile_objects`] once more, behind the passes and ahead of
+/// the backend.  [`run_passes`] closes every function before it runs
+/// anything, and a pass that re-points a store makes a plain one into a
+/// volatile object after that: `volatile _Complex double z = 1.0;` builds
+/// the constant in a temporary, the copy of the temporary into `z` is
+/// elided, and what was the temporary's store of 1.0 is `z`'s -- one the
+/// backend then wrote as two halves of a double.  Nothing is merged here:
+/// what is left is what the program wrote.
+pub(crate) fn close_volatile_objects(module: &mut IrModule) -> usize {
+    module.for_each_function(|func| dse::close_volatile_objects(func, false))
+}
+
 pub(crate) fn run_passes(
     module: &mut IrModule,
     opt_level: u32,
@@ -2182,6 +2194,15 @@ pub(crate) fn run_passes(
         lccc::cli::stderr_line(format_args!("{:#?}", module));
         lccc::cli::stderr_line(format_args!("==== END IR ===="));
     }
+    // The accesses of a C volatile object are volatile instructions from
+    // here on (`dse::close_volatile_objects`): its initializer is written
+    // and each of its reads is made, whatever runs below and at whatever
+    // level.  That is what the program says, not an optimization, so no
+    // switch turns it off; what `dse` (and `all`, and `-O0`) turns off is
+    // only the merge of what an initializer wrote twice.
+    let merge_initializers =
+        opt_level != 0 && !pass_disabled(&disabled, "all") && !pass_disabled(&disabled, "dse");
+    module.for_each_function(|func| dse::close_volatile_objects(func, merge_initializers));
     if pass_disabled(&disabled, "all") {
         return;
     }

@@ -45,6 +45,18 @@
 #     Each cell must write the slot and read it back, the calls must go
 #     through what was read, and the same code with a plain pointer is the
 #     control: there no slot is left.
+#  8. the initializer of a volatile object is written, whatever is assigned
+#     next.  Its stores were plain ones, and a plain store is dead under a
+#     later store of the same bytes: `volatile struct s v = {1, 2}; v.a = 3;`
+#     never wrote the 1, `volatile char c[8] = "abcdefg"; c[0] = 'x';` never
+#     the 'a', `volatile int x = 1; x = 2;` (before item 7's change) never
+#     the 1.  GCC 16.2 and Clang 23.1 write the initializer and then the
+#     assignment.  Each cell must store every constant its initializer and
+#     its assignments name, a zero fill for what a partial initializer leaves
+#     out, and -- a volatile `_Complex double` initialized with 1.0 and then
+#     `__real__ z = 3.0` -- no half of a double into the object's slot, where
+#     its real part used to be two `movl`.  The control is the same code
+#     without `volatile`: there the initializer's store is gone.
 set -euo pipefail
 
 CCC=${CCC:-./target/fastbuild/lccc}
@@ -477,6 +489,79 @@ for lvl in O1 O2 O3 Os; do
             echo "ok: $fn, the control, keeps its pointer out of memory"
         fi
     done
+done
+
+# 8. initializers of volatile objects.
+cat >"$td/init.c" <<'EOF'
+struct s { int a, b; };
+int scalar_init(void) { volatile int x = 41; x = 42; return x; }
+int struct_init(void) { volatile struct s v = {41, 42}; v.a = 43; return v.b; }
+int array_init(void) { volatile int a[2] = {41, 42}; a[0] = 43; return a[1]; }
+int partial_init(void) { volatile struct s v = {41}; v.a = 43; v.b = 44; return v.b; }
+int string_init(void) { volatile char c[8] = "ABCDEFG"; c[0] = 'x'; return c[1]; }
+int complex_init(void) { volatile _Complex double z = 1.0; __real__ z = 3.0; return (int)__imag__ z; }
+int plain_struct(void) { struct s v = {41, 42}; v.a = 43; return v.a + v.b; }
+EOF
+# An immediate stored into the frame: `movl $41, 4(%rsp)`.
+stored() { grep -Ec "mov[bwlq] +\\\$$2, *-?[0-9]*\\(%(rsp|rbp)\\)" <<<"$1" || true; }
+for lvl in O1 O2 O3 Os; do
+    echo "== initializers of volatile objects, $lvl"
+    "$CCC" -$lvl -S "$td/init.c" -o "$td/init.s" || { echo "FAIL: compile init.c at -$lvl"; rc=1; continue; }
+    # function:the constants it must store, each at least once.
+    for probe in scalar_init:41,42 struct_init:41,42,43 array_init:41,42,43 partial_init:0,41,43,44 \
+        string_init:65,66,67,68,69,70,71,120; do
+        fn=${probe%%:*}
+        body=$(awk -v f="$fn" '$0==f":"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/init.s")
+        missing=""
+        for value in $(tr ',' ' ' <<<"${probe##*:}"); do
+            [ "$(stored "$body" "$value")" -ge 1 ] || missing="$missing $value"
+        done
+        if [ -z "$missing" ]; then
+            echo "ok: $fn stores what its initializer and its assignments name"
+        else
+            echo "FAIL: $fn at -$lvl never stores:$missing"
+            echo "$body" | sed 's/^/      /'
+            rc=1
+        fi
+    done
+    # A double is one object: no store of half of one into `z`, whose slot
+    # the code generator names (`# LCCC_VOLATILE_SLOT 8(%rsp)`, 16 bytes
+    # from there).  The assigned 3.0 is one 8-byte store at its start; the
+    # initializer is the same, or a copy of all 16 bytes from a temporary
+    # that is no volatile object and may be written as it comes.
+    body=$(awk '$0=="complex_init:"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/init.s")
+    marker=$(sed -n 's/^ *# LCCC_VOLATILE_SLOT \(-\{0,1\}[0-9]*\)(%\(r[sb]p\))$/\1 \2/p' <<<"$body")
+    marker=${marker%%$'\n'*}
+    if [ -z "$marker" ]; then
+        echo "FAIL: complex_init at -$lvl names no volatile slot"
+        echo "$body" | sed 's/^/      /'
+        rc=1
+    else
+        off=${marker%% *}
+        base=${marker##* }
+        halves=0
+        for d in 0 4 8 12; do
+            n=$(grep -Ec "movl +[^,]+, *$((off + d))\\(%$base\\)" <<<"$body" || true)
+            halves=$((halves + n))
+        done
+        wide=$(grep -Ec "(movq|movsd|movlps) +[^,]+, *$off\\(%$base\\)" <<<"$body" || true)
+        if [ "$halves" -eq 0 ] && [ "$wide" -ge 1 ]; then
+            echo "ok: complex_init stores each double of its volatile object whole"
+        else
+            echo "FAIL: complex_init at -$lvl: $halves store(s) of half a double into the volatile slot, $wide whole at its start"
+            echo "$body" | sed 's/^/      /'
+            rc=1
+        fi
+    fi
+    # The control: without `volatile` the 41 is dead under the 43.
+    body=$(awk '$0=="plain_struct:"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/init.s")
+    if [ "$(stored "$body" 41)" -eq 0 ]; then
+        echo "ok: plain_struct, the control, drops the store its assignment covers"
+    else
+        echo "FAIL: plain_struct (the control) at -$lvl still stores the 41 it overwrites"
+        echo "$body" | sed 's/^/      /'
+        rc=1
+    fi
 done
 
 riscv_cc=${CCC_RISCV:-"$(dirname "$CCC")/lccc-riscv"}

@@ -52,6 +52,15 @@
 //!   Segment-relative reads are opaque barriers: their offsets cannot be
 //!   compared to default-space offsets. Segment stores supply no coverage
 //!   proof and are never eliminated here.
+//! * A C volatile *object* (an alloca with `semantic_volatile`) is written
+//!   where the program writes it, its initializer included: a volatile store
+//!   of it is an event like a read, which hides nothing and ends what the
+//!   stores behind it can hide, so `volatile struct s v = {1, 2}; v.a = 3;`
+//!   keeps the 1 it began with.  What an initializer writes twice it still
+//!   writes once -- the zero fill under the member stores is dead under
+//!   them, as for any object -- and [`close_volatile_objects`] then makes
+//!   each access of the object the volatile instruction every later pass
+//!   and the backends respect.
 //!
 //! Scope is deliberately same-block. Cross-block DSE needs post-dominator
 //! plus read-between proofs — that is the `segments`-based OP-33 follow-up.
@@ -124,6 +133,8 @@ struct DseContext {
     multi_defs: FxHashSet<u32>,
     /// Alloca value ids whose address provably never escapes.
     closed_allocas: FxHashSet<u32>,
+    /// Alloca value ids of C volatile objects (`semantic_volatile`).
+    volatile_objects: FxHashSet<u32>,
     /// This function IS a non-local-goto target (it holds a
     /// NonlocalGotoSave area): any callee can transfer control to a label
     /// alias inside this function, creating a re-entry edge invisible to
@@ -136,14 +147,22 @@ impl DseContext {
     fn build(func: &IrFunction) -> Self {
         let multi_defs = super::gvn::find_multi_def_values(func);
         let mut defs: FxHashMap<u32, PtrDef> = FxHashMap::default();
+        let mut volatile_objects = FxHashSet::default();
         for block in &func.blocks {
             for inst in &block.instructions {
                 if inst.dest().is_some_and(|v| multi_defs.contains(&v.0)) {
                     continue;
                 }
                 match inst {
-                    Instruction::Alloca { dest, .. } => {
+                    Instruction::Alloca {
+                        dest,
+                        semantic_volatile,
+                        ..
+                    } => {
                         defs.insert(dest.0, PtrDef::Alloca);
+                        if *semantic_volatile {
+                            volatile_objects.insert(dest.0);
+                        }
                     }
                     Instruction::GlobalAddr { dest, name } => {
                         defs.insert(dest.0, PtrDef::Global(name.as_str().into()));
@@ -185,8 +204,14 @@ impl DseContext {
             defs,
             multi_defs,
             closed_allocas,
+            volatile_objects,
             has_nonlocal_targets,
         }
+    }
+
+    /// Is `root` a C volatile object of this function?
+    fn is_volatile_object(&self, root: &CellRoot) -> bool {
+        matches!(root, CellRoot::Alloca(id) if self.volatile_objects.contains(id))
     }
 
     /// Resolve a pointer value to a cell address. Values with no defining
@@ -438,8 +463,22 @@ fn vec_store_cell(
     Some((addr.root, off))
 }
 
+/// Which stores a scan may remove.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Any store that is dead.
+    Function,
+    /// Only what an initializer of a C volatile object wrote twice: the
+    /// plain stores into such an object ([`close_volatile_objects`]).
+    VolatileObjects,
+}
+
 /// Backward scan of one block. Returns indices of dead stores.
-fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<usize> {
+fn dse_block(
+    block: &crate::ir::reexports::BasicBlock,
+    ctx: &DseContext,
+    scope: Scope,
+) -> Vec<usize> {
     let mut pending: Vec<Pending> = Vec::new();
     let mut dead: Vec<usize> = Vec::new();
     for ii in (0..block.instructions.len()).rev() {
@@ -464,18 +503,36 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
                         continue;
                     }
                 };
+                let in_volatile_object = ctx.is_volatile_object(&addr.root);
+                if *volatile && in_volatile_object {
+                    // A volatile store of a C volatile object is an event,
+                    // as a read of it is: what the object held up to here
+                    // was there to be seen, so the stores behind this one
+                    // hide nothing of the bytes it names, and it hides
+                    // nothing itself.  `volatile int x = 1; x = 2;` writes
+                    // twice (GCC 16.2 and Clang 23.1 both do); the 1 used to
+                    // be dead under the 2.
+                    match (addr.offset, extent) {
+                        (Some(off), Some((_, may_write))) => pending.retain(|p| {
+                            p.root != addr.root || !overlaps(p.offset, p.size, off, may_write)
+                        }),
+                        _ => pending.retain(|p| p.root != addr.root),
+                    }
+                    continue;
+                }
                 if let Some(off) = addr.offset {
                     if let Some((written, may_write)) = extent {
                         // Exact cell: does a pending later store definitely
                         // overwrite every byte this one may write?
-                        if !*volatile {
-                            if covered(&pending, &addr.root, off, may_write) {
-                                dead.push(ii);
-                                // The dead store is removed, but the pending
-                                // overwriter stays: an even earlier store to
-                                // the same cell is equally dead.
-                                continue;
-                            }
+                        if !*volatile
+                            && (scope == Scope::Function || in_volatile_object)
+                            && covered(&pending, &addr.root, off, may_write)
+                        {
+                            dead.push(ii);
+                            // The dead store is removed, but the pending
+                            // overwriter stays: an even earlier store to
+                            // the same cell is equally dead.
+                            continue;
                         }
                         pending.push(Pending {
                             root: addr.root,
@@ -559,7 +616,9 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
                     super::alias::vec_intrinsic_access(op, args)
                 {
                     if let Some((root, off)) = vec_store_cell(ctx, base, index, disp) {
-                        if covered(&pending, &root, off, bytes) {
+                        if (scope == Scope::Function || ctx.is_volatile_object(&root))
+                            && covered(&pending, &root, off, bytes)
+                        {
                             dead.push(ii);
                         } else {
                             pending.push(Pending {
@@ -676,15 +735,11 @@ pub(crate) fn eliminate_dead_private_slot_loads(func: &mut IrFunction) -> usize 
     removed
 }
 
-/// Run same-block dead store elimination on one function.
-pub(crate) fn eliminate_dead_stores(func: &mut IrFunction) -> usize {
-    if func.blocks.is_empty() || std::env::var_os("CCC_NO_DSE").is_some() {
-        return 0;
-    }
-    let mut total = eliminate_dead_private_slot_loads(func);
-    let ctx = DseContext::build(func);
+/// Remove from every block the stores a scan of `scope` finds dead.
+fn remove_dead_stores(func: &mut IrFunction, ctx: &DseContext, scope: Scope) -> usize {
+    let mut total = 0;
     for block in func.blocks.iter_mut() {
-        let dead = dse_block(block, &ctx);
+        let dead = dse_block(block, ctx, scope);
         if dead.is_empty() {
             continue;
         }
@@ -707,6 +762,90 @@ pub(crate) fn eliminate_dead_stores(func: &mut IrFunction) -> usize {
         });
     }
     total
+}
+
+/// Run same-block dead store elimination on one function.
+pub(crate) fn eliminate_dead_stores(func: &mut IrFunction) -> usize {
+    if func.blocks.is_empty() || std::env::var_os("CCC_NO_DSE").is_some() {
+        return 0;
+    }
+    let total = eliminate_dead_private_slot_loads(func);
+    let ctx = DseContext::build(func);
+    total + remove_dead_stores(func, &ctx, Scope::Function)
+}
+
+/// Make every access of a C volatile object the volatile instruction it is.
+/// Returns the number of instructions removed and marked.
+///
+/// The lowering marks the accesses it makes through an lvalue of volatile
+/// type.  What it writes of an initializer it writes as plain stores --
+/// `volatile struct s v = {1, 2};` is a zero fill and a store for each
+/// member -- and so do the paths that reach into an object without an
+/// lvalue of their own (`__real__ z = 3.0` of a volatile `_Complex
+/// double`).  A plain store is one the optimizer may take for dead and the
+/// backend may split:
+///
+/// ```c
+/// volatile struct s v = {1, 2};  v.a = 3;   // the 1 was never written
+/// volatile char c[8] = "abcdefg"; c[0] = 'x';   // nor the 'a'
+/// __real__ z = 3.0;   // two 4-byte stores of one volatile double
+/// ```
+///
+/// (GCC 16.2 writes the initializer whole and then the assignment, and the
+/// double in one `movq`.)  So, once per function and before any pass:
+///
+/// 1. with `merge_initializers`, what an initializer wrote twice is written
+///    once: the scan of [`Scope::VolatileObjects`] removes a plain store
+///    into a volatile object that later plain stores cover -- the zero fill
+///    under the members -- and nothing else of the function.  A volatile
+///    store covers nothing there (`dse_block`);
+/// 2. every load and store whose address is in a volatile object (the
+///    alloca, through copies and element addresses, with constant or
+///    variable offsets: [`DseContext::resolve`]) becomes volatile.
+///
+/// From there on the object's accesses are instructions every pass leaves
+/// alone and every backend emits in place, one access each, and no pass has
+/// to ask what an address is an address of.  Without optimization there is
+/// nothing to merge and step 2 alone runs.
+pub(crate) fn close_volatile_objects(func: &mut IrFunction, merge_initializers: bool) -> usize {
+    let has_volatile_object = func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Alloca {
+                    semantic_volatile: true,
+                    ..
+                }
+            )
+        })
+    });
+    if !has_volatile_object {
+        return 0;
+    }
+    let ctx = DseContext::build(func);
+    let mut changed = if merge_initializers {
+        remove_dead_stores(func, &ctx, Scope::VolatileObjects)
+    } else {
+        0
+    };
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            let (ptr, volatile) = match inst {
+                Instruction::Load { ptr, volatile, .. }
+                | Instruction::Store { ptr, volatile, .. } => (*ptr, volatile),
+                _ => continue,
+            };
+            if !*volatile
+                && ctx
+                    .resolve(ptr)
+                    .is_some_and(|addr| ctx.is_volatile_object(&addr.root))
+            {
+                *volatile = true;
+                changed += 1;
+            }
+        }
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -1730,5 +1869,313 @@ mod displaced_alias_tests {
             store(1),
         ]);
         assert_eq!(eliminate_dead_stores(&mut overlapping), 1);
+    }
+}
+
+#[cfg(test)]
+mod volatile_object_tests {
+    //! A C volatile object is written where the program writes it: no
+    //! volatile store hides one of its stores, what its initializer wrote
+    //! twice is written once, and [`close_volatile_objects`] leaves each of
+    //! its accesses a volatile instruction.
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
+
+    fn alloca(dest: u32, size: usize, volatile: bool, semantic_volatile: bool) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::I64,
+            size,
+            align: 4,
+            volatile,
+            semantic_volatile,
+        }
+    }
+    fn gep(dest: u32, base: u32, offset: Operand) -> Instruction {
+        Instruction::GetElementPtr {
+            dest: Value(dest),
+            base: Value(base),
+            offset,
+            ty: IrType::I32,
+        }
+    }
+    fn at(n: i64) -> Operand {
+        Operand::Const(IrConst::I64(n))
+    }
+    fn store(ptr: u32, val: Operand, ty: IrType, volatile: bool) -> Instruction {
+        Instruction::Store {
+            volatile,
+            val,
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+        }
+    }
+    fn int(n: i32) -> Operand {
+        Operand::Const(IrConst::I32(n))
+    }
+    fn load(dest: u32, ptr: u32, volatile: bool) -> Instruction {
+        Instruction::Load {
+            volatile,
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+        }
+    }
+    fn function(instructions: Vec<Instruction>, result: Option<u32>) -> IrFunction {
+        let mut f = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        f.next_value_id = 100;
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(result.map(|v| Operand::Value(Value(v)))),
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        });
+        f
+    }
+    /// `(value stored, volatile)` of the stores left, in order.
+    fn stores(f: &IrFunction) -> Vec<(i64, bool)> {
+        f.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|inst| match inst {
+                Instruction::Store {
+                    val: Operand::Const(k),
+                    volatile,
+                    ..
+                } => Some((k.to_i64().expect("an integer"), *volatile)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `volatile struct s { int a, b; } v = {1, 2}; v.a = 3; return v.b;` as
+    /// the lowering writes it: the fill, a plain store for each member, and
+    /// the volatile accesses the program makes.  `semantic` is whether the
+    /// alloca is a C volatile object or only kept in memory.
+    fn initialized_and_assigned(semantic: bool) -> IrFunction {
+        function(
+            vec![
+                alloca(0, 8, true, semantic),
+                store(0, at(0), IrType::I64, false),
+                store(0, int(1), IrType::I32, false),
+                gep(1, 0, at(4)),
+                store(1, int(2), IrType::I32, false),
+                store(0, int(3), IrType::I32, true),
+                load(2, 1, true),
+            ],
+            Some(2),
+        )
+    }
+
+    #[test]
+    fn a_volatile_store_hides_nothing_of_a_volatile_object() {
+        // The fill is dead under the two member stores; the 1 is not dead
+        // under the volatile 3.
+        let mut f = initialized_and_assigned(true);
+        assert_eq!(eliminate_dead_stores(&mut f), 1);
+        assert_eq!(stores(&f), [(1, false), (2, false), (3, true)]);
+
+        // The control: memory that is only kept out of a register is
+        // overwritten by a volatile store like any other.
+        let mut f = initialized_and_assigned(false);
+        assert_eq!(eliminate_dead_stores(&mut f), 2);
+        assert_eq!(stores(&f), [(2, false), (3, true)]);
+
+        // `volatile int x = 1; x = 2;` with the initializer a plain store.
+        let mut f = function(
+            vec![
+                alloca(0, 4, true, true),
+                store(0, int(1), IrType::I32, false),
+                store(0, int(2), IrType::I32, true),
+            ],
+            None,
+        );
+        assert_eq!(eliminate_dead_stores(&mut f), 0);
+        assert_eq!(stores(&f), [(1, false), (2, true)]);
+    }
+
+    #[test]
+    fn a_volatile_access_ends_what_later_stores_of_the_object_hide() {
+        // Two plain stores of one cell are one initializer's, and the later
+        // stands ...
+        let mut f = function(
+            vec![
+                alloca(0, 4, true, true),
+                store(0, int(1), IrType::I32, false),
+                store(0, int(2), IrType::I32, false),
+            ],
+            None,
+        );
+        assert_eq!(eliminate_dead_stores(&mut f), 1);
+        assert_eq!(stores(&f), [(2, false)]);
+
+        // ... unless the program wrote the object between them, or read it:
+        // then the first was there to be seen.
+        for between in [store(0, int(5), IrType::I32, true), load(2, 0, true)] {
+            let mut f = function(
+                vec![
+                    alloca(0, 4, true, true),
+                    store(0, int(1), IrType::I32, false),
+                    between,
+                    store(0, int(2), IrType::I32, false),
+                ],
+                None,
+            );
+            assert_eq!(eliminate_dead_stores(&mut f), 0);
+        }
+
+        // A volatile store of other bytes of the object ends nothing for
+        // these: the fill is dead under the two member stores around it.
+        let mut f = function(
+            vec![
+                alloca(0, 12, true, true),
+                store(0, at(0), IrType::I64, false),
+                store(0, int(1), IrType::I32, false),
+                gep(1, 0, at(4)),
+                gep(3, 0, at(8)),
+                store(3, int(9), IrType::I32, true),
+                store(1, int(2), IrType::I32, false),
+            ],
+            None,
+        );
+        assert_eq!(eliminate_dead_stores(&mut f), 1);
+        assert_eq!(stores(&f), [(1, false), (9, true), (2, false)]);
+
+        // One at an offset nobody knows may name any of them.
+        let mut f = function(
+            vec![
+                alloca(0, 8, true, true),
+                Instruction::ParamRef {
+                    dest: Value(9),
+                    param_idx: 0,
+                    ty: IrType::I64,
+                },
+                store(0, at(0), IrType::I64, false),
+                store(0, int(1), IrType::I32, false),
+                gep(1, 0, at(4)),
+                gep(3, 0, Operand::Value(Value(9))),
+                store(3, int(9), IrType::I32, true),
+                store(1, int(2), IrType::I32, false),
+            ],
+            None,
+        );
+        assert_eq!(eliminate_dead_stores(&mut f), 0);
+    }
+
+    #[test]
+    fn closing_merges_the_initializer_and_marks_every_access() {
+        let mut f = initialized_and_assigned(true);
+        // The fill goes, the two member stores are marked.
+        assert_eq!(close_volatile_objects(&mut f, true), 3);
+        assert_eq!(stores(&f), [(1, true), (2, true), (3, true)]);
+        // Closed, the function is one DSE has nothing to say about ...
+        assert_eq!(eliminate_dead_stores(&mut f), 0);
+        // ... and closing it again changes nothing.
+        let before = format!("{f:?}");
+        assert_eq!(close_volatile_objects(&mut f, true), 0);
+        assert_eq!(format!("{f:?}"), before);
+
+        // Without optimization nothing is merged: the fill is written too.
+        let mut f = initialized_and_assigned(true);
+        assert_eq!(close_volatile_objects(&mut f, false), 3);
+        assert_eq!(stores(&f), [(0, true), (1, true), (2, true), (3, true)]);
+    }
+
+    #[test]
+    fn closing_reaches_an_access_through_any_address_in_the_object() {
+        let mut f = function(
+            vec![
+                alloca(0, 16, true, true),
+                Instruction::ParamRef {
+                    dest: Value(9),
+                    param_idx: 0,
+                    ty: IrType::I64,
+                },
+                // A constant offset on a constant offset, a variable
+                // offset, and a copy of an element address.
+                gep(1, 0, at(4)),
+                gep(2, 1, at(4)),
+                gep(3, 0, Operand::Value(Value(9))),
+                Instruction::Copy {
+                    dest: Value(4),
+                    src: Operand::Value(Value(2)),
+                },
+                store(2, int(1), IrType::I32, false),
+                store(3, int(2), IrType::I32, false),
+                load(5, 4, false),
+                load(6, 3, false),
+            ],
+            Some(5),
+        );
+        assert_eq!(close_volatile_objects(&mut f, true), 4);
+        assert!(f.blocks[0].instructions.iter().all(|inst| !matches!(
+            inst,
+            Instruction::Load {
+                volatile: false,
+                ..
+            } | Instruction::Store {
+                volatile: false,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn closing_leaves_every_other_object_as_it_is() {
+        // An ordinary local with a dead store, memory that is only kept out
+        // of a register, and a pointer parameter: not one instruction of
+        // them is removed or marked, with a volatile object in the function
+        // or without one.
+        let others = |with_volatile_object: bool| {
+            let mut insts = vec![
+                alloca(0, 4, false, false),
+                alloca(1, 4, true, false),
+                Instruction::ParamRef {
+                    dest: Value(2),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                store(0, int(1), IrType::I32, false),
+                store(0, int(2), IrType::I32, false),
+                store(1, int(3), IrType::I32, false),
+                store(1, int(4), IrType::I32, false),
+                store(2, int(5), IrType::I32, false),
+                load(5, 0, false),
+                load(6, 1, false),
+                load(7, 2, false),
+            ];
+            if with_volatile_object {
+                insts.push(alloca(8, 4, true, true));
+                insts.push(store(8, int(6), IrType::I32, false));
+            }
+            function(insts, Some(5))
+        };
+        let mut f = others(false);
+        let before = format!("{f:?}");
+        assert_eq!(close_volatile_objects(&mut f, true), 0);
+        assert_eq!(format!("{f:?}"), before);
+
+        let mut f = others(true);
+        assert_eq!(close_volatile_objects(&mut f, true), 1);
+        assert_eq!(
+            stores(&f),
+            [
+                (1, false),
+                (2, false),
+                (3, false),
+                (4, false),
+                (5, false),
+                (6, true)
+            ]
+        );
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .all(|inst| !matches!(inst, Instruction::Load { volatile: true, .. }))
+        );
     }
 }

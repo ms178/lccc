@@ -4011,6 +4011,12 @@ impl Driver {
             }
         }
 
+        // Behind the last pass that may re-point a store into a volatile
+        // object (the passes above, and the inliner PGO promotion runs
+        // again): each access of such an object is a volatile instruction
+        // when the backend reads it.
+        crate::passes::close_volatile_objects(&mut module);
+
         // Pressure-guided live-range shrinkage runs after PGO promotion and
         // every ordinary SSA transform, but before call/global splitters and
         // phi elimination create non-SSA copy webs.  The pass itself is the
