@@ -349,63 +349,75 @@ fn unique_arm(incoming: &[(Operand, BlockId)], from: BlockId) -> Option<Operand>
     it.next().is_none().then_some(first)
 }
 
-/// What `cond`, a value `block` computes, is when the block is entered from
-/// `from` -- as far as the constants that edge brings the block's phis
-/// decide it.
+/// `inst` folded with what is `known`: an integer cast, an integer
+/// comparison and a copy of known operands, by the constant folder's own
+/// oracles (`constant_fold::eval_cast_const`, `eval_cmp_const`), so that the
+/// answer is the one the cleanup computes.  `None` for anything else.
+pub(super) fn fold_with_known(
+    inst: &Instruction,
+    known: &FxHashMap<u32, IrConst>,
+) -> Option<IrConst> {
+    let read = |op: &Operand| match op {
+        Operand::Const(k) => Some(*k),
+        Operand::Value(x) => known.get(&x.0).copied(),
+    };
+    match inst {
+        Instruction::Copy { src, .. } => read(src),
+        Instruction::Cast {
+            src,
+            from_ty,
+            to_ty,
+            ..
+        } if from_ty.is_integer() && to_ty.is_integer() => {
+            read(src).and_then(|k| super::constant_fold::eval_cast_const(k, *from_ty, *to_ty))
+        }
+        Instruction::Cmp {
+            op, lhs, rhs, ty, ..
+        } if ty.is_integer() => read(lhs)
+            .zip(read(rhs))
+            .and_then(|(l, r)| super::constant_fold::eval_cmp_const(*op, l, r, *ty)),
+        _ => None,
+    }
+}
+
+/// What `block` computes when it is entered from `from`, as far as the
+/// constants that edge brings the block's phis decide it.
 ///
 /// The block is folded for that one way in: a phi is the constant its arm
-/// from `from` is, and an integer cast, an integer comparison and a copy of
-/// what is known are folded by the constant folder's own oracles
-/// (`constant_fold::eval_cast_const`, `eval_cmp_const`), so that the answer
-/// is the one the cleanup computes in the copy the thread makes.  That
-/// reads a constant through whatever stands between a merge and its branch
-/// where a condition is inlined from a function of its own: nothing for a
-/// helper that returns `int`, `(p != 0)` for one that returns `_Bool`, a
-/// cast to a byte for `unsigned char` -- and a constant that is not 0 or 1
+/// from `from` is, and what [`fold_with_known`] folds of the known is known.
+/// That reads a constant through whatever stands between a merge and its
+/// branch where a condition is inlined from a function of its own: nothing
+/// for a helper that returns `int`, `(p != 0)` for one that returns `_Bool`,
+/// a cast to a byte for `unsigned char` -- and a constant that is not 0 or 1
 /// as far as the cast keeps it (256 as a byte is 0).  The instructions read
 /// are the ones `if_convert::branch_is_decided_on_entry` reads when it
 /// leaves the branch to this pass.
-fn constant_on_entry(block: &BasicBlock, from: BlockId, cond: Value) -> Option<IrConst> {
+pub(super) fn constants_on_entry(block: &BasicBlock, from: BlockId) -> FxHashMap<u32, IrConst> {
     let mut known: FxHashMap<u32, IrConst> = FxHashMap::default();
     for inst in &block.instructions {
-        let read = |op: &Operand| match op {
-            Operand::Const(k) => Some(*k),
-            Operand::Value(x) => known.get(&x.0).copied(),
-        };
         let folded = match inst {
-            Instruction::Phi { incoming, ty, .. } if ty.is_integer() => {
+            // An integer, or a pointer: the null a way in brings decides
+            // `if (p)` and `p != 0` like any other constant.
+            Instruction::Phi { incoming, ty, .. } if ty.is_integer() || *ty == IrType::Ptr => {
                 match unique_arm(incoming, from) {
                     Some(Operand::Const(k)) => Some(k),
                     _ => None,
                 }
             }
-            Instruction::Copy { src, .. } => read(src),
-            Instruction::Cast {
-                src,
-                from_ty,
-                to_ty,
-                ..
-            } if from_ty.is_integer() && to_ty.is_integer() => {
-                read(src).and_then(|k| super::constant_fold::eval_cast_const(k, *from_ty, *to_ty))
-            }
-            Instruction::Cmp {
-                op, lhs, rhs, ty, ..
-            } if ty.is_integer() => read(lhs)
-                .zip(read(rhs))
-                .and_then(|(l, r)| super::constant_fold::eval_cmp_const(*op, l, r, *ty)),
-            _ => None,
+            Instruction::Phi { .. } => None,
+            other => fold_with_known(other, &known),
         };
-        let Some(dest) = inst.dest() else {
-            continue;
-        };
-        if dest == cond {
-            return folded;
-        }
-        if let Some(k) = folded {
+        if let (Some(dest), Some(k)) = (inst.dest(), folded) {
             known.insert(dest.0, k);
         }
     }
-    None
+    known
+}
+
+/// What `cond`, a value `block` computes, is when the block is entered from
+/// `from` ([`constants_on_entry`]).
+fn constant_on_entry(block: &BasicBlock, from: BlockId, cond: Value) -> Option<IrConst> {
+    constants_on_entry(block, from).get(&cond.0).copied()
 }
 
 fn phi_def<'a>(b: &'a BasicBlock, v: Value) -> Option<&'a [(Operand, BlockId)]> {

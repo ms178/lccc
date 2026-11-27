@@ -2660,6 +2660,9 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
 /// (The order matters to the vectorizer too: converted from the outside in,
 /// the classifier loops `if (alpha(s[i])) n++` and `if (space(s[i])) n++`
 /// kept a select of a phi and stayed scalar.)
+///
+/// One kind of such a branch is converted all the same: the one whose select
+/// leaves no way in with anything to test ([`resolves_on_every_entry`]).
 fn branch_is_decided_on_entry(block: &BasicBlock) -> bool {
     let Terminator::CondBranch {
         cond: Operand::Value(cond),
@@ -2710,6 +2713,80 @@ fn branch_is_decided_on_entry(block: &BasicBlock) -> bool {
     false
 }
 
+/// Whether the selects `d` would make leave no way into its head with
+/// anything to choose: every way in that decides the condition decides it
+/// the same, and on every other way -- there is one -- both arms give every
+/// phi the same constant.
+///
+/// ```c
+/// if (!arg) { cleanup(); ok = names != 0; p = 0; } else { ok = 1; p = saved; }
+/// return ok && p != 0;
+/// ```
+///
+/// `ok && p != 0` branches on `ok = phi [t, A], [1, B]`.  From `B` the
+/// condition is 1.  From `A` it is not known, but `p` is 0 there and both
+/// arms give 0: the value is the true arm's on every way in, `t` is dead,
+/// and so is the load behind it.  The phi-observation fold makes exactly
+/// that of the select (`bit_idioms_guards::cfg`; `gf_phi` of
+/// tests/regression/llvm_guarded_folds), where the threader can take only
+/// `B`'s way out and leaves `A` a test of `t` between two ways to the same
+/// answer.  So a branch that [`branch_is_decided_on_entry`] would leave to
+/// the threader is converted when this holds, and only then:
+///
+/// * `if (smaller(...)) j++`, whose arms give `j + 1` and `j` on the way in
+///   that has to test, is left: that way needs its branch;
+/// * a branch every way in decides is left (the static key, a phi of 0 and
+///   1): the threader removes it whole, and a select would compute both
+///   arms on every way;
+/// * ways in that decide it differently are left for the same reason: no
+///   one arm is the value, and each of those ways is a thread.
+///
+/// The head and the arms are folded for one way in with the folder the
+/// threader reads a head with (`jump_thread::constants_on_entry`,
+/// `fold_with_known`): what is no constant by it is not taken for decided.
+fn resolves_on_every_entry(ctx: &IfConvCtx<'_>, d: &DiamondInfo) -> bool {
+    let Operand::Value(cond) = d.cond else {
+        return false;
+    };
+    let head = &ctx.func.blocks[d.pred_idx];
+    // The arm the ways in that decide the condition take, and whether a way
+    // in leaves it open.
+    let mut taken: Option<bool> = None;
+    let mut open = false;
+    for &from in ctx.preds.row(d.pred_idx) {
+        let from = ctx.func.blocks[from as usize].label;
+        let mut known = super::jump_thread::constants_on_entry(head, from);
+        if let Some(k) = known.get(&cond.0) {
+            let truth = !k.is_zero();
+            if taken.is_some_and(|before| before != truth) {
+                return false;
+            }
+            taken = Some(truth);
+            continue;
+        }
+        for inst in d.true_arm_insts.iter().chain(&d.false_arm_insts) {
+            if let (Some(dest), Some(k)) = (
+                inst.dest(),
+                super::jump_thread::fold_with_known(inst, &known),
+            ) {
+                known.insert(dest.0, k);
+            }
+        }
+        let constant = |op: &Operand| match op {
+            Operand::Const(k) => k.to_i128(),
+            Operand::Value(v) => known.get(&v.0).and_then(|k| k.to_i128()),
+        };
+        let arms_agree = d.phi_selects.iter().all(|(_, _, on_true, on_false)| {
+            matches!((constant(on_true), constant(on_false)), (Some(a), Some(b)) if a == b)
+        });
+        if !arms_agree {
+            return false;
+        }
+        open = true;
+    }
+    open && taken.is_some()
+}
+
 /// Diamond/triangle conversion proper, split out so the if-combine phase can
 /// rebuild the analysis context before calling it.
 fn if_convert_diamonds(func: &mut IrFunction) -> usize {
@@ -2720,14 +2797,17 @@ fn if_convert_diamonds(func: &mut IrFunction) -> usize {
     let mut diamonds: Vec<DiamondInfo> = Vec::new();
 
     for pred_idx in 0..num_blocks {
-        if branch_is_decided_on_entry(&func.blocks[pred_idx]) {
+        let Some(found) =
+            detect_diamond(&ctx, pred_idx).or_else(|| detect_triangle(&ctx, pred_idx))
+        else {
+            continue;
+        };
+        if branch_is_decided_on_entry(&func.blocks[pred_idx])
+            && !resolves_on_every_entry(&ctx, &found)
+        {
             continue;
         }
-        if let Some(diamond) = detect_diamond(&ctx, pred_idx) {
-            diamonds.push(diamond);
-        } else if let Some(triangle) = detect_triangle(&ctx, pred_idx) {
-            diamonds.push(triangle);
-        }
+        diamonds.push(found);
     }
 
     if diamonds.is_empty() {
@@ -7476,5 +7556,155 @@ mod decided_on_entry_tests {
             .find(|b| b.label == BlockId(3))
             .expect("the arm keeps its block");
         assert_eq!(arm.instructions.len(), 2, "and holds the arithmetic");
+    }
+
+    /// `if (!arg) { cleanup(); ok = t; p = 0; } else { ok = 1; p = saved; }
+    /// return ok && p != 0;` -- the shape of `gf_phi`:
+    ///
+    /// b0: saved = param 0; arg = param 1; t = param 2; CondBranch(arg, b2, b1)
+    /// b1: call cleanup; Branch(b3)
+    /// b2: Branch(b3)
+    /// b3: p = phi [0, b1], [saved, b2]; ok = phi [t, b1], [1, b2];
+    ///     CondBranch(ok, b4, b5)
+    /// b4: n = (p != 0); Branch(b5)
+    /// b5: r = phi [0, b3], [n, b4]; Return r
+    ///
+    /// `on_the_way_that_tests` is what `p` is on the way in from b1, and
+    /// `on_the_way_that_knows` what `ok` is on the way in from b2.  The call
+    /// keeps b1 a block: without it b0 is a diamond of its own, its select
+    /// takes the phis of b3, and b3 is no merge any more.
+    fn value_decided_on_every_way_in(
+        on_the_way_that_tests: Operand,
+        on_the_way_that_knows: i32,
+    ) -> IrFunction {
+        let mut f = IrFunction::new("f".to_string(), IrType::I32, vec![], false);
+        f.next_value_id = 40;
+        let param = |dest: u32, param_idx: usize| Instruction::ParamRef {
+            dest: Value(dest),
+            param_idx,
+            ty: IrType::I32,
+        };
+        f.blocks = vec![
+            block(
+                0,
+                vec![param(1, 0), param(2, 1), param(3, 2)],
+                branch_on(2, 2, 1),
+            ),
+            block(
+                1,
+                vec![Instruction::Call {
+                    func: "cleanup".into(),
+                    info: Default::default(),
+                }],
+                jump(3),
+            ),
+            block(2, vec![], jump(3)),
+            block(
+                3,
+                vec![
+                    phi(
+                        10,
+                        vec![(on_the_way_that_tests, 1), (Operand::Value(Value(1)), 2)],
+                    ),
+                    phi(
+                        11,
+                        vec![
+                            (Operand::Value(Value(3)), 1),
+                            (int(on_the_way_that_knows), 2),
+                        ],
+                    ),
+                ],
+                branch_on(11, 4, 5),
+            ),
+            block(
+                4,
+                vec![Instruction::Cmp {
+                    dest: Value(20),
+                    op: IrCmpOp::Ne,
+                    lhs: Operand::Value(Value(10)),
+                    rhs: int(0),
+                    ty: IrType::I32,
+                }],
+                jump(5),
+            ),
+            block(
+                5,
+                vec![phi(30, vec![(int(0), 3), (Operand::Value(Value(20)), 4)])],
+                Terminator::Return(Some(Operand::Value(Value(30)))),
+            ),
+        ];
+        f
+    }
+
+    fn still_branches(f: &IrFunction, label: u32) -> bool {
+        f.blocks.iter().any(|b| {
+            b.label == BlockId(label) && matches!(b.terminator, Terminator::CondBranch { .. })
+        })
+    }
+
+    /// Where no way in has anything to choose, the branch is converted: one
+    /// way knows the arm, and on the other both arms give the same constant.
+    #[test]
+    fn a_branch_no_way_in_has_to_test_is_converted() {
+        let mut f = value_decided_on_every_way_in(int(0), 1);
+        assert!(branch_is_decided_on_entry(&f.blocks[3]));
+        assert_eq!(if_convert_function(&mut f), 1);
+        assert!(
+            has_select(&f),
+            "the select the phi-observation fold resolves per way in"
+        );
+        assert!(!still_branches(&f, 3), "b3 no longer branches");
+        assert!(still_branches(&f, 0), "and b0, whose arm calls, still does");
+    }
+
+    /// The controls of [`a_branch_no_way_in_has_to_test_is_converted`]: each
+    /// is left to the threader as it stands.
+    #[test]
+    fn a_branch_a_way_in_has_to_test_is_left() {
+        let left = |mut f: IrFunction, why: &str| {
+            assert!(branch_is_decided_on_entry(&f.blocks[3]), "{why}");
+            let before = format!("{f:?}");
+            assert_eq!(if_convert_function(&mut f), 0, "{why}");
+            assert_eq!(format!("{f:?}"), before, "{why}");
+        };
+        // On the way in that has to test, `p` is a value: the arms differ
+        // there.
+        left(
+            value_decided_on_every_way_in(Operand::Value(Value(1)), 1),
+            "a value on the way that tests",
+        );
+        // A constant that makes the arms differ on that way (`p` is 5: the
+        // arms give 1 and 0) is no decision either.
+        left(
+            value_decided_on_every_way_in(int(5), 1),
+            "arms that differ on the way that tests",
+        );
+    }
+
+    /// Ways in that decide the branch differently are threads, whatever the
+    /// arms give: b1 brings `ok` a constant too, and the two disagree.
+    #[test]
+    fn ways_in_that_decide_differently_are_left() {
+        let mut f = value_decided_on_every_way_in(int(0), 1);
+        let Instruction::Phi { incoming, .. } = &mut f.blocks[3].instructions[1] else {
+            panic!("the second phi of b3 is `ok`");
+        };
+        incoming[0].0 = int(0);
+        assert!(branch_is_decided_on_entry(&f.blocks[3]));
+        let before = format!("{f:?}");
+        assert_eq!(if_convert_function(&mut f), 0);
+        assert_eq!(format!("{f:?}"), before);
+
+        // And ways in that all decide it the same leave nothing open: the
+        // threader removes the branch, a select would keep a test of a
+        // constant.
+        let mut f = value_decided_on_every_way_in(int(0), 1);
+        let Instruction::Phi { incoming, .. } = &mut f.blocks[3].instructions[1] else {
+            panic!("the second phi of b3 is `ok`");
+        };
+        incoming[0].0 = int(2);
+        let before = format!("{f:?}");
+        assert_eq!(if_convert_function(&mut f), 0);
+        assert_eq!(format!("{f:?}"), before);
     }
 }
