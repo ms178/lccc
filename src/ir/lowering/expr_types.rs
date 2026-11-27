@@ -336,8 +336,10 @@ impl Lowerer {
     }
 
     /// Resolve the RETURN type of the function designated by `func`, for
-    /// indirect calls (function pointer calls). Strip Deref layers since
-    /// dereferencing function pointers is a no-op in C.
+    /// indirect calls (function pointer calls).  The dereferences that only
+    /// designate the function again are taken off; one that loads a function
+    /// pointer stays, and its type is what is called
+    /// (`strip_designator_derefs`).
     ///
     /// Shared by `get_call_return_struct_size` and
     /// `get_call_return_struct_align` so the size and alignment queries can
@@ -348,14 +350,7 @@ impl Lowerer {
                 // Could be a function pointer variable
                 self.lookup_var_info(name).and_then(|vi| vi.c_type.clone())
             }
-            Expr::Deref(..) => {
-                let mut expr = func;
-                while let Expr::Deref(inner, _) = expr {
-                    expr = inner;
-                }
-                self.get_expr_ctype(expr)
-            }
-            _ => self.get_expr_ctype(func),
+            _ => self.get_expr_ctype(self.strip_designator_derefs(func)),
         };
         func_ctype.and_then(|ref ct| ct.func_ptr_return_type(false))
     }
@@ -1022,13 +1017,11 @@ impl Lowerer {
     }
 
     /// Get the IR type for a function call's return value.
-    /// Strips Deref layers since dereferencing function pointers is a no-op in C.
+    /// The dereferences that only designate the function again are taken
+    /// off (`strip_designator_derefs`); `*pp` of a pointer to a function
+    /// pointer is typed as what it loads.
     pub(super) fn get_call_return_type(&self, func: &Expr) -> IrType {
-        // Strip all Deref layers to get the underlying expression
-        let mut stripped = func;
-        while let Expr::Deref(inner, _) = stripped {
-            stripped = inner;
-        }
+        let stripped = self.strip_designator_derefs(func);
         if let Expr::Identifier(name, _) = stripped {
             // A function-pointer VARIABLE decides its own return type: its
             // declared signature, else its `c_type` (below).  It must never
@@ -2043,12 +2036,11 @@ impl Lowerer {
                     }
                 }
                 // For indirect calls through function pointer variables,
-                // extract the return type from the pointer's CType.
-                // Strip Deref layers since dereferencing function pointers is a no-op.
-                let mut stripped_func: &Expr = func.as_ref();
-                while let Expr::Deref(inner, _) = stripped_func {
-                    stripped_func = inner;
-                }
+                // extract the return type from the pointer's CType.  The
+                // dereferences that only designate the function again are
+                // taken off; one that loads a function pointer is typed as
+                // what it loads (`strip_designator_derefs`).
+                let stripped_func = self.strip_designator_derefs(func);
                 let func_ctype = match stripped_func {
                     Expr::Identifier(name, _) => {
                         if let Some(vi) = self.lookup_var_info(name) {

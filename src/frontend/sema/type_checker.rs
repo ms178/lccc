@@ -754,9 +754,25 @@ impl<'a> ExprTypeChecker<'a> {
 
     /// Infer the return CType of a function call.
     fn infer_call_return_ctype(&self, func: &Expr) -> Option<CType> {
-        // Strip Deref layers (dereferencing function pointers is a no-op in C)
+        // Strip the Deref layers that designate the function again
+        // (`(*f)(x)`, `(**f)(x)` of a function or a pointer to one).  A
+        // `*pp` of a pointer to a function pointer is a load: what is
+        // called is what it loads, and it is typed below like any other
+        // expression.  Taken off too, it typed `(**ppp)(x)` of a `double
+        // (***ppp)(double)` by `ppp`, and the call was refused: "returning
+        // 'double (**)(double)' from a function with return type 'double'".
+        // An operand whose type is not known (a builtin's name) is
+        // stripped, as before.
         let mut stripped = func;
         while let Expr::Deref(inner, _) = stripped {
+            let designates_function = match self.infer_expr_ctype(inner) {
+                Some(CType::Function(_)) | None => true,
+                Some(CType::Pointer(pointee, _)) => matches!(*pointee, CType::Function(_)),
+                Some(_) => false,
+            };
+            if !designates_function {
+                break;
+            }
             stripped = inner;
         }
 

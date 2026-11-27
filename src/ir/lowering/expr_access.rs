@@ -1147,11 +1147,10 @@ impl Lowerer {
             // If the callee is a function pointer variable whose return type is
             // itself a function pointer, then dereferencing the result is a no-op.
             Expr::FunctionCall(func, _, _) => {
-                // Strip deref layers from the callee (since *p, **p are equivalent for fptrs)
-                let mut callee: &Expr = func.as_ref();
-                while let Expr::Deref(inner, _) = callee {
-                    callee = inner;
-                }
+                // Strip deref layers from the callee (since *p, **p are equivalent
+                // for fptrs; a `*pp` that loads one is not a name, and the type
+                // of its call answered above).
+                let callee = self.strip_designator_derefs(func);
                 if let Expr::Identifier(name, _) = callee {
                     // Check if the callee returns a function pointer by examining its CType
                     if let Some(vi) = self.lookup_var_info(name) {

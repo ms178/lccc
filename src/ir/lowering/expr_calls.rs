@@ -168,15 +168,8 @@ impl Lowerer {
         // But dereferencing a pointer-to-function-pointer is a real load:
         // (*fpp)() where fpp is int (**)(int,int) must load the function pointer.
         // Only strip a Deref if the inner expression is itself a function pointer
-        // or function designator (checked via is_function_pointer_deref).
-        let mut stripped_func = func;
-        while let Expr::Deref(inner, _) = stripped_func {
-            if self.is_function_pointer_deref(inner) {
-                stripped_func = inner;
-            } else {
-                break;
-            }
-        }
+        // or function designator (`strip_designator_derefs`).
+        let mut stripped_func = self.strip_designator_derefs(func);
 
         // Strip AddressOf wrapping a function name: (&func)(args) => func(args).
         // In C, taking the address of a function and calling through it is equivalent
