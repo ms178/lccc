@@ -289,6 +289,52 @@ pub(crate) fn decide(arg: &str, ctx: &Context) -> Option<Outcome> {
     })
 }
 
+/// The options whose value is the next argument. What stands there is a
+/// file name, a macro, a symbol: never an option, whatever it looks like
+/// (`-o -msse5` writes a file by that name).
+fn takes_the_next_argument(option: &str) -> bool {
+    matches!(
+        option,
+        "-o" | "-x"
+            | "-I"
+            | "-D"
+            | "-U"
+            | "-A"
+            | "-L"
+            | "-l"
+            | "-T"
+            | "-e"
+            | "-u"
+            | "-z"
+            | "-B"
+            | "-G"
+            | "-MF"
+            | "-MT"
+            | "-MQ"
+            | "-include"
+            | "-imacros"
+            | "-isystem"
+            | "-idirafter"
+            | "-iquote"
+            | "-isysroot"
+            | "-iprefix"
+            | "-iwithprefix"
+            | "-iwithprefixbefore"
+            | "-imultilib"
+            | "--sysroot"
+            | "--param"
+            | "-Xlinker"
+            | "-Xassembler"
+            | "-Xpreprocessor"
+            | "-aux-info"
+            | "-dumpbase"
+            | "-dumpbase-ext"
+            | "-dumpdir"
+            | "-specs"
+            | "-wrapper"
+    )
+}
+
 /// Replace the options GCC 16.2 keeps as names for other options, and
 /// return GCC's warning for each one found.
 ///
@@ -306,7 +352,14 @@ pub(crate) fn expand_aliases(args: &[String]) -> Result<(Vec<String>, Vec<String
             warnings.push(text);
         }
     };
+    let mut is_a_value = false;
     for arg in args {
+        if std::mem::replace(&mut is_a_value, takes_the_next_argument(arg)) {
+            out.push(arg.clone());
+            // The value of an option is not itself one that takes a value.
+            is_a_value = false;
+            continue;
+        }
         if let Ok(at) = ALIASES.binary_search_by(|(option, ..)| (*option).cmp(arg.as_str())) {
             let (_, warning, replacement) = ALIASES[at];
             warn(warning.to_string());
@@ -761,6 +814,26 @@ mod tests {
             warnings[2],
             "'-mstore-max=' is deprecated; use '-mmove-max=' instead"
         );
+    }
+
+    /// `-o -msse5` names a file. The argument behind an option that takes
+    /// its value there is copied, and the one behind that is read again.
+    #[test]
+    fn the_value_of_another_option_is_not_an_alias() {
+        for option in [
+            "-o", "-include", "-I", "-D", "-MF", "-Xlinker", "-x", "--param",
+        ] {
+            let args = strings(&[option, "-msse5", "-msse5", "x.c"]);
+            let (replaced, warnings) = expand_aliases(&args).unwrap();
+            assert_eq!(replaced, [option, "-msse5", "-mavx", "x.c"], "{option}");
+            assert_eq!(warnings, ["'-msse5' was removed"], "{option}");
+        }
+        let args = strings(&["-o", "-malign-loops=4", "-include", "-mstore-max=256"]);
+        assert_eq!(expand_aliases(&args).unwrap(), (args, vec![]));
+        // An option joined to its value takes nothing from the next argument.
+        let (replaced, _) =
+            expand_aliases(&strings(&["-ofile", "-msse5", "-I.", "-mno-sse5"])).unwrap();
+        assert_eq!(replaced, ["-ofile", "-mavx", "-I.", "-mno-avx"]);
     }
 
     #[test]

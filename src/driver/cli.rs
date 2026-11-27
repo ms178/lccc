@@ -3294,6 +3294,15 @@ impl Driver {
                 "-mcmodel=kernel" => {
                     self.code_model_kernel = true;
                     self.x86_code_model_name = Some("kernel");
+                    self.x86_deferred_mflags.retain(|arg| arg != "-mcmodel=32");
+                }
+                // IA-32's one code model. Whether it is valid is the table's
+                // to say once the mode is known; here it only ends an
+                // earlier x86-64 model, as the last `-mcmodel=` does in GCC.
+                "-mcmodel=32" if self.target_is_x86() => {
+                    self.code_model_kernel = false;
+                    self.x86_code_model_name = None;
+                    self.x86_deferred_mflags.push(args[i].clone());
                 }
                 // SA-YG-1: `-mcmodel=large` used to be silently folded into
                 // the SMALL model (`code_model_kernel = false`).  Every
@@ -3319,6 +3328,7 @@ impl Driver {
                         "-mcmodel=medium" => Some("medium"),
                         _ => None,
                     };
+                    self.x86_deferred_mflags.retain(|arg| arg != "-mcmodel=32");
                 }
                 // RISC-V's `-mabi=`. On x86 the option chooses the calling
                 // convention of every function (`sysv` or `ms`) and went
@@ -4699,7 +4709,15 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
         if deferred.is_empty() {
             return Ok(());
         }
-        let strict = strict_options || std::env::var_os("LCCC_STRICT_MFLAGS").is_some();
+        // Either strict policy makes what is not implemented an error; the
+        // message names the one that is set.
+        let strict_mflags = std::env::var_os("LCCC_STRICT_MFLAGS").is_some();
+        let strict = strict_options || strict_mflags;
+        let policy = if strict_options {
+            "LCCC_STRICT_OPTIONS"
+        } else {
+            "LCCC_STRICT_MFLAGS"
+        };
         let generic = |arg: &str| {
             format!(
                 "unsupported machine option {arg}; LCCC refuses to silently ignore target-affecting -m flags"
@@ -4735,9 +4753,7 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                 continue;
             }
             let unimplemented = || {
-                format!(
-                    "command-line option '{arg}' is not implemented by LCCC; LCCC_STRICT_OPTIONS is set"
-                )
+                format!("command-line option '{arg}' is not implemented by LCCC; {policy} is set")
             };
             match outcome {
                 Outcome::State | Outcome::Invalid(_) => {}
@@ -10085,12 +10101,21 @@ mod x86_mflag_policy_tests {
             "code model '32' not supported in the 64 bit mode"
         );
         for model in ["small", "medium", "kernel"] {
+            let flag = format!("-mcmodel={model}");
             assert_eq!(
-                error(&["-m32", &format!("-mcmodel={model}")]),
+                error(&["-m32", &flag]),
                 format!("code model '{model}' not supported in the 32 bit mode")
             );
-            assert!(parse_as("ccc", &[&format!("-mcmodel={model}")], true).is_ok());
+            assert!(parse_as("ccc", &[&flag], true).is_ok());
+            // The last `-mcmodel=` is the one in force, either way round.
+            assert!(parse_as("ccc", &["-m32", &flag, "-mcmodel=32"], true).is_ok());
+            assert!(parse_as("ccc", &["-mcmodel=32", &flag], true).is_ok());
+            assert_eq!(
+                error(&[&flag, "-mcmodel=32"]),
+                "code model '32' not supported in the 64 bit mode"
+            );
         }
+        assert!(!parse(&["-mcmodel=kernel", "-mcmodel=32", "-m32"]).code_model_kernel);
         // IA-32 computes `float` in SSE and `double` in the x87: neither
         // of GCC's two pure modes.
         assert!(error(&["-m32", "-mfpmath=sse"]).contains("not implemented"));
