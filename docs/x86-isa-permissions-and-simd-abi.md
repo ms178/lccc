@@ -278,6 +278,16 @@ the intrinsics of `include/x86gprintrin.h`:
   for `rdpkru`, EDX:EAX for the XSAVE family, RBX/RCX/RDX per enclave
   leaf). The ones a process may execute are executed
   (`x86_gpr_intrinsics_runtime.c`, and `_i686`).
+* The same promise for the AVX-512 integer compares that write a mask.
+  `vpcmp` takes its predicate as an immediate; the headers name six of
+  the eight (`cmpeq`, `cmpneq`, `cmplt`, `cmple`, `cmpgt`, `cmpge`) and
+  give every form a twin under a mask (`_mm512_mask_cmpge_epu8_mask`,
+  `_mm256_mask_cmp_epi64_mask`), for eight element types and three
+  widths. lccc had `cmpeq` and the numbered form; the other 288 are
+  generated from the same rows (`scripts/gen_lcccsimd.py`; 6,100 missing
+  before, 5,812 after). `tests/regression/avx512_mask_compare_names.c`
+  calls every form and holds each mask to a compare of the elements one
+  at a time.
 
 Not announced, and their options still refused: `prefetchi` (the
 instruction prefetches only through a RIP-relative operand, which the
