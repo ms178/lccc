@@ -4125,6 +4125,25 @@ impl Driver {
                 floor: self.tls_model_floor,
             },
         ));
+
+        // A 512-bit vector object that is only ever read and written whole
+        // lives in one of zmm16..zmm31 instead of a 64-byte-aligned stack
+        // slot (`backend::x86_zmm_homes`). Behind every pass that can add a
+        // use of an object or a call (the inliner, IPA-PTA, the return
+        // duplication above) and behind the TLS table, which says what is a
+        // call; in front of the splitters, to whose liveness a `Memcpy` is a
+        // call point and the register move it becomes here is not.
+        // `CCC_DISABLE_PASSES=zmmhome` turns it off.
+        if self.target == Target::X86_64
+            && self.opt_level >= 1
+            && !crate::passes::pass_disabled(
+                std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
+                "zmmhome",
+            )
+            && crate::backend::x86_zmm_homes::assign(&mut module) != 0
+        {
+            crate::passes::verify::verify_after_pass(&module, "zmmhome");
+        }
         (module, pgo_unit)
     }
 

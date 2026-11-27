@@ -647,6 +647,25 @@ impl X86Codegen {
         // the caller-saved pool is final).
         self.ipa_keep = 0;
         self.ipa_keep_callees.clear();
+        // The 512-bit objects that live in a register, if what was decided
+        // for them still holds (`x86_zmm_homes::homes_hold`). A function for
+        // which it does not is compiled without homes: its objects get stack
+        // slots below, like every other object.
+        self.zmm_homes.clear();
+        self.state.register_homed_allocas.clear();
+        if !func.zmm_homes.is_empty() {
+            if crate::backend::x86_zmm_homes::homes_hold(func) {
+                self.zmm_homes.extend(func.zmm_homes.iter().copied());
+                self.state
+                    .register_homed_allocas
+                    .extend(func.zmm_homes.iter().map(|(object, _)| *object));
+            } else if std::env::var_os("CCC_DEBUG_ZMMHOME").is_some() {
+                lccc::cli::stderr_line(format_args!(
+                    "[zmmhome] {}: the homes do not hold; the function is compiled without them",
+                    func.name
+                ));
+            }
+        }
         self.wide_simd_copies = func.blocks.iter().any(|block| {
             block.instructions.iter().any(|inst| {
                 matches!(

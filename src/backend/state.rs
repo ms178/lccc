@@ -636,6 +636,11 @@ pub struct CodegenState {
     pub omitted_tls_roots: FxHashMap<u32, String>,
     /// Name of the function currently being code-generated (diagnostics).
     pub current_func_name: String,
+    /// The `Alloca`s of the current function whose object the back end keeps
+    /// in a register (x86-64: a 512-bit vector in `zmm16`..`zmm31`,
+    /// `backend::x86_zmm_homes`). Stack layout gives such an object no slot.
+    /// Set by the back end before the layout runs; empty everywhere else.
+    pub register_homed_allocas: FxHashSet<u32>,
     /// Total use count for each value ID across the entire function.
     /// Used by MachInst flush to determine if a buffer-defined vreg is live-out.
     pub value_use_counts: Vec<u32>,
@@ -1101,6 +1106,7 @@ impl CodegenState {
             promoted_global_addr_homes: FxHashSet::default(),
             omitted_tls_roots: FxHashMap::default(),
             current_func_name: String::new(),
+            register_homed_allocas: FxHashSet::default(),
             value_use_counts: Vec::new(),
             switch_unsigned_bounds: FxHashMap::default(),
             switch_bounds_enabled: false,

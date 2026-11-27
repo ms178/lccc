@@ -477,6 +477,41 @@ Differences from GCC 16.2, each pinned by the gate:
   operand costs a load or a store that GCC does not emit. The intrinsics
   do not go this way.
 
+### 2.2 512-bit vector objects in registers
+
+A vector has no IR type: a `__m512i` is a 64-byte object, an operation
+reads and writes it through pointers, and each inlined intrinsic copies
+its arguments. The 128- and 256-bit widths leave that form in the pass
+pipeline. The 512-bit width keeps it, and `backend::x86_zmm_homes` gives
+the object a register instead of a stack slot at the end of the pipeline:
+
+* **Which objects.** A 64-byte object, not volatile and not a parameter's
+  home, whose every mention reads or writes it whole: the operations of
+  `x86_zmm_homes::signature` and 64-byte copies. One lane access, call
+  argument, masked operation, `_mm512_castsi512_si256`, `asm` operand or
+  address that goes anywhere else leaves the object in memory.
+* **Which registers.** `zmm16`..`zmm31`. Nothing else in the back end
+  names them, both calling conventions leave them to the caller, and
+  `vzeroupper` neither clears them nor is needed after code that writes
+  only them (GCC 16.2 and Clang 23.1.5 emit none there either).
+* **Calls.** Nobody preserves the registers. An object that holds a value
+  across a call, a library helper or an `asm` statement with a template
+  stays in memory; the others of the same function do not.
+* **Copies.** The names one value has (the parameter of an inlined
+  function, its result, a plain `b = a`) are one register where no name is
+  written while another still holds the value. A copy between them is no
+  instruction.
+* **Which functions.** Those with a 512-bit operation. A function that
+  only copies 64-byte structures has not said that it may execute AVX-512.
+* **Not yet.** Parameters and results (a `__m512i` parameter is stored to
+  its slot by the prologue and read from there), and the operations
+  outside the table: widening, conversions between widths, insert and
+  extract, masked forms.
+
+`CCC_DISABLE_PASSES=zmmhome` switches it off. The decision is checked
+again at code generation, and a function for which it no longer holds is
+compiled without homes; `CCC_DEBUG_ZMMHOME=1` reports such a function.
+
 ## 3. Call-frame information
 
 Code generation never writes `.cfi_*` directives. `backend/cfi_synth.rs`
@@ -502,6 +537,8 @@ instructions.
 | `scripts/gen_x86_mflag_policy.py --check --lccc LCCC --gcc GCC` | The table of machine options without code generation: every row under lccc (also under the strict policy), every spelling of GCC's list decided, nothing GCC refuses accepted, GCC's warnings word for word |
 | `tests/regression/check_x86_mflag_effects.py` | `-mharden-sls=`, `-mcld`, `notrack` on the jump of a `switch` under `-fcf-protection=branch`, the `-pg` names and negatives: shape per function against GCC, and the program run |
 | `tests/regression/check_x86_asm_register_operands.py` | `asm` operands in `ymm`, `zmm`, mask and MMX registers (§2.1): the statement's text line for line, GCC's template and diagnostics, generated statements run against GCC's build |
+| `tests/regression/check_x86_zmm_homes.py` | 512-bit objects in `zmm16`..`zmm31` (§2.2): the instructions of chains, copies and a loop; no register above 15 anywhere with the homes off; no home given up at code generation; generated programs run at every level against GCC's build |
+| `every_signature_holds_for_its_emitter` (unit) | Each operation a homed object may be an operand of, with its operands in registers, in memory and shared with the result: the value the destination ends with is the one the all-in-memory path computes |
 | `x86_macro_gate_tests` (unit) | XSAVE precedence, the AES/PCLMUL/GFNI announcement split, the POPCNT unwind matrix, sticky `-mno-mmx`, `-mprefer-vector-width=` parsing |
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |
 | `check_target_attribute_isa.sh` | `target()` scoping, ordering, errors and intrinsic verdicts, re-measured on GCC |

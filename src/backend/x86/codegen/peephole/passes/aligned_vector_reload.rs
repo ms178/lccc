@@ -138,6 +138,27 @@ const MOVE_MNEMONICS: &[&str] = &[
     "vmovdqu64",
 ];
 
+/// Whether `mnem` has a register/register form for registers `src` and `dst`
+/// at `width` under the ISA the memory form of the same mnemonic and width
+/// already needed.
+///
+/// Registers 16..31 exist only in EVEX encodings.  `vmovdqa`/`vmovdqu` and
+/// the legacy mnemonics have none, so no form names such a register.  The
+/// `vmovdq[au]{32,64}` mnemonics are EVEX at every width, and a load that
+/// used one needed that encoding already.  `vmov[au]p[sd]` is EVEX at 512
+/// bits; at 128 and 256 bits the load may have been VEX, and the EVEX form
+/// would need AVX512VL, which the load does not prove.
+fn register_form_exists(mnem: &str, width: Width, src: u8, dst: u8) -> bool {
+    if src < 16 && dst < 16 {
+        return true;
+    }
+    match mnem {
+        "vmovdqa32" | "vmovdqa64" | "vmovdqu32" | "vmovdqu64" => true,
+        "vmovaps" | "vmovups" | "vmovapd" | "vmovupd" => width == Width::Zmm,
+        _ => false,
+    }
+}
+
 /// Vector register width class.  Comparison is by [`Width::bytes`], so
 /// "no wider than" is an explicit byte-count test rather than an implicit
 /// ordering that a future variant could silently reorder.
@@ -437,6 +458,7 @@ pub(super) fn forward_aligned_vector_reload(store: &mut LineStore, infos: &mut [
             if key != Some(ps.key)
                 || mv.reg.width.bytes() > ps.src.width.bytes()
                 || mv.vex != ps.vex
+                || !register_form_exists(mv.mnem, mv.reg.width, ps.src.index, mv.reg.index)
             {
                 continue;
             }
@@ -558,6 +580,43 @@ mod aligned_vector_reload_tests {
         assert!(out.contains("vmovups %xmm0, %xmm3"), "{out}");
         let asm = "    leaq -128(%rbp), %rax\n    andq $-64, %rax\n    vmovdqu64 %zmm2, (%rax)\n    vmovdqu (%rax), %ymm5";
         assert!(run(asm).contains("vmovdqu %ymm2, %ymm5"));
+    }
+
+    /// A 512-bit object the back end keeps in `%zmm16`..`%zmm31` is stored
+    /// from there, and a narrower VEX load of the same bytes may follow (a
+    /// `Memcpy` in `%ymm` halves).  `vmovdqu %ymm17, %ymm0` is no
+    /// instruction: VEX cannot name the register.
+    #[test]
+    fn a_register_above_15_is_forwarded_only_in_an_evex_form() {
+        const HEAD: &str =
+            "    leaq -128(%rbp), %rax\n    andq $-64, %rax\n    vmovdqu64 %zmm17, (%rax)\n";
+        for load in [
+            "vmovdqu (%rax), %ymm0",
+            "vmovdqa (%rax), %ymm0",
+            "vmovdqu (%rax), %xmm0",
+            "vmovups (%rax), %ymm0",
+            "vmovapd (%rax), %xmm3",
+        ] {
+            let out = run(&format!("{HEAD}    {load}"));
+            // The load is still a load: no line moves register 17 to a register.
+            assert!(
+                out.contains(load) && !out.contains("mm17, %"),
+                "{load}: {out}"
+            );
+        }
+        for (load, forwarded) in [
+            ("vmovdqu64 (%rax), %zmm5", "vmovdqu64 %zmm17, %zmm5"),
+            ("vmovdqa64 (%rax), %zmm20", "vmovdqa64 %zmm17, %zmm20"),
+            ("vmovups (%rax), %zmm1", "vmovups %zmm17, %zmm1"),
+            // The load already was the EVEX form of its width.
+            ("vmovdqu64 (%rax), %ymm5", "vmovdqu64 %ymm17, %ymm5"),
+        ] {
+            let out = run(&format!("{HEAD}    {load}"));
+            assert!(out.contains(forwarded), "{load}: {out}");
+        }
+        // The destination can be the register above 15.
+        let asm = "    leaq -128(%rbp), %rax\n    andq $-64, %rax\n    vmovdqu64 %zmm2, (%rax)\n    vmovdqu64 (%rax), %zmm20";
+        assert!(run(asm).contains("vmovdqu64 %zmm2, %zmm20"));
     }
 
     #[test]

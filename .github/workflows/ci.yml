@@ -2393,6 +2393,19 @@ jobs:
       run: >-
         python3 tests/regression/check_x86_asm_register_operands.py --lccc target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
+    # A 512-bit vector object that is only read and written whole lives in
+    # one of zmm16..zmm31 instead of 64 bytes of stack. This holds the
+    # shapes (one instruction per operation, no instruction for a copy, no
+    # stack traffic in a loop), the contract the registers rest on (nothing
+    # else lccc emits names a register above 15), and generated programs
+    # with loops, branches, calls that overwrite every register and more
+    # than sixteen values alive, built at every level and run against
+    # GCC's build of them. The programs run where the runner has AVX-512;
+    # elsewhere they are compiled and assembled.
+    - name: Verify 512-bit vector objects in zmm16..zmm31 against GCC 16.2
+      run: >-
+        python3 tests/regression/check_x86_zmm_homes.py --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
     - name: Verify x86 -mprefer-vector-width= against GCC 16.2
       run: >-
         python3 scripts/check_x86_prefer_vector_width.py target/fastbuild/lccc

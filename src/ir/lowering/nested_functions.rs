@@ -1212,6 +1212,7 @@ impl Lowerer {
             ret_is_vector128,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
+            zmm_homes: Vec::new(),
             ssp: crate::ir::module::SspInfo {
                 stack_protect: nf.attrs.is_stack_protect(),
                 no_stack_protector: nf.attrs.is_no_stack_protector(),

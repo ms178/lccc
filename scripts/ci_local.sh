@@ -1385,6 +1385,10 @@ gate "x86-mflag-effects" fast \
 gate "x86-asm-register-operands" fast \
     python3 tests/regression/check_x86_asm_register_operands.py --lccc "$LCCC" \
         --gcc "${GCC16:-gcc-16}"
+# 512-bit vector objects in zmm16..zmm31: the shapes, the registers nothing
+# else names, and generated programs run against GCC's build of them.
+gate "x86-zmm-homes" fast \
+    python3 tests/regression/check_x86_zmm_homes.py --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 # `-mprefer-vector-width=` is a cost-model request, so its gate is a codegen
 # gate, not a macro gate: it compares the register class lccc picks against
 # GCC for the same command line, proves the flag moves no predefined macro,

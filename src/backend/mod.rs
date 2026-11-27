@@ -26,6 +26,7 @@ pub(crate) mod state; // CodegenState, StackSlot, SlotAddr
 pub(crate) mod traits; // ArchCodegen trait with default implementations
 pub(crate) mod x86_common; // Shared x86/i686 register names, condition codes, asm template parsing
 pub(crate) mod x86_late_text; // -mharden-sls=, -mcld, notrack jump tables: rules on the finished x86 text
+pub(crate) mod x86_zmm_homes; // 512-bit vector objects that live in zmm16..zmm31 instead of a stack slot
 pub mod zero_call_used_regs; // -fzero-call-used-regs=* post-peephole return-site zeroing
 
 // Register allocation and liveness analysis

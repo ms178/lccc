@@ -590,6 +590,13 @@ pub struct IrFunction {
     /// Backends may give these values dedicated FP registers without enabling
     /// broad register allocation for every phi-elimination Copy chain.
     pub loop_promoted_f64_values: Vec<Value>,
+    /// The 512-bit vector objects that live in a register instead of a
+    /// stack slot: `(the Alloca's value, the number of the zmm register)`,
+    /// sorted by value. Written by `backend::x86_zmm_homes::assign` at the
+    /// end of the pass pipeline and empty on every other target; the x86-64
+    /// emitters name the register wherever the object is an operand, and
+    /// stack layout gives the object no slot.
+    pub zmm_homes: Vec<(u32, u8)>,
     /// Stack-smashing protection metadata (`-fstack-protector*` + function attrs).
     pub ssp: SspInfo,
 }
@@ -872,6 +879,7 @@ impl IrFunction {
             ret_is_vector128: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
+            zmm_homes: Vec::new(),
             ssp: SspInfo::default(),
             decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
@@ -881,6 +889,15 @@ impl IrFunction {
             debug_scopes: Vec::new(),
             debug_inline_instances: Vec::new(),
         }
+    }
+
+    /// The `zmm` register the 512-bit object `value` lives in, if it has
+    /// one ([`IrFunction::zmm_homes`]).
+    pub fn zmm_home(&self, value: u32) -> Option<u8> {
+        self.zmm_homes
+            .binary_search_by_key(&value, |(object, _)| *object)
+            .ok()
+            .map(|at| self.zmm_homes[at].1)
     }
 
     /// Return the highest Value ID defined (as a destination) in this function, or 0 if empty.

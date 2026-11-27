@@ -922,6 +922,7 @@ fn build_outlined_function(
         uses_sret: false,
         is_gnu_inline_def: false,
         loop_promoted_f64_values: Vec::new(),
+        zmm_homes: Vec::new(),
         ssp: crate::ir::module::SspInfo {
             stack_guard_alloca: None,
             ..func.ssp

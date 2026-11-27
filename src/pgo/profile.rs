@@ -768,6 +768,7 @@ mod tests {
             ret_is_vector128: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: vec![],
+            zmm_homes: vec![],
             ssp: Default::default(),
             decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),

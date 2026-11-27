@@ -1153,6 +1153,11 @@ pub struct X86Codegen {
     /// Per-function measured copy policy: only audited wide conversion/cast
     /// webs use ZMM aggregate copies. Plain memcpy loops retain YMM.
     pub(super) wide_simd_copies: bool,
+    /// The 512-bit vector objects of the current function that live in a
+    /// register: the `Alloca`'s value to the number of its `zmm` register
+    /// (`IrFunction::zmm_homes`, decided by `backend::x86_zmm_homes`). Such
+    /// an object has no stack slot and no address.
+    pub(super) zmm_homes: FxHashMap<u32, u8>,
     /// AVX-512VL *with* the F base (see `CodegenOptions::avx512vl`): the
     /// 128/256-bit EVEX permission.  Gates the xmm/ymm `vprold` rotate —
     /// one µop where the AVX2 form needs vpslld+vpsrld+vpor.
@@ -1744,6 +1749,7 @@ impl X86Codegen {
             isa: super::super::isa::X86Isa::default(),
             avx512_enabled: false,
             wide_simd_copies: false,
+            zmm_homes: FxHashMap::default(),
             avx512vl_enabled: false,
             optimize_for_size: false,
             skip_i32_sext: false,
