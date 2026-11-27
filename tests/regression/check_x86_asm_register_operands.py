@@ -21,6 +21,15 @@ itself (src/ir/lowering/x86_asm_registers.rs). This gate holds it to:
 4. values: a few hundred generated statements, run and compared with the
    same program built by GCC, at -O0 and -O2 and in 32-bit code.
 
+Part 4 runs what the CPU can run. A program built with `-mavx512f` is not
+run on a CPU without it, whatever the program checks before it calls a
+vector function: the option is the compiler's for the whole file, and GCC
+uses it where it likes (in 32-bit code it computes the 64-bit checksum of
+the plain C function `sum` in mask registers, `kmovd %eax, %k0`). On such
+a CPU the whole program is built by both compilers and not run, and the
+256-bit statements are run from a program of their own that is built with
+`-mavx2` alone.
+
 Usage: check_x86_asm_register_operands.py --lccc BIN [--gcc gcc-16]
 """
 
@@ -458,7 +467,7 @@ def mask_function(rng: random.Random, name: str) -> str:
     return head + f"    __asm__({asm});\n    return r;\n}}\n"
 
 
-def value_program(seed: int, count: int, with_zmm: bool) -> str:
+def value_program(seed: int, count: int, with_zmm: bool, with_masks: bool = True) -> str:
     rng = random.Random(seed)
     parts = ["#include <immintrin.h>\n#include <stdio.h>\n"]
     calls: list[str] = []
@@ -468,9 +477,10 @@ def value_program(seed: int, count: int, with_zmm: bool) -> str:
         if with_zmm:
             parts.append(vector_function(rng, f"z{index}", 512))
             calls.append(f"    if (avx512) {{ z{index}(o, a, b, m); sum(\"z{index}\", o, 16); }}")
-        parts.append(mask_function(rng, f"k{index}"))
-        calls.append(f"    if (avx512) printf(\"k{index} %llx\\n\","
-                     f" k{index}(0x{rng.getrandbits(64):x}ULL, 0x{rng.getrandbits(64):x}ULL));")
+        if with_masks:
+            parts.append(mask_function(rng, f"k{index}"))
+            calls.append(f"    if (avx512) printf(\"k{index} %llx\\n\","
+                         f" k{index}(0x{rng.getrandbits(64):x}ULL, 0x{rng.getrandbits(64):x}ULL));")
     parts.append(
         "static void sum(const char *name, const int *o, int n)\n{\n"
         "    unsigned long long h = 1469598103934665603ULL;\n"
@@ -483,6 +493,7 @@ def value_program(seed: int, count: int, with_zmm: bool) -> str:
         "    int avx512 = __builtin_cpu_supports(\"avx512f\") && __builtin_cpu_supports(\"avx512bw\");\n"
         "    int a[16], b[16], o[16];\n"
         "    unsigned state = 0x2545F491u, m = 0;\n"
+        "    (void)avx512;\n"
         "    for (int i = 0; i < 16; i++) {\n"
         "        state = state * 1664525u + 1013904223u; a[i] = (int)state;\n"
         "        state = state * 1664525u + 1013904223u; b[i] = (int)(state >> (i % 7));\n"
@@ -531,8 +542,21 @@ def can_run_32(gcc: str | None, tmp: str) -> bool:
         return False
 
 
-def check_values(lccc: str, gcc: str | None, tmp: str) -> int:
-    statements = 0
+def cpu_flags() -> set[str]:
+    """The feature flags of this CPU, by the names Linux gives them."""
+    try:
+        with open("/proc/cpuinfo") as handle:
+            for line in handle:
+                if line.startswith("flags"):
+                    return set(line.split(":", 1)[1].split())
+    except OSError:
+        pass
+    return set()
+
+
+def check_values(lccc: str, gcc: str | None, tmp: str, cpu: set[str]) -> tuple[int, int]:
+    """The statements run and found equal to GCC's, and the ones only built."""
+    statements = unrun = 0
     source = os.path.join(tmp, "zero.c")
     with open(source, "w") as handle:
         handle.write(ZERO_EXTENSION)
@@ -541,68 +565,86 @@ def check_values(lccc: str, gcc: str | None, tmp: str) -> int:
         done = run([lccc, level, "-mavx512f", source, "-o", binary])
         if done.returncode != 0:
             problem(f"zero extension {level}: lccc fails: {done.stderr.strip()[:300]}")
-        else:
+        elif "avx512f" in cpu:
             ran = run([binary])
             if ran.returncode != 0:
                 problem(f"zero extension {level}: {ran.stdout.strip()} (exit {ran.returncode})")
     if not gcc:
-        return statements
+        return statements, unrun
     modes = [("", True)]
     if can_run_32(gcc, tmp):
         # The i686 back end has no encodings for the 512-bit intrinsics the
         # program loads and stores with; the 256-bit and mask statements run.
         modes.append(("-m32 -msse2", False))
+    everything = ["-mavx2", "-mavx512f", "-mavx512bw"]
     for mode, with_zmm in modes:
         for seed in (20261127, 7, 99):
             count = 40
-            program = value_program(seed, count, with_zmm)
-            source = os.path.join(tmp, f"values{seed}.c")
-            with open(source, "w") as handle:
-                handle.write(program)
-            flags = ["-mavx2", "-mavx512f", "-mavx512bw", *mode.split()]
-            reference = os.path.join(tmp, "values.gcc")
-            done = run([gcc, "-O2", *flags, source, "-o", reference])
-            if done.returncode != 0:
-                problem(f"values seed {seed} {mode}: GCC refuses the program:"
-                        f" {done.stderr.strip()[:400]}")
-                continue
-            want = run([reference])
-            if want.returncode != 0:
-                problem(f"values seed {seed} {mode}: GCC's program fails ({want.returncode})")
-                continue
-            statements += count * (3 if with_zmm else 2)
-            for level in ("-O0", "-O1", "-O2", "-Os"):
-                binary = os.path.join(tmp, "values.lccc")
-                done = run([lccc, level, *flags, source, "-o", binary])
+            whole = (value_program(seed, count, with_zmm), everything, count * (3 if with_zmm else 2))
+            if {"avx2", "avx512f", "avx512bw"} <= cpu:
+                plans = [(*whole, True)]
+            else:
+                plans = [(*whole, False),
+                         (value_program(seed, count, False, with_masks=False), ["-mavx2"], count,
+                          "avx2" in cpu)]
+            for program, isa, total, execute in plans:
+                what = f"values seed {seed} {' '.join(isa)} {mode}".rstrip()
+                source = os.path.join(tmp, f"values{seed}.c")
+                with open(source, "w") as handle:
+                    handle.write(program)
+                flags = [*isa, *mode.split()]
+                reference = os.path.join(tmp, "values.gcc")
+                done = run([gcc, "-O2", *flags, source, "-o", reference])
                 if done.returncode != 0:
-                    problem(f"values seed {seed} {mode} {level}: lccc fails:"
-                            f" {done.stderr.strip()[:400]}")
+                    problem(f"{what}: GCC refuses the program: {done.stderr.strip()[:400]}")
                     continue
-                got = run([binary])
-                if got.returncode != 0 or got.stdout != want.stdout:
-                    theirs = want.stdout.split("\n")
-                    ours = got.stdout.split("\n")
-                    wrong = [f"{o} (GCC: {t})" for o, t in zip(ours, theirs) if o != t][:5]
-                    problem(f"values seed {seed} {mode} {level}: exit {got.returncode},"
-                            f" {len(ours)} lines against {len(theirs)}; first differences: {wrong}")
-    return statements
+                want = run([reference]) if execute else None
+                if want is not None and want.returncode != 0:
+                    problem(f"{what}: GCC's program fails ({want.returncode})")
+                    continue
+                if want is None:
+                    unrun += total
+                else:
+                    statements += total
+                for level in ("-O0", "-O1", "-O2", "-Os"):
+                    binary = os.path.join(tmp, "values.lccc")
+                    done = run([lccc, level, *flags, source, "-o", binary])
+                    if done.returncode != 0:
+                        problem(f"{what} {level}: lccc fails: {done.stderr.strip()[:400]}")
+                        continue
+                    if want is None:
+                        continue
+                    got = run([binary])
+                    if got.returncode != 0 or got.stdout != want.stdout:
+                        theirs = want.stdout.split("\n")
+                        ours = got.stdout.split("\n")
+                        wrong = [f"{o} (GCC: {t})" for o, t in zip(ours, theirs) if o != t][:5]
+                        problem(f"{what} {level}: exit {got.returncode},"
+                                f" {len(ours)} lines against {len(theirs)}; first differences: {wrong}")
+    return statements, unrun
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--lccc", required=True)
     parser.add_argument("--gcc", help="GCC 16.2: the reference for text, words and values")
+    parser.add_argument("--cpu-flags", metavar="FLAGS",
+                        help="the CPU's feature flags, instead of /proc/cpuinfo's: what part 4 "
+                             "does on a machine with these (\"avx2\" for one without AVX-512)")
     args = parser.parse_args()
+    cpu = cpu_flags() if args.cpu_flags is None else set(args.cpu_flags.split())
     with tempfile.TemporaryDirectory(prefix="lccc-asmreg.") as tmp:
         shapes = check_shapes(args.lccc, args.gcc, tmp)
         diagnostics = check_diagnostics(args.lccc, args.gcc, tmp)
-        statements = check_values(args.lccc, args.gcc, tmp)
+        statements, unrun = check_values(args.lccc, args.gcc, tmp, cpu)
     if PROBLEMS:
         for text in PROBLEMS:
             print(f"FAIL: {text}", file=sys.stderr)
         print(f"x86 asm register operands: {len(PROBLEMS)} problem(s)", file=sys.stderr)
         return 1
     against = f", {statements} generated statements equal to GCC's" if args.gcc else ""
+    if unrun:
+        against += f", {unrun} built and not run (this CPU has no AVX-512 F and BW)"
     print(f"x86 asm register operands: PASS ({shapes} shapes, {diagnostics} diagnostics{against})")
     return 0
 
