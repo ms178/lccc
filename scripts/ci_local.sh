@@ -1379,6 +1379,12 @@ gate "x86-mflag-policy" fast \
     python3 scripts/gen_x86_mflag_policy.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "x86-mflag-effects" fast \
     python3 tests/regression/check_x86_mflag_effects.py --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# `asm` operands in ymm, zmm, mask and MMX registers, which the lowering loads
+# and stores inside the statement: the text, GCC's template and diagnostics,
+# and generated statements run against GCC's build of them.
+gate "x86-asm-register-operands" fast \
+    python3 tests/regression/check_x86_asm_register_operands.py --lccc "$LCCC" \
+        --gcc "${GCC16:-gcc-16}"
 # `-mprefer-vector-width=` is a cost-model request, so its gate is a codegen
 # gate, not a macro gate: it compares the register class lccc picks against
 # GCC for the same command line, proves the flag moves no predefined macro,

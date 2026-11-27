@@ -1780,9 +1780,9 @@ impl Lowerer {
                 inputs,
                 clobbers,
                 goto_labels,
-                ..
+                span,
             } => {
-                self.lower_inline_asm_stmt(template, outputs, inputs, clobbers, goto_labels);
+                self.lower_inline_asm_stmt(template, outputs, inputs, clobbers, goto_labels, *span);
             }
         }
     }

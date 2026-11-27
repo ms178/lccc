@@ -434,6 +434,49 @@ flag moves no predefined macro — GCC defines none for it either.
 caller/callee pairings. `check_legacy_sse_permissions.py` checks the
 SSE1/SSE2 boundary of every public intrinsic.
 
+### 2.1 Vector, mask and MMX operands of `asm` statements
+
+The back ends give an `asm` operand a general register or an `xmm`
+register. Operands of three other kinds are loaded and stored by the
+statement itself: the lowering rewrites it
+(`src/ir/lowering/x86_asm_registers.rs`).
+
+| Operand | Constraint | Register | Moves |
+|---|---|---|---|
+| 256-bit vector | `x`, `v`, `Yz` | `ymm15` downwards (`ymm7` on i686), `ymm0` for `Yz` | `vmovdqu` from and to memory |
+| 512-bit vector | `x`, `v`, `Yz` | `zmm15` downwards | `vmovdqu64` |
+| integer or pointer of 8 to 64 bits | `k`, `Yk` | `k7` down to `k1` | `kmovw`, `kmovd`, `kmovq` through a general register; 64 bits on i686 through memory |
+| 64-bit vector, integer of 32 or 64 bits | `y` | `mm7` downwards | `movd`, `movq` through a general register; 64 bits on i686 through memory |
+
+A register that the template or the clobber list names is not taken, and
+the registers taken are added to the clobbers. `%x0`, `%t0` and `%g0`
+print the `xmm`, `ymm` and `zmm` name of a vector operand's register. An
+input tied to such an operand is loaded into its register. A constraint
+that offers memory beside the register (`xm`) is given memory. A local
+register variable of a vector type (`register __m256i v asm("ymm7")`)
+keeps its register.
+
+Before this, a 256- or 512-bit operand was moved eight bytes wide into an
+`xmm` register and printed under the `xmm` name (wrong values at every
+level, no diagnostic), `k` was refused, and `Yk` and `y` stopped in the
+assembler. A 64-bit vector in any register class was the address of the
+variable instead of its value.
+
+Differences from GCC 16.2, each pinned by the gate:
+
+* An eight-bit mask has the bits above it cleared in the mask register
+  (`kshiftlw`, `kshiftrw`); GCC without AVX-512DQ leaves them as the
+  general register had them.
+* `"y"` with a `float` is refused; GCC moves it into an MMX register.
+* An output of an `asm goto` and a register variable in a mask or MMX
+  register are refused.
+* The function's instruction sets are not asked: 64 bits of mask without
+  AVX-512BW and a 256-bit vector without AVX are accepted. The statement
+  names the registers, and its instructions need the extension anyway.
+* A wide vector is in memory before and behind the statement, so each
+  operand costs a load or a store that GCC does not emit. The intrinsics
+  do not go this way.
+
 ## 3. Call-frame information
 
 Code generation never writes `.cfi_*` directives. `backend/cfi_synth.rs`
@@ -458,6 +501,7 @@ instructions.
 | `scripts/check_x86_prefer_vector_width.py LCCC` | `-mprefer-vector-width=` codegen class per row against GCC, macro neutrality, rejection wording |
 | `scripts/gen_x86_mflag_policy.py --check --lccc LCCC --gcc GCC` | The table of machine options without code generation: every row under lccc (also under the strict policy), every spelling of GCC's list decided, nothing GCC refuses accepted, GCC's warnings word for word |
 | `tests/regression/check_x86_mflag_effects.py` | `-mharden-sls=`, `-mcld`, `notrack` on the jump of a `switch` under `-fcf-protection=branch`, the `-pg` names and negatives: shape per function against GCC, and the program run |
+| `tests/regression/check_x86_asm_register_operands.py` | `asm` operands in `ymm`, `zmm`, mask and MMX registers (§2.1): the statement's text line for line, GCC's template and diagnostics, generated statements run against GCC's build |
 | `x86_macro_gate_tests` (unit) | XSAVE precedence, the AES/PCLMUL/GFNI announcement split, the POPCNT unwind matrix, sticky `-mno-mmx`, `-mprefer-vector-width=` parsing |
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |
 | `check_target_attribute_isa.sh` | `target()` scoping, ordering, errors and intrinsic verdicts, re-measured on GCC |

@@ -11,13 +11,26 @@
 
 use super::definitions::LValue;
 use super::lower::Lowerer;
+use crate::backend::Target;
 use crate::backend::inline_asm::{
     constraint_has_immediate_alt, constraint_is_memory_only, constraint_needs_address,
 };
+use crate::common::source::Span;
 use crate::common::types::{AddressSpace, IrType};
 use crate::frontend::parser::ast::TypeSpecifier;
 use crate::frontend::parser::ast::{AsmOperand, Expr};
 use crate::ir::reexports::{BlockId, Instruction, Operand, Terminator, Value};
+
+/// An x86 `asm` statement after [`Lowerer::pin_x86_asm_registers`].
+struct PinnedAsm {
+    template: String,
+    outputs: Vec<AsmOperand>,
+    inputs: Vec<AsmOperand>,
+    clobbers: Vec<String>,
+    /// Per input: the operand is in memory by this compiler's doing, so a
+    /// value that is no lvalue is given a temporary.
+    inputs_in_memory: Vec<bool>,
+}
 
 impl Lowerer {
     pub(super) fn lower_inline_asm_stmt(
@@ -27,6 +40,140 @@ impl Lowerer {
         inputs: &[AsmOperand],
         clobbers: &[String],
         goto_labels: &[String],
+        span: Span,
+    ) {
+        if self.is_x86() {
+            let leaves_by_label = !goto_labels.is_empty();
+            match self.pin_x86_asm_registers(template, outputs, inputs, clobbers, leaves_by_label) {
+                Ok(None) => {}
+                Ok(Some(pinned)) => {
+                    self.lower_asm_operands(
+                        &pinned.template,
+                        &pinned.outputs,
+                        &pinned.inputs,
+                        &pinned.clobbers,
+                        goto_labels,
+                        &pinned.inputs_in_memory,
+                    );
+                    return;
+                }
+                Err(message) => {
+                    self.emit_error(message, span);
+                    return;
+                }
+            }
+        }
+        self.lower_asm_operands(template, outputs, inputs, clobbers, goto_labels, &[]);
+    }
+
+    /// x86: the operands of a statement that want a `ymm`, `zmm`, mask or
+    /// MMX register, which no back end hands out. The statement is
+    /// rewritten to load and store them itself
+    /// ([`super::x86_asm_registers`]); `Ok(None)` when it has none.
+    fn pin_x86_asm_registers(
+        &self,
+        template: &str,
+        outputs: &[AsmOperand],
+        inputs: &[AsmOperand],
+        clobbers: &[String],
+        leaves_by_label: bool,
+    ) -> Result<Option<PinnedAsm>, String> {
+        use super::x86_asm_registers::{
+            Action, AsmOperandView, Pinned, classify, rewrite, sse_register_number,
+        };
+        use crate::common::types::CType;
+
+        let mut views = Vec::with_capacity(outputs.len() + inputs.len());
+        for (at, operand) in outputs.iter().chain(inputs).enumerate() {
+            let ctype = self.expr_ctype(&operand.expr);
+            let (vector, integer) = match &ctype {
+                CType::Vector(_, bytes) => (Some(*bytes), None),
+                CType::Pointer(..) => (None, Some(crate::common::types::target_ptr_size())),
+                other if other.is_integer() => (None, Some(other.size())),
+                _ => (None, None),
+            };
+            let action = classify(&operand.constraint, vector, integer)
+                .map_err(|_| "inconsistent operand constraints in an 'asm'".to_string())?;
+            let register_variable = match (&operand.expr, action) {
+                (Expr::Identifier(name, _), Some(_)) => self.get_asm_register(name),
+                _ => None,
+            };
+            let fixed = match (action, &register_variable) {
+                (Some(Action::Pin(class) | Action::MemoryOrPin(class)), Some(register)) => {
+                    match class {
+                        Pinned::Wide { .. } => sse_register_number(register),
+                        // The moves of these two go through a general
+                        // register, which the variable does not have.
+                        Pinned::Mask { .. } | Pinned::Mmx { .. } => {
+                            return Err(format!(
+                                "'asm' operand {at}: a register variable cannot be a mask or MMX operand"
+                            ));
+                        }
+                    }
+                }
+                _ => None,
+            };
+            views.push(AsmOperandView {
+                constraint: &operand.constraint,
+                name: operand.name.as_deref(),
+                is_output: at < outputs.len(),
+                action,
+                fixed,
+            });
+        }
+        let x86_64 = self.target == Target::X86_64;
+        let Some(rewritten) = rewrite(template, &views, clobbers, leaves_by_label, x86_64)? else {
+            return Ok(None);
+        };
+        let with_constraint = |operand: &AsmOperand, at: usize| AsmOperand {
+            name: operand.name.clone(),
+            constraint: rewritten.constraints[at].clone(),
+            expr: operand.expr.clone(),
+        };
+        let mut all_clobbers = clobbers.to_vec();
+        all_clobbers.extend(rewritten.clobbers.iter().cloned());
+        Ok(Some(PinnedAsm {
+            outputs: outputs
+                .iter()
+                .enumerate()
+                .map(|(at, operand)| with_constraint(operand, at))
+                .collect(),
+            inputs: inputs
+                .iter()
+                .enumerate()
+                .map(|(at, operand)| with_constraint(operand, outputs.len() + at))
+                .collect(),
+            inputs_in_memory: rewritten.in_memory[outputs.len()..].to_vec(),
+            clobbers: all_clobbers,
+            template: rewritten.template,
+        }))
+    }
+
+    /// The storage of a temporary that stands in for an `asm` operand: the
+    /// operand's own size and alignment. A vector wider than 128 bits is
+    /// a pointer to the IR, which is not the size of what is stored there.
+    fn asm_temporary_layout(
+        &self,
+        ctype: &crate::common::types::CType,
+        ty: IrType,
+    ) -> (usize, usize) {
+        match ctype {
+            crate::common::types::CType::Vector(_, bytes) if *bytes > 16 => (*bytes, *bytes),
+            _ => (ty.size(), ty.align()),
+        }
+    }
+
+    /// The statement itself: operands, the instruction, and what follows
+    /// from it. `inputs_in_memory` is [`PinnedAsm::inputs_in_memory`], empty
+    /// for a statement as it was written.
+    fn lower_asm_operands(
+        &mut self,
+        template: &str,
+        outputs: &[AsmOperand],
+        inputs: &[AsmOperand],
+        clobbers: &[String],
+        goto_labels: &[String],
+        inputs_in_memory: &[bool],
     ) {
         let mut ir_outputs = Vec::new();
         let mut ir_inputs = Vec::new();
@@ -64,7 +211,9 @@ impl Lowerer {
                     }
                 }
             }
-            let out_ty = self.asm_operand_ir_type(&self.expr_ctype(&out.expr));
+            let out_ctype = self.expr_ctype(&out.expr);
+            let out_ty = self.asm_operand_ir_type(&out_ctype);
+            let (temporary_size, temporary_align) = self.asm_temporary_layout(&out_ctype, out_ty);
             // Detect address space for memory operands (e.g., __seg_gs pointer dereferences)
             let out_seg = self.get_asm_operand_addr_space(&out.expr);
             let out_lvalue = self.lower_lvalue(&out.expr);
@@ -91,8 +240,8 @@ impl Lowerer {
                     self.emit(Instruction::Alloca {
                         dest: tmp,
                         ty: out_ty,
-                        size: out_ty.size(),
-                        align: out_ty.align(),
+                        size: temporary_size,
+                        align: temporary_align,
                         volatile: false,
                         semantic_volatile: false,
                     });
@@ -110,8 +259,8 @@ impl Lowerer {
                 self.emit(Instruction::Alloca {
                     dest: tmp,
                     ty: out_ty,
-                    size: out_ty.size(),
-                    align: out_ty.align(),
+                    size: temporary_size,
+                    align: temporary_align,
                     volatile: false,
                     semantic_volatile: false,
                 });
@@ -176,7 +325,9 @@ impl Lowerer {
                     // a vector member/pointee. Materialize all 16 bytes using a
                     // typed load; a spilled GEP is only an 8-byte POINTER home.
                     // Preserve volatile and segment metadata from the lvalue.
-                    if self.is_x86() && out_ty == IrType::I128 {
+                    // A 64-bit vector likewise: the address went into the
+                    // register in its place (`"+y"`, `"+r"` of an `__m64`).
+                    if self.is_x86() && matches!(out_ty, IrType::I128 | IrType::I64) {
                         if let Some(lv) = out_lvalue {
                             self.load_lvalue_typed(&lv, out_ty)
                         } else {
@@ -227,7 +378,7 @@ impl Lowerer {
         // Start with symbols for synthetic "+" inputs (from output operands),
         // since those appear first in ir_inputs.
         let mut input_symbols: Vec<Option<String>> = plus_input_symbols;
-        for inp in inputs {
+        for (input_index, inp) in inputs.iter().enumerate() {
             let mut constraint = inp.constraint.clone();
             let name = inp.name.clone();
             // Rewrite constraint for register variables with __asm__("regname"):
@@ -240,7 +391,8 @@ impl Lowerer {
                     }
                 }
             }
-            let inp_ty = self.asm_operand_ir_type(&self.expr_ctype(&inp.expr));
+            let inp_ctype = self.expr_ctype(&inp.expr);
+            let inp_ty = self.asm_operand_ir_type(&inp_ctype);
             let inp_seg = self.get_asm_operand_addr_space(&inp.expr);
             let mut sym_name: Option<String> = None;
             let val = if constraint_has_immediate_alt(&constraint) {
@@ -295,19 +447,68 @@ impl Lowerer {
                         } => v,
                     };
                     Operand::Value(ptr)
+                } else if inp_ctype.is_vector() {
+                    // A vector that is no lvalue: the address of its bytes.
+                    // `lower_expr` yields that too, except for a call whose
+                    // small vector comes back in a register, which was
+                    // taken for an address here.
+                    Operand::Value(self.vector_operand_ptr(&inp.expr, &inp_ctype))
                 } else {
-                    self.lower_expr(&inp.expr)
+                    let value = self.lower_expr(&inp.expr);
+                    if inputs_in_memory.get(input_index) == Some(&true) {
+                        // The source put a value in a register, and this
+                        // compiler moved the operand into memory: the
+                        // memory is a temporary that holds the value.
+                        let (size, align) = self.asm_temporary_layout(&inp_ctype, inp_ty);
+                        let temporary = self.fresh_value();
+                        self.emit(Instruction::Alloca {
+                            dest: temporary,
+                            ty: inp_ty,
+                            size,
+                            align,
+                            volatile: false,
+                            semantic_volatile: false,
+                        });
+                        self.emit(Instruction::Store {
+                            val: value,
+                            ptr: temporary,
+                            ty: inp_ty,
+                            seg_override: AddressSpace::Default,
+                            volatile: false,
+                        });
+                        Operand::Value(temporary)
+                    } else {
+                        value
+                    }
                 }
-            } else if self.is_x86()
-                && matches!(
-                    self.expr_ctype(&inp.expr),
-                    crate::common::types::CType::Vector(_, 16)
-                )
-            {
+            } else if let (true, Some(register_ty)) = (
+                self.is_x86(),
+                match inp_ctype {
+                    crate::common::types::CType::Vector(_, 16) => Some(IrType::I128),
+                    crate::common::types::CType::Vector(_, 8) => Some(IrType::I64),
+                    _ => None,
+                },
+            ) {
+                // A vector is the address of its bytes to the IR, and 128
+                // or 64 bits to the register it goes into. The load is
+                // typed here: left to the back end, an address that is no
+                // plain variable's was read as the value. That was every
+                // 64-bit vector (`"y"(v)`, `"r"(v)` of an `__m64` passed
+                // the address) and a 128-bit one that is no lvalue and no
+                // call (`"x"(c ? a : b)` at -O0).
                 if let Some(lv) = self.lower_lvalue(&inp.expr) {
-                    self.load_lvalue_typed(&lv, IrType::I128)
+                    self.load_lvalue_typed(&lv, register_ty)
                 } else {
-                    self.lower_expr(&inp.expr)
+                    let storage = self.vector_operand_ptr(&inp.expr, &inp_ctype);
+                    let bits = self.fresh_value();
+                    self.emit(Instruction::Load {
+                        volatile: false,
+                        dest: bits,
+                        ptr: storage,
+                        ty: register_ty,
+                        seg_override: AddressSpace::Default,
+                    });
+                    Operand::Value(bits)
                 }
             } else {
                 // For local register variables, load from the alloca instead of

@@ -206,7 +206,7 @@ impl Diagnostic {
 /// Constraint characters the x86 back ends actually classify: register, memory
 /// and symbolic classes on the left, immediate-only classes on the right.
 /// Anything else used to fall through `match { _ => {} }` into `GpReg`.
-const X86_CLASSES: &str = "abcdfglmopqrvxyUADQRSVYX";
+const X86_CLASSES: &str = "abcdfgklmopqrvxyUADQRSVYX";
 // `s` is GCC's "symbolic/string-literal immediate" class: it is an immediate
 // class for choosing an alternative, but unlike `i`/`n` it refuses a folded
 // integer (`"s"(5)` is `impossible constraint`, measured gcc 16.2).  It is
@@ -1179,7 +1179,7 @@ mod tests {
         // Every one of these is the `_ => {}` fallback in the x86 classifier.
         // `C` is NOT in the list: a `C`-prefixed pair is a class (measured --
         // gcc 16.2 accepts `"Ci"(7)`), so the letter alone is not evidence.
-        for letter in ["z", "j", "k", "h", "w", "P", "T", "W"] {
+        for letter in ["z", "j", "h", "w", "P", "T", "W"] {
             let p = validate(
                 "",
                 &[op("=r", Constness::Unknown)],
@@ -1188,6 +1188,24 @@ mod tests {
                 AsmTarget::X86,
             );
             assert_eq!(messages(&p), ["impossible constraint in 'asm'"], "{letter}");
+        }
+    }
+
+    /// `k` is the mask registers. It was in the list above until the
+    /// lowering learned to load one (`ir::lowering::x86_asm_registers`),
+    /// which is also where an operand of a type no mask register holds is
+    /// refused: the type is not known here.
+    #[test]
+    fn a_mask_register_is_a_class() {
+        for constraint in ["k", "Yk", "ki"] {
+            let inputs = [op(constraint, Constness::Unknown)];
+            let p = validate("", &[], &inputs, 0, AsmTarget::X86);
+            assert!(p.is_empty(), "{constraint}: {:?}", messages(&p));
+        }
+        for constraint in ["=k", "+k", "=&Yk"] {
+            let outputs = [op(constraint, Constness::Unknown)];
+            let p = validate("", &outputs, &[], 0, AsmTarget::X86);
+            assert!(p.is_empty(), "{constraint}: {:?}", messages(&p));
         }
     }
 

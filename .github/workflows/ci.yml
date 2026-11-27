@@ -2382,6 +2382,17 @@ jobs:
       run: >-
         python3 tests/regression/check_x86_mflag_effects.py --lccc target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
+    # An `asm` operand in a ymm, zmm, mask or MMX register. The back ends
+    # hand out none of these: a 256-bit "x" operand was moved eight bytes
+    # wide into an xmm register (wrong values, no diagnostic), "k" was
+    # refused and "y" got a general register. The lowering rewrites such a
+    # statement to load and store these operands itself; this holds the
+    # text line for line, GCC's template beside it, GCC's diagnostics, and
+    # a few hundred generated statements run against GCC's build of them.
+    - name: Verify x86 asm operands in vector, mask and MMX registers against GCC 16.2
+      run: >-
+        python3 tests/regression/check_x86_asm_register_operands.py --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
     - name: Verify x86 -mprefer-vector-width= against GCC 16.2
       run: >-
         python3 scripts/check_x86_prefer_vector_width.py target/fastbuild/lccc

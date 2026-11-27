@@ -66,5 +66,6 @@ pub(crate) mod ubsan;
 mod vector_array_init;
 mod vector_simd;
 mod vm_layout;
+mod x86_asm_registers;
 
 pub(crate) use lower::Lowerer;
