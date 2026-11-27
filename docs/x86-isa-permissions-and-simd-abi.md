@@ -520,7 +520,7 @@ the object a register instead of a stack slot at the end of the pipeline:
 
 `CCC_DISABLE_PASSES=zmmhome` switches it off. The decision is checked
 again at code generation, and a function for which it no longer holds is
-compiled without homes; `CCC_DEBUG_ZMMHOME=1` reports such a function.
+compiled without homes; `CCC_VERIFY_IR=1` reports such a function.
 
 ## 3. Call-frame information
 

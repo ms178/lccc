@@ -89,7 +89,8 @@ passes; the backend peepholes are documented per backend
   object) -- a 64-byte vector object that is only read and written whole
   lives in one of `zmm16`..`zmm31`; the names of one value share a
   register, so the copies of inlined intrinsics are no instructions. A loop
-  of six 512-bit operations: 2.59 s -> 0.064 s (GCC 16.2: 0.062 s). See
+  of six 512-bit operations: 2.57 s -> 0.060 s (GCC 16.2: 0.061 s, Clang
+  23.1.5: 0.060 s; medians of seven runs). See
   `docs/x86-isa-permissions-and-simd-abi.md` §2.2. Gate:
   `tests/regression/check_x86_zmm_homes.py`. `zmmhome`.
 - **Phi webs** (`ir/mem2reg/phi_webs.rs`) -- acyclic phi webs inside one
@@ -656,7 +657,6 @@ documented in a tracked markdown file.
 | `CCC_DEBUG_VOLRED=1` | `volatile_reduce`'s interleave budget: how many lanes the pass admitted, which bound (lane count vs. budget) bound the group, and why a candidate was dropped. Budget exhaustion is a normal outcome, not a defect, so it is silent by default. |
 | `CCC_DEBUG_STATIC_INIT=1` | The static-initializer builder's decision for an element it cannot fold: which evaluator ran (scalar constant, sema's folded value, address constant, byte fill), and the offset each one wrote. |
 | `CCC_DEBUG_TYPES_COMPATIBLE=1` | `__builtin_types_compatible_p`'s verdict for each query with the two resolved types in canonical form, i.e. exactly the pair the predicate compared after qualification stripping and parameter-name erasure. |
-| `CCC_DEBUG_ZMMHOME=1` | One line per function whose 512-bit register homes (`zmmhome`) are given up at code generation because a later stage added a use the homes do not cover. The function is still compiled correctly, through memory; the line is how the lost registers are noticed (`check_x86_zmm_homes.py` requires that none appears). |
 | `CCC_DEBUG_INTCONST=1` | `int_const_hoist`'s per-loop decisions: the function and loop under consideration, whether a preheader exists, the wide-constant candidates found in every-iteration blocks, and which survived the leaf-loop pressure rule. Written for the silent failure mode where the hoist fires but a later cleanup re-folds it — compare this trace against the final assembly. |
 
 Debug traces are opt-in and rate-limited by construction: each is a
@@ -691,6 +691,15 @@ no longer a predecessor still "works" whenever that block happens to dominate. A
 predecessor list and prunes operands on edges it proves dead — deleted an induction
 variable's initialisation. See
 `../engineering/journal/2026-08.md`.
+
+A stage that is handed IR which no longer meets what an earlier stage decided
+about it takes its safe path and says nothing: the code is right, and the
+optimisation is gone without a trace. Under `CCC_VERIFY_IR` it says so, as
+`[stage] function: what`, and `abort` stops there. The 512-bit register homes
+are the first such decision (`[zmmhome] f: the homes do not hold; the function
+is compiled without them`, when a pass behind `zmmhome` added a use of an
+object that a register cannot serve); `check_x86_zmm_homes.py` requires that
+no such line appears.
 
 When a violation names a stage, the *producer* is not always that stage: the
 pipeline tail after the last checkpoint (live-range splitting, entry-parameter

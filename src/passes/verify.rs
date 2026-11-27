@@ -906,6 +906,37 @@ pub fn verify_module(module: &IrModule, stage: &str) -> Vec<Violation> {
     out
 }
 
+/// What `CCC_VERIFY_IR=abort` says of a violation of the checks above.
+const MALFORMED: &str = "the pass named here produced malformed IR";
+
+/// `CCC_VERIFY_IR=abort`: stop at the first report, with a backtrace.
+fn abort(stage: &str, violations: usize, blame: &str) -> ! {
+    panic!("IR verification failed after `{stage}`: {violations} violation(s); {blame}");
+}
+
+/// A stage was handed IR that no longer meets what an earlier stage decided
+/// about it, and took its safe path instead of the decision.
+///
+/// The code is right either way, so nothing is said by default. Under
+/// `CCC_VERIFY_IR` it is said the way a violation is, `[stage] function:
+/// what`, and `abort` stops there: a decision that is thrown away is an
+/// optimisation that went without a trace, and the pass between the two
+/// stages that changed the IR is the one to look at.
+pub fn report_dropped_decision(stage: &str, function: &str, what: &str) {
+    let m = mode();
+    if m == Mode::Off {
+        return;
+    }
+    lccc::cli::stderr_line(format_args!("[{stage}] {function}: {what}"));
+    if m == Mode::Abort {
+        abort(
+            stage,
+            1,
+            "a later pass changed the IR that the stage named here had decided for",
+        );
+    }
+}
+
 /// Per-function pass hook, for passes that run inside a shared-analysis loop
 /// rather than through `timed_pass!` (gvn / licm / ivsr / univsr /
 /// load_forward). Without these, a defect from one of them is first reported
@@ -925,12 +956,7 @@ pub fn verify_after_func_pass(func: &IrFunction, stage: &str) {
         lccc::cli::stderr_line(format_args!("{}", v));
     }
     if m == Mode::Abort {
-        panic!(
-            "IR verification failed after `{}`: {} violation(s); \
-             the pass named here produced malformed IR",
-            stage,
-            violations.len()
-        );
+        abort(stage, violations.len(), MALFORMED);
     }
 }
 
@@ -953,12 +979,7 @@ pub fn verify_after_pass(module: &IrModule, stage: &str) {
         lccc::cli::stderr_line(format_args!("{}", v));
     }
     if m == Mode::Abort {
-        panic!(
-            "IR verification failed after `{}`: {} violation(s); \
-             the pass named here produced malformed IR",
-            stage,
-            violations.len()
-        );
+        abort(stage, violations.len(), MALFORMED);
     }
 }
 

@@ -3,8 +3,9 @@
 
 A 512-bit value used to be 64 bytes of stack behind a `leaq`/`andq $-64`,
 and every copy the inliner left behind was memory traffic: a loop of six
-operations ran 47 times slower than GCC 16.2's. `backend::x86_zmm_homes`
-now keeps an object that is only read and written whole in a register.
+operations ran 42 times slower than GCC 16.2's (2.57 s against 0.061 s).
+`backend::x86_zmm_homes` now keeps an object that is only read and written
+whole in a register, and the loop takes 0.060 s.
 This gate holds it to:
 
 1. shapes: the vector and mask instructions of a few functions, line for
@@ -17,15 +18,19 @@ This gate holds it to:
    generated programs and in every test of the corpus that is built with
    AVX-512 or a `-march=`;
 3. the homes that are decided are the homes that are used: no stage behind
-   the decision adds a use that makes the code generator give them up;
+   the decision adds a use that makes the code generator give them up
+   (it says so under `CCC_VERIFY_IR`);
 4. values: generated programs (chains, loops, branches, calls that scribble
    over every register, more than sixteen values alive at once, objects
    whose address is taken, vectors passed and returned by value), built at
    every optimisation level and with the homes off, and run. Every build
    prints the same numbers, and they are GCC's where GCC is given.
 
-The programs run only on a CPU with AVX-512 F, BW, DQ and VNNI; elsewhere
-part 4 compiles them and says that it did no more.
+The programs run only on a CPU with AVX-512 F, BW, DQ, VL and VNNI and
+FMA, which is what they are built for (/proc/cpuinfo): the options are the
+compiler's for the whole file, so what a program checks before its first
+vector function is no protection. Elsewhere part 4 builds them, with GCC
+as well, and says that it did no more.
 
 Usage: check_x86_zmm_homes.py --lccc BIN [--gcc gcc-16] [--programs N] [--seed N]
 """
@@ -64,8 +69,20 @@ def without_homes() -> dict[str, str]:
 def telling() -> dict[str, str]:
     """The compiler says when it gives a function's homes up."""
     env = dict(os.environ)
-    env["CCC_DEBUG_ZMMHOME"] = "1"
+    env["CCC_VERIFY_IR"] = "1"
     return env
+
+
+def cpu_flags() -> set[str]:
+    """The feature flags of this CPU, by the names Linux gives them."""
+    try:
+        with open("/proc/cpuinfo") as handle:
+            for line in handle:
+                if line.startswith("flags"):
+                    return set(line.split(":", 1)[1].split())
+    except OSError:
+        pass
+    return set()
 
 
 # ---------------------------------------------------------------- shapes
@@ -614,11 +631,18 @@ CONFIGURATIONS = [
     ("-O2, homes off", ["-O2"], True),
 ]
 PROGRAM_ISA = [*ISA, "-mavx512vnni", "-mfma", "-ffp-contract=off"]
+# What a CPU needs to run a program built with PROGRAM_ISA.
+PROGRAM_CPU = {"avx512f", "avx512bw", "avx512dq", "avx512vl", "avx512_vnni", "fma"}
 
 
-def check_programs(lccc: str, gcc: str | None, count: int, seed: int) -> tuple[int, int, int]:
+def check_programs(lccc: str, gcc: str | None, count: int, seed: int,
+                   execute: bool) -> tuple[int, int, int]:
     built = ran = homes = 0
     said = False
+    if not execute:
+        print("  values: this CPU lacks one of AVX-512 F, BW, DQ, VL, VNNI and FMA; the "
+              "programs are built, not run")
+        said = True
     with tempfile.TemporaryDirectory(prefix="zmmhome.") as directory:
         source = os.path.join(directory, "p.c")
         binary = os.path.join(directory, "p")
@@ -665,11 +689,12 @@ def check_programs(lccc: str, gcc: str | None, count: int, seed: int) -> tuple[i
                 if done.returncode != 0:
                     problem(f"program {seed + index}: {gcc} refuses it:\n{done.stderr.strip()[:2000]}")
                     continue
-                result = run([binary])
-                reference = (f"{gcc} -O2", result.stdout)
-                if result.returncode != 0:
-                    problem(f"program {seed + index}: {gcc}'s binary exits {result.returncode}")
-                    continue
+                if execute:
+                    result = run([binary])
+                    reference = (f"{gcc} -O2", result.stdout)
+                    if result.returncode != 0:
+                        problem(f"program {seed + index}: {gcc}'s binary exits {result.returncode}")
+                        continue
             for name, flags, off_switch in CONFIGURATIONS:
                 if os.path.exists(binary):
                     os.remove(binary)
@@ -684,6 +709,8 @@ def check_programs(lccc: str, gcc: str | None, count: int, seed: int) -> tuple[i
                 if done.stderr.strip():
                     problem(f"program {seed + index}: diagnostics at {name}:\n{done.stderr.strip()[:800]}")
                 built += 1
+                if not execute:
+                    continue
                 result = run([binary])
                 if result.returncode != 0:
                     problem(f"program {seed + index}: exit {result.returncode} at {name}")
@@ -727,13 +754,18 @@ def main() -> int:
     parser.add_argument("--gcc")
     parser.add_argument("--programs", type=int, default=24)
     parser.add_argument("--seed", type=int, default=20261127)
+    parser.add_argument("--cpu-flags", metavar="FLAGS",
+                        help="the CPU's feature flags, instead of /proc/cpuinfo's: what part 4 "
+                             "does on a machine with these")
     arguments = parser.parse_args()
+    cpu = cpu_flags() if arguments.cpu_flags is None else set(arguments.cpu_flags.split())
 
     shapes = check_shapes(arguments.lccc)
     corpus = check_corpus(arguments.lccc)
     if corpus < 50:
         problem(f"only {corpus} tests of the corpus were looked at: the selection is broken")
-    built, ran, homes = check_programs(arguments.lccc, arguments.gcc, arguments.programs, arguments.seed)
+    built, ran, homes = check_programs(arguments.lccc, arguments.gcc, arguments.programs,
+                                       arguments.seed, PROGRAM_CPU <= cpu)
     if homes == 0:
         problem("no generated program has a register above 15 in it: the homes are not in use")
 

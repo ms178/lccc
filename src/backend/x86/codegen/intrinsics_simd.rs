@@ -1870,10 +1870,10 @@ impl X86Codegen {
         self.evex_store_dest(dest_ptr);
     }
 
-    /// Copy 64 bytes from `src` to `dest_ptr`, where at least one of the
-    /// two is an object in a register and the other, if it is not, is the
-    /// address of 64 bytes. This is what `Loadu512` and `Storeu512` both
-    /// are, and a 64-byte `Memcpy` that touches a home has become a
+    /// Copy 64 bytes from `src` to `dest_ptr`. Each of the two is an object
+    /// in a register or the address of 64 bytes; the callers come here when
+    /// at least one is a register. This is what `Loadu512` and `Storeu512`
+    /// both are, and a 64-byte `Memcpy` that touches a home has become a
     /// `Storeu512` (`backend::x86_zmm_homes`).
     fn emit_evex_copy_512(&mut self, dest_ptr: &Value, src: &Operand) {
         match (self.zmm_home(dest_ptr.0), self.zmm_home_of(src)) {
@@ -1886,7 +1886,11 @@ impl X86Codegen {
             // Straight from the memory into the home.
             (Some(to), None) => self.evex_load_arg_to(src, to),
             (None, Some(from)) => self.evex_write_memory_from(dest_ptr, from),
-            (None, None) => unreachable!("emit_evex_copy_512 without a home"),
+            // Memory to memory, through the scratch register.
+            (None, None) => {
+                self.evex_load_arg_to(src, "zmm0");
+                self.evex_write_memory_from(dest_ptr, "zmm0");
+            }
         }
     }
 
@@ -4669,6 +4673,46 @@ mod zmm_home_tests {
             out = next;
         }
         out
+    }
+
+    /// `emit_evex_copy_512` has no case it cannot do: each end is taken
+    /// from where it is, and with both in memory the 64 bytes go through
+    /// the scratch register.
+    #[test]
+    fn a_copy_takes_each_end_from_where_it_is() {
+        for (from, to) in [
+            (Place::Memory, Place::Memory),
+            (Place::Memory, Place::Home(17)),
+            (Place::Home(16), Place::Memory),
+            (Place::Home(16), Place::Home(17)),
+            (Place::Home(16), Place::Home(16)),
+        ] {
+            let mut cg = codegen(&[from], Some(to));
+            cg.emit_evex_copy_512(&Value(DEST), &Operand::Value(Value(0)));
+            let text = cg.state.out.buf.clone();
+            let machine = Machine::run(&text);
+            let got = match to {
+                Place::Home(register) => machine.holds(&format!("v{register}")),
+                Place::Memory => {
+                    let slot = format!("{}(", slot_of(DEST));
+                    let stores: Vec<&(String, String)> = machine
+                        .memory
+                        .iter()
+                        .filter(|(place, _)| place.starts_with(&slot))
+                        .collect();
+                    assert_eq!(stores.len(), 1, "{from:?} -> {to:?}: one store:\n{text}");
+                    stores[0].1.clone()
+                }
+            };
+            assert_eq!(got, leaf(&cg, 0, from), "{from:?} -> {to:?}:\n{text}");
+            let instructions = text.lines().filter(|line| !line.trim().is_empty()).count();
+            let expected = match (from, to) {
+                (Place::Memory, Place::Memory) => 2,
+                (Place::Home(a), Place::Home(b)) if a == b => 0,
+                _ => 1,
+            };
+            assert_eq!(instructions, expected, "{from:?} -> {to:?}:\n{text}");
+        }
     }
 
     #[test]

@@ -659,11 +659,12 @@ impl X86Codegen {
                 self.state
                     .register_homed_allocas
                     .extend(func.zmm_homes.iter().map(|(object, _)| *object));
-            } else if std::env::var_os("CCC_DEBUG_ZMMHOME").is_some() {
-                lccc::cli::stderr_line(format_args!(
-                    "[zmmhome] {}: the homes do not hold; the function is compiled without them",
-                    func.name
-                ));
+            } else {
+                crate::passes::verify::report_dropped_decision(
+                    "zmmhome",
+                    &func.name,
+                    "the homes do not hold; the function is compiled without them",
+                );
             }
         }
         self.wide_simd_copies = func.blocks.iter().any(|block| {

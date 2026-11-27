@@ -19,8 +19,9 @@
 //! addressed through `leaq`/`andq $-64`, the copy went through two `ymm`
 //! halves that the `zmm` load behind it cannot be forwarded from, and a
 //! `Memcpy` is a call point to the general registers. A loop of six
-//! 512-bit operations ran 47 times slower than GCC 16.2's (0.072 s against
-//! 3.377 s, `tests/regression/check_x86_zmm_homes.py` keeps the shape).
+//! 512-bit operations ran 42 times slower than GCC 16.2's (2.57 s against
+//! 0.061 s; with the homes 0.060 s, and the gate
+//! `tests/regression/check_x86_zmm_homes.py` keeps the shape).
 //!
 //! Nothing in this back end hands out `zmm16`..`zmm31`: its scratch is
 //! `zmm0`..`zmm2`, its allocator's pool ends at `xmm15`, `vzeroupper` leaves
