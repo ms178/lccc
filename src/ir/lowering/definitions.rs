@@ -688,6 +688,22 @@ impl LocalInfo {
     }
 }
 
+impl DeclAnalysis {
+    /// Whether the declared object is itself volatile: for a pointer the
+    /// qualifier of the pointer object (`T *volatile p`, `int (*volatile
+    /// f)(int)`, `volatile fn_t f`), which the pointee's qualifier in
+    /// `base_type_volatile` (`volatile T *p`) says nothing of; for anything
+    /// else `base_type_volatile`.  It decides the slot (a volatile object
+    /// is never promoted to a register) and the store its initializer is.
+    pub(super) fn object_is_volatile(&self) -> bool {
+        if self.is_pointer {
+            self.object_volatile
+        } else {
+            self.base_type_volatile
+        }
+    }
+}
+
 /// Whether an access to a variable's own object is volatile. For a pointer
 /// variable that is the object qualifier (`int *volatile p`, which the
 /// pointee-qualifier `base_type_volatile` of `volatile int *p` does not cover).

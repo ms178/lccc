@@ -33,6 +33,18 @@
 #     The cast cells hold one more form of plain `volatile` to the same
 #     rule: a cast to a pointer to a typedef name that is volatile, the
 #     register idiom `*(vu32 *)ADDR`, whose object used to be read once.
+#  7. a pointer object that is itself volatile -- `T *volatile p`, a function
+#     pointer `int (*volatile f)(int)`, `volatile fn_t f` with `fn_t` a typedef
+#     of a pointer -- is stored and loaded where the program says.  The slot
+#     of such a local was an ordinary one (only a volatile POINTEE was looked
+#     at when the slot was made), so its initializer was forwarded to its
+#     first read, and a function pointer never reached memory at all: with
+#     `static int h(int a) { return a + 1; }`, `int (*volatile f)(int) = h;
+#     return f(1);` was `movl $2, %eax`, where GCC 16.2 stores `h`, loads it
+#     back and jumps through what it loaded.
+#     Each cell must write the slot and read it back, the calls must go
+#     through what was read, and the same code with a plain pointer is the
+#     control: there no slot is left.
 set -euo pipefail
 
 CCC=${CCC:-./target/fastbuild/lccc}
@@ -413,6 +425,59 @@ if [[ -x "$i686_cc" ]]; then
 else
     echo "SKIP: i686 volatile codegen ($i686_cc not built)"
 fi
+
+# 7. volatile pointer objects.
+cat >"$td/ptr.c" <<'EOF'
+static int h(int a) { return a + 1; }
+typedef int (*fn_t)(int);
+int ptr_init(int *v) { int *volatile p = v; return *p; }
+int ptr_assign(int *v) { int *volatile p; p = v; return *p; }
+void *void_ptr_assign(void *v) { void *volatile p; p = v; return p; }
+int fn_init(void) { int (*volatile f)(int) = h; return f(1); }
+int fn_typedef(fn_t v) { volatile fn_t f = v; return f(2); }
+int fn_assign(fn_t v) { fn_t volatile f; f = v; return f(3); }
+int plain_ptr(int *v) { int *p = v; return *p; }
+int plain_fn(void) { int (*f)(int) = h; return f(1); }
+EOF
+frame_store='mov[a-z]* +[^,(]+, *-?[0-9]*\(%(rsp|rbp)\)'
+frame_load='(mov[a-z]* +-?[0-9]*\(%(rsp|rbp)\), *%|(call|jmp)q? +\*-?[0-9]*\(%(rsp|rbp)\))'
+for lvl in O1 O2 O3 Os; do
+    echo "== volatile pointer objects, $lvl"
+    "$CCC" -$lvl -S "$td/ptr.c" -o "$td/ptr.s" || { echo "FAIL: compile ptr.c at -$lvl"; rc=1; continue; }
+    for fn in ptr_init ptr_assign void_ptr_assign fn_init fn_typedef fn_assign; do
+        body=$(awk -v f="$fn" '$0==f":"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/ptr.s")
+        stores=$(echo "$body" | grep -Ec "$frame_store" || true)
+        loads=$(echo "$body" | grep -Ec "$frame_load" || true)
+        if [ "$stores" -ge 1 ] && [ "$loads" -ge 1 ]; then
+            echo "ok: $fn writes its volatile pointer and reads it back"
+        else
+            echo "FAIL: $fn: $stores store(s) and $loads load(s) of the volatile pointer's slot"
+            echo "$body" | sed 's/^/      /'
+            rc=1
+        fi
+        case $fn in fn_*)
+            if echo "$body" | grep -Eq '(call|jmp)q? +\*'; then
+                echo "ok: $fn calls through the pointer it read"
+            else
+                echo "FAIL: $fn does not call through its volatile pointer"
+                echo "$body" | sed 's/^/      /'
+                rc=1
+            fi ;;
+        esac
+    done
+    # The control: the same code with a plain pointer leaves no slot, so the
+    # accesses counted above are the volatile object's.
+    for fn in plain_ptr plain_fn; do
+        body=$(awk -v f="$fn" '$0==f":"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/ptr.s")
+        if echo "$body" | grep -Eq "$frame_store|$frame_load"; then
+            echo "FAIL: $fn (plain pointer, the control) touches the frame at -$lvl"
+            echo "$body" | sed 's/^/      /'
+            rc=1
+        else
+            echo "ok: $fn, the control, keeps its pointer out of memory"
+        fi
+    done
+done
 
 riscv_cc=${CCC_RISCV:-"$(dirname "$CCC")/lccc-riscv"}
 if [[ -x "$riscv_cc" ]]; then

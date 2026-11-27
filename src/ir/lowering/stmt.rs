@@ -238,11 +238,18 @@ impl Lowerer {
                     },
                     da.actual_alloc_size,
                     alloca_align,
-                    // The OBJECT is volatile only when the base type's
-                    // qualifier applies to this declaration level: for
-                    // `volatile T *p` the volatile qualifies the POINTEE,
-                    // not the pointer object itself.
-                    da.base_type_volatile && !da.is_pointer,
+                    // The OBJECT is volatile when the qualifier applies to
+                    // this declaration level.  For `volatile T *p` it
+                    // qualifies the POINTEE, not the pointer object; for `T
+                    // *volatile p`, and for `volatile fn_t p` with `fn_t` a
+                    // typedef of a pointer, it qualifies the pointer object
+                    // (`object_volatile`), which then is stored and loaded
+                    // where the program says, like any volatile object: the
+                    // slot of a volatile pointer was an ordinary one, so its
+                    // initializer was forwarded to its first read and the
+                    // read after a store came out of the register that held
+                    // what was stored.
+                    da.object_is_volatile(),
                 )
             };
 

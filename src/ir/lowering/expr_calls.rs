@@ -2334,9 +2334,16 @@ impl Lowerer {
     }
 
     /// Load a function pointer from a local or global variable.
+    ///
+    /// A volatile pointer is read as one: `int (*volatile f)(int)` and
+    /// `static void *(*const volatile wipe)(void *, int, size_t) = memset;`
+    /// are how a program asks for a call the compiler cannot see through,
+    /// and the read was an ordinary load that the initializer's store was
+    /// forwarded to: with `static int h(int a) { return a + 1; }`, `int
+    /// (*volatile f)(int) = h; return f(1);` was `movl $2, %eax`.
     fn load_func_ptr_variable(&mut self, name: &str) -> Value {
-        let base_addr = if let Some(info) = self.func_mut().locals.get(name).cloned() {
-            if let Some(ref global_name) = info.static_global_name {
+        let (base_addr, volatile) = if let Some(info) = self.func_mut().locals.get(name).cloned() {
+            let addr = if let Some(ref global_name) = info.static_global_name {
                 let addr = self.fresh_value();
                 self.emit(Instruction::GlobalAddr {
                     dest: addr,
@@ -2345,19 +2352,24 @@ impl Lowerer {
                 addr
             } else {
                 info.alloca
-            }
+            };
+            (addr, info.object_volatile)
         } else {
             // Global function pointer
+            let volatile = self
+                .globals
+                .get(name)
+                .is_some_and(|global| global.object_volatile);
             let addr = self.fresh_value();
             self.emit(Instruction::GlobalAddr {
                 dest: addr,
                 name: name.to_string(),
             });
-            addr
+            (addr, volatile)
         };
         let ptr_val = self.fresh_value();
         self.emit(Instruction::Load {
-            volatile: false,
+            volatile,
             dest: ptr_val,
             ptr: base_addr,
             ty: IrType::Ptr,
