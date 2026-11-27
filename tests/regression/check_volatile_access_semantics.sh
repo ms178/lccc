@@ -456,7 +456,7 @@ for lvl in O1 O2 O3 Os; do
             rc=1
         fi
         case $fn in fn_*)
-            if echo "$body" | grep -Eq '(call|jmp)q? +\*'; then
+            if grep -Eq '(call|jmp)q? +\*' <<<"$body"; then
                 echo "ok: $fn calls through the pointer it read"
             else
                 echo "FAIL: $fn does not call through its volatile pointer"
@@ -469,7 +469,7 @@ for lvl in O1 O2 O3 Os; do
     # accesses counted above are the volatile object's.
     for fn in plain_ptr plain_fn; do
         body=$(awk -v f="$fn" '$0==f":"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/ptr.s")
-        if echo "$body" | grep -Eq "$frame_store|$frame_load"; then
+        if grep -Eq "$frame_store|$frame_load" <<<"$body"; then
             echo "FAIL: $fn (plain pointer, the control) touches the frame at -$lvl"
             echo "$body" | sed 's/^/      /'
             rc=1
