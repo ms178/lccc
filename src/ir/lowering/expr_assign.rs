@@ -1494,10 +1494,13 @@ impl Lowerer {
         } else if val_ty != op_ty && val_ty.is_float() && op_ty.is_float() {
             Operand::Value(self.emit_cast_val(loaded, val_ty, op_ty))
         } else if !op_ty.is_float() && ir_ty.size() < op_ty.size() {
-            // Widen the LHS to the operation type.
+            // Convert to the C common type before widening to an IR carrier.
+            // A negative signed LHS must sign-extend when the unsigned common
+            // type is wider; zero-extension would change its value modulo
+            // that type (e.g. int -8 converted to unsigned long long).
             if op_ty == IrType::I128 || op_ty == IrType::U128 {
-                // Widen to 128-bit: first promote to I64/U64, then cast to 128-bit
-                let from_64 = if ir_ty.is_unsigned() || common_ty.is_unsigned() {
+                // Preserve the source's signedness at BOTH widening steps.
+                let from_64 = if ir_ty.is_unsigned() {
                     IrType::U64
                 } else {
                     IrType::I64
@@ -1509,22 +1512,23 @@ impl Lowerer {
                 };
                 Operand::Value(self.emit_cast_val(loaded_64, from_64, op_ty))
             } else {
-                let extend_unsigned = if is_shift {
-                    ir_ty.is_unsigned()
-                } else {
-                    common_ty.is_unsigned() || ir_ty.is_unsigned()
-                };
-                let from_ty = if extend_unsigned {
-                    match ir_ty {
-                        IrType::I32 => IrType::U32,
-                        IrType::I16 => IrType::U16,
-                        IrType::I8 => IrType::U8,
-                        _ => ir_ty,
+                let mut src = loaded;
+                let mut from_ty = ir_ty;
+                // Shifts promote the LHS independently of the RHS (6.5.7).
+                if !is_shift {
+                    if ir_ty.size() >= common_ty.size() {
+                        from_ty = common_ty;
+                    } else if ir_ty.is_signed()
+                        && common_ty.is_unsigned()
+                        && common_ty.size() < op_ty.size()
+                    {
+                        // short -> unsigned int -> 64-bit carrier: first sign-
+                        // extend to 32 bits, then zero-extend the converted bits.
+                        src = Operand::Value(self.emit_cast_val(loaded, ir_ty, common_ty));
+                        from_ty = common_ty;
                     }
-                } else {
-                    ir_ty
-                };
-                Operand::Value(self.emit_cast_val(loaded, from_ty, op_ty))
+                }
+                Operand::Value(self.emit_cast_val(src, from_ty, op_ty))
             }
         } else {
             loaded

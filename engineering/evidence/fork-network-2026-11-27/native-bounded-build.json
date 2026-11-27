@@ -1,0 +1,294 @@
+{
+  "complete": true,
+  "identity": {
+    "compilers": {
+      "lccc": {
+        "path": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+        "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+        "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+      },
+      "before": {
+        "path": "/tmp/lccc-research/evidence/baseline/lccc-x86",
+        "sha256": "0ba6c80ad8d208c0e2c51dfa6999ff3bfe8fec3d0c14b2bfd78bf676f86b3949",
+        "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+      },
+      "gcc": {
+        "path": "/tmp/lccc-research/toolchains/bin/gcc-16",
+        "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+        "version": "gcc-16 (GCC) 16.2.0"
+      },
+      "clang": {
+        "path": "/tmp/lccc-research/llvm-23.1.6-complete/bin/clang-23",
+        "sha256": "1b281b7c46c55ec5ce743cc848d52b6652b65eae595650d302925c44a68e9797",
+        "version": "clang version 23.1.6 (https://github.com/llvm/llvm-project 5b10d2d74929eae78912771222c9855af97496f4)"
+      },
+      "icx": {
+        "path": "/tmp/lccc-research/icx-2026.2/opt/intel/oneapi/compiler/2026.2/bin/icx",
+        "sha256": "91ec5016b4a4fef52406e9286f3d932f8bea2da98b3a22228909f908df27832c",
+        "version": "Intel(R) oneAPI DPC++/C++ Compiler 2026.2.1 (2026.2.1.20261118)"
+      }
+    },
+    "flags": [
+      "-O2",
+      "-march=x86-64-v3",
+      "-fwrapv",
+      "-ffp-contract=off",
+      "-DPASSES=128",
+      "-DWINDOW_SIZE=4096",
+      "-DDOC_CAP=16384",
+      "-DNUM_RECORDS=1024",
+      "-DNSYMS=1024",
+      "-DNQUERIES=2048"
+    ],
+    "runtime_libraries": {
+      "lccc": [],
+      "before": [],
+      "gcc": [],
+      "clang": [],
+      "icx": [
+        {
+          "path": "/tmp/lccc-research/icx-2026.2/opt/intel/oneapi/compiler/2026.2/lib/libirc.a",
+          "sha256": "182aeaab931a9802ac7d2f950bc525828bcdaa5d9104b5fc6477cb5c81e7af03"
+        }
+      ]
+    },
+    "object_mode": "direct",
+    "driver_sha256": "51065a204ba2fd3da870a117cc96fc8efdff000e39c23aedb868f2897a869d37",
+    "object_protocol_sha256": "198eb4dd525eeb3c140f0df858f6ec4c909e89351822542650b8c500dc0047ce",
+    "header_provider": "gcc-16 (GCC) 16.2.0",
+    "sources": {
+      "zlib_ng_adler32_combine": {
+        "sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+        "flags": []
+      },
+      "gzip_longest_match": {
+        "sha256": "18a7a1d5dc782cbfe623ded7eb4d20bebcf75f3613b301f3306c3ec968a8db2b",
+        "flags": []
+      },
+      "expat_utf8_content": {
+        "sha256": "ca0354de49e7d89029cb24d442ff1f681fa26f5aa9b9fea48c73966e242d3ec2",
+        "flags": []
+      },
+      "sqlite_vdbe_serial": {
+        "sha256": "716c4164550d809dd2ca8af7c37897fe8e66296f28972e890326228931affc17",
+        "flags": []
+      },
+      "glibc_dl_hash": {
+        "sha256": "a42905655da8210823680569d084dc0e14521d8ab8f61e299fea7b0afda0f38c",
+        "flags": []
+      },
+      "zlib_ng_crc32_combine": {
+        "sha256": "152e8b9d5e8266b90aebcac40a0f18142662f3db533fc731cf59b0f62e8636d3",
+        "flags": []
+      }
+    }
+  },
+  "binaries": {
+    "zlib_ng_adler32_combine": {
+      "lccc": "74e6340779a6aed72558f02a7ad09ef481bc25bc0cefdc215025d08d3e407a55",
+      "before": "74e6340779a6aed72558f02a7ad09ef481bc25bc0cefdc215025d08d3e407a55",
+      "gcc": "17d61d762b872890ebe37ee517c3a91f4a09a2550a3288e4b1aa8bfeb013353a",
+      "clang": "2bb3fdd8fa29b5cf49aa0f928791a6c76541f7be3e28308b55bcd18a4d5103d0",
+      "icx": "75e23d31092c4f2e2762cb4bad24d65b28cd4876affb00298e5bd5a2d5052a36"
+    },
+    "gzip_longest_match": {
+      "lccc": "f081a0244b11ae5aa58f77f04f144643a6ba5137c9758a00e309bd8286c03528",
+      "before": "f081a0244b11ae5aa58f77f04f144643a6ba5137c9758a00e309bd8286c03528",
+      "gcc": "58cda10dd1aff5ef64085b4e2a93bd6c96eb68c1686b86b63f0c60224be54d26",
+      "clang": "ee4aa9e59e0bfa485c9f0b19a44e118fba8d3ee66b3479940bb57377454f16a8",
+      "icx": "2a99a92c10a173163bf97e9e523e8b0b105fb910781bbc09d752c647931560f8"
+    },
+    "expat_utf8_content": {
+      "lccc": "11cfbecf4f2cfc996a977baa1332ceb551a9c3c1d26b555e3476f37cd9f77322",
+      "before": "11cfbecf4f2cfc996a977baa1332ceb551a9c3c1d26b555e3476f37cd9f77322",
+      "gcc": "61939daab939926543d1a961df305bb54a1a6ad823fbc2fd43980f6e1d39c53a",
+      "clang": "140217d706828404a83efaf21c46a40d92ccf009b2901b6abb3771e59c44b3b3",
+      "icx": "99666e35fa293dda2ccf473721f3be4593269a1c56a644484dc058032d51c1e0"
+    },
+    "sqlite_vdbe_serial": {
+      "lccc": "e64187641a6bb47905f6d15273edae4cab4a52a5ed501ab37e0a7f0b2666d37d",
+      "before": "e64187641a6bb47905f6d15273edae4cab4a52a5ed501ab37e0a7f0b2666d37d",
+      "gcc": "a9ee3ef46048aa583793bdd9961fca27a7373fd9c0b49b9c2b18b35a84ccbf0b",
+      "clang": "8bc7e7da09ef71f5e4212bacd57270aff4b97e1ef23d03a67147917266deed84",
+      "icx": "41b721cc890a691d9d7c9fea89e2513841e3f7ac8ed6e613b325784887c89c9f"
+    },
+    "glibc_dl_hash": {
+      "lccc": "85e61ebd46275ab7584d5e7092314da5f948d38757b1f74c8a7b5d7afe8bf111",
+      "before": "85e61ebd46275ab7584d5e7092314da5f948d38757b1f74c8a7b5d7afe8bf111",
+      "gcc": "722db80229fb958534e43914aee51dec16677bca787a39b95934ceea7e6ae9a7",
+      "clang": "c7927961d6350a83af23138d288cb467d07a60fdd9a50df11005108183784cc4",
+      "icx": "7c4f5b2e8307e14a7b6b96235f51142faee3698c0824ffdf819a744297c38215"
+    },
+    "zlib_ng_crc32_combine": {
+      "lccc": "fabb90a80792d5a2a8777d20c0ad4374097aa4ca88aeae2eb3d3e6cb18f91ed8",
+      "before": "fabb90a80792d5a2a8777d20c0ad4374097aa4ca88aeae2eb3d3e6cb18f91ed8",
+      "gcc": "c808b350d242878ec1efd67ed13f15abc17f7e049be35bf3c5b8b2eae85c14ee",
+      "clang": "298684a1bb89b5bb404661ceab51859f750aa279017c73a0735b21feeb964b29",
+      "icx": "b9fbddf643a6828a288b13eef366dd8176946cedb97b9c0fa946e6b5132d1254"
+    }
+  },
+  "body_checks": {
+    "zlib_ng_adler32_combine": {
+      "lccc": {
+        "original_object": "14da594106452e16578a860863851150c8b3e9a495962f53b9e705ae017448fd",
+        "renamed_object": "fc9e1f91ce7a3827ca71ed49382b4c59ec8ef9602a13e42a890218d3387c2f34",
+        "whole_object_identity": true
+      },
+      "before": {
+        "original_object": "14da594106452e16578a860863851150c8b3e9a495962f53b9e705ae017448fd",
+        "renamed_object": "fc9e1f91ce7a3827ca71ed49382b4c59ec8ef9602a13e42a890218d3387c2f34",
+        "whole_object_identity": true
+      },
+      "gcc": {
+        "original_object": "e19be306859eb0998be190967ce23d5423a04b3d47531c400afed8223bec86aa",
+        "renamed_object": "c541d7c8398a33ea735d69edf51755172f4a0c9276500dbd3c6b5f5b8570b150",
+        "whole_object_identity": true
+      },
+      "clang": {
+        "original_object": "f03181b7858a0907d7a9fb98599a452cab5ae8ff01f4ed7d3f75f4f0b4793227",
+        "renamed_object": "29e74a79cf6cd2552f03fdd886517d4f5d6a77764997f467c5868aa8d59f6217",
+        "whole_object_identity": true
+      },
+      "icx": {
+        "original_object": "ac67ad109bb02066f04671e4699afc78cf867522965f3707cb234a4b84f50b63",
+        "renamed_object": "e54bca05b097e267bb14b4a66c66bf268436bdce75b7c9b1b22dcfdc6ce04da3",
+        "whole_object_identity": true
+      }
+    },
+    "gzip_longest_match": {
+      "lccc": {
+        "original_object": "d2ecbe22fe59392a9084b76588330ba5182a41ef05a8d71902c33a88828a087c",
+        "renamed_object": "fd5df547ca234582610b767c855b15aa5390e88357a2e61dddddebaa24994d76",
+        "whole_object_identity": true
+      },
+      "before": {
+        "original_object": "d2ecbe22fe59392a9084b76588330ba5182a41ef05a8d71902c33a88828a087c",
+        "renamed_object": "fd5df547ca234582610b767c855b15aa5390e88357a2e61dddddebaa24994d76",
+        "whole_object_identity": true
+      },
+      "gcc": {
+        "original_object": "5d85f621556bcd5664fdf63cd617bfc0868e349d9176d2a0834251b1ceea4d14",
+        "renamed_object": "97d440ea61c704edc6b2de967ac78a9d4abdb2cded6902d17f92772677332969",
+        "whole_object_identity": true
+      },
+      "clang": {
+        "original_object": "75daaf03dc9643c28d9c3e2164e5263514d3a8cab251f79ec58a382350a09d70",
+        "renamed_object": "113427e2f5d9f9327b6ca44755f5dcbe57f025ac36d540f7df57809921c44653",
+        "whole_object_identity": true
+      },
+      "icx": {
+        "original_object": "9dca04c96ae708db98defbeada831a8a4fdefa9b6acc2350ece2bac8e9636f59",
+        "renamed_object": "6a3405a92941d7466ebed763b59d525a1b427d3ec9ffb3c9ecb8a4fda518c80f",
+        "whole_object_identity": true
+      }
+    },
+    "expat_utf8_content": {
+      "lccc": {
+        "original_object": "996eaf4b1561c1832b38b810ac770232e1711f26c8f46c633de49e7dbeabe577",
+        "renamed_object": "ac012b4a83b63575a8f363e48d8641731302f76a48cab6543205d1a0d6fe631a",
+        "whole_object_identity": true
+      },
+      "before": {
+        "original_object": "996eaf4b1561c1832b38b810ac770232e1711f26c8f46c633de49e7dbeabe577",
+        "renamed_object": "ac012b4a83b63575a8f363e48d8641731302f76a48cab6543205d1a0d6fe631a",
+        "whole_object_identity": true
+      },
+      "gcc": {
+        "original_object": "5759228bc0f175dc916fea4fe1e8f228c9cde276ac25caa0f618501837d8917c",
+        "renamed_object": "7fbf83574a127661c4e3f7eb129c06c69dd4c0b448513c6fdd5b891b8d5c3e2e",
+        "whole_object_identity": true
+      },
+      "clang": {
+        "original_object": "5e0a9ff466d064e0351af8f327efc82dfcbe4ea5ea7ad33431adc183b09a5d87",
+        "renamed_object": "9d208234b7f48ccf8165e2c9a0e25afd6613564ad5618519ae1d752bf168f9a0",
+        "whole_object_identity": true
+      },
+      "icx": {
+        "original_object": "88e88b5ed89d61d39b884e183271cd8a90ce1b3ab52c3371b5475c36d0fa9d2d",
+        "renamed_object": "88ef5331565c9024b0dcac24fa5eb30adf1a19ef4365885fda4546e087a2761d",
+        "whole_object_identity": true
+      }
+    },
+    "sqlite_vdbe_serial": {
+      "lccc": {
+        "original_object": "bd69f9f41916a1ba983a4759ee6301da2f2c12eb9589144a3469749ecfeae239",
+        "renamed_object": "aa5fd1cead6a25fa30e8a7f948b8e999d1a3e56546f53ce49d820ce62da182b4",
+        "whole_object_identity": true
+      },
+      "before": {
+        "original_object": "bd69f9f41916a1ba983a4759ee6301da2f2c12eb9589144a3469749ecfeae239",
+        "renamed_object": "aa5fd1cead6a25fa30e8a7f948b8e999d1a3e56546f53ce49d820ce62da182b4",
+        "whole_object_identity": true
+      },
+      "gcc": {
+        "original_object": "f64796acbf0ea2579a223275d7fc0e7c2a496cf05d4a0e5f4b978d630a485bfb",
+        "renamed_object": "fc60534dd3015f875b8a73db7080eb68f8437f974a9163b10dbdd9795e796533",
+        "whole_object_identity": true
+      },
+      "clang": {
+        "original_object": "eb7dc90a0f2a8577d84c1d3ac47306f6394cf9b685cbdbb2dedf81594f0fb685",
+        "renamed_object": "8f159695bd07608d4056c98b4af746b6de968100a5e2b34ff5842901eaf197a5",
+        "whole_object_identity": true
+      },
+      "icx": {
+        "original_object": "7c8e32c39f9dd0fba5c34c9ccf1065cef70977c2935b1fb4717b8d40c9ad27a6",
+        "renamed_object": "3946404c51e1d7391ed29ac3f7d23aa6e0fff9c3b09d1003d6c07ba4a40e570f",
+        "whole_object_identity": true
+      }
+    },
+    "glibc_dl_hash": {
+      "lccc": {
+        "original_object": "ae25db3f74ed73ec0f65c355079f5ea71086fd4bff81cbdf6e777f66dfbe6660",
+        "renamed_object": "17826291a24802430dfb13a0d1de3e60465429f74079c16d8c07ddf3c4838845",
+        "whole_object_identity": true
+      },
+      "before": {
+        "original_object": "ae25db3f74ed73ec0f65c355079f5ea71086fd4bff81cbdf6e777f66dfbe6660",
+        "renamed_object": "17826291a24802430dfb13a0d1de3e60465429f74079c16d8c07ddf3c4838845",
+        "whole_object_identity": true
+      },
+      "gcc": {
+        "original_object": "d66f347485c641b75b2f7b2413231371ef7c72adaa3cb8eda2099635aa609292",
+        "renamed_object": "dca36bd668c788a9a7ad053dc7b551e5ea7c595435f87fd6ccf12e02b8260e87",
+        "whole_object_identity": true
+      },
+      "clang": {
+        "original_object": "7f4e4031080ba782a5601e56b87077784b39c1f9a14079c2cc84532d42b9190c",
+        "renamed_object": "59da30ca050030613c2b6648140e258263ab07a7c6a9e4cf6275953cb0de677f",
+        "whole_object_identity": true
+      },
+      "icx": {
+        "original_object": "a2efbeebabb3d924dce45b1c8071482b3963d87fcbd362780acd3d80565e18c7",
+        "renamed_object": "93bf7362ffb7ab6a84e44790d55642d40c0266bb05118dfbcf3f8a809e987cf7",
+        "whole_object_identity": true
+      }
+    },
+    "zlib_ng_crc32_combine": {
+      "lccc": {
+        "original_object": "c275d65fd76987c701673d458e157216d950c2d8e693a19cdf41c97f4a4d3e31",
+        "renamed_object": "13c2acc4ca98835229d091f2364d231be62bd4018557746c420fab48745edc64",
+        "whole_object_identity": true
+      },
+      "before": {
+        "original_object": "c275d65fd76987c701673d458e157216d950c2d8e693a19cdf41c97f4a4d3e31",
+        "renamed_object": "13c2acc4ca98835229d091f2364d231be62bd4018557746c420fab48745edc64",
+        "whole_object_identity": true
+      },
+      "gcc": {
+        "original_object": "a1503519d0e7b50525c879af397846142aab6d800bb0592aed92cac35a53b289",
+        "renamed_object": "697d12c0d1533967bfe82d568e2a127824ec7f2d80cb8389cd13ff3fb5d054a9",
+        "whole_object_identity": true
+      },
+      "clang": {
+        "original_object": "8e241d3127ac4058d7eb4302db6ae201e6fa2a408d303773d0bd531ed5f46f64",
+        "renamed_object": "f262dbadf06f1f2c5287979212fa424381d3ee43c9dcdc73ce4b9f0baaed23cd",
+        "whole_object_identity": true
+      },
+      "icx": {
+        "original_object": "783ca2d290f6b02fcb475800f1029dd1fe37f178bc99fab5a38455f5175874cf",
+        "renamed_object": "487b7d751234b9e67dc616b7853c5cd1c45c8147a63b15d1b0f12fc86b8c0f1c",
+        "whole_object_identity": true
+      }
+    }
+  }
+}

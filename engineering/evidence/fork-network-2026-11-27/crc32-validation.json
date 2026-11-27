@@ -1,0 +1,100 @@
+{
+  "source": "tests/benchmark/programs/zlib_ng_crc32_combine.c",
+  "source_sha256": "152e8b9d5e8266b90aebcac40a0f18142662f3db533fc731cf59b0f62e8636d3",
+  "common_flags": [
+    "-DPASSES=128"
+  ],
+  "x86_64_levels": [
+    "-O0",
+    "-O2",
+    "-O3"
+  ],
+  "i686_levels": [
+    "-O2"
+  ],
+  "rows": [
+    {
+      "binary_label": "lccc-O0",
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "binary_sha256": "07cc182e0f17385baeef2ccfd859f031b0565261ea7f006e089a699643ccfa7c"
+    },
+    {
+      "binary_label": "lccc-O2",
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "binary_sha256": "5814a1422289104046edcbc2024d627b2cb27886325135e5add81ddcf01d3b34"
+    },
+    {
+      "binary_label": "lccc-O3",
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "binary_sha256": "5814a1422289104046edcbc2024d627b2cb27886325135e5add81ddcf01d3b34"
+    },
+    {
+      "binary_label": "gcc-O0",
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "binary_sha256": "edf5761131bc883f2ca42bf1649027be723d06c24eff786177eec2ae718c365e"
+    },
+    {
+      "binary_label": "gcc-O2",
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "binary_sha256": "b25822e98ad55516e43fb2b9c9b614a0b9d8faedf72ec0977d18ab2f8b303c75"
+    },
+    {
+      "binary_label": "gcc-O3",
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "binary_sha256": "c46202f99d2eb9a25e0cbd828fd3058f10241aa96ae250b7839c7e2e8b365e1a"
+    },
+    {
+      "binary_label": "clang-O0",
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "binary_sha256": "9308e61c3da6dbde2ac2ee2ca4e627fd4474107b4ed1cefaa918e9acfd42a4c1"
+    },
+    {
+      "binary_label": "clang-O2",
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "binary_sha256": "134774a9890383b4a134f548afa31883a3d40736a07d62245ef0c4d2aa9d4c3c"
+    },
+    {
+      "binary_label": "clang-O3",
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "binary_sha256": "6dfca8a96eca5595c7e7032e61b1480376256c0d6ec45fac15f0f988ee07312c"
+    },
+    {
+      "binary_label": "lccc-i686",
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "binary_sha256": "aa9c432cdcbe775026caeef1ff44afd1022aa537205598388c822f781628a043"
+    },
+    {
+      "binary_label": "gcc-m32",
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "binary_sha256": "47ebe6f16eb2167ca7fd8e3697fe2ee475cd17963742fc3565a5cfccfc1f78d5"
+    },
+    {
+      "binary_label": "sanitized",
+      "compiler": "system GCC 12.2 (sanitizer runtime only; codegen references remain GCC 16.2/Clang 23.1.5)",
+      "flags": [
+        "-O1",
+        "-DPASSES=128",
+        "-fsanitize=address,undefined",
+        "-fno-sanitize-recover=all"
+      ],
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "stderr": ""
+    }
+  ],
+  "unavailable": {
+    "gcc16_sanitizer_runtime": "/tmp/lccc-research/toolchains/binutils-2.47-x86_64-linux/libexec/ld: cannot find libasan_preinit.o: No such file or directory\n/tmp/lccc-research/toolchains/binutils-2.47-x86_64-linux/libexec/ld: cannot find -lasan: No such file or directory\n/tmp/lccc-research/toolchains/binutils-2.47-x86_64-linux/libexec/ld: cannot find -lubsan: No such file or directory\ncollect2: error: ld returned 1 exit status\n"
+  },
+  "scope": "standalone kernel correctness; not full zlib-ng or runtime speedup"
+}

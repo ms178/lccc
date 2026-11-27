@@ -1,0 +1,136 @@
+{
+  "complete": true,
+  "identity": {
+    "compilers": {
+      "lccc": {
+        "path": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+        "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+        "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+      },
+      "before": {
+        "path": "/tmp/lccc-research/evidence/baseline/lccc-x86",
+        "sha256": "0ba6c80ad8d208c0e2c51dfa6999ff3bfe8fec3d0c14b2bfd78bf676f86b3949",
+        "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+      },
+      "gcc": {
+        "path": "/tmp/lccc-research/toolchains/bin/gcc-16",
+        "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+        "version": "gcc-16 (GCC) 16.2.0"
+      },
+      "clang": {
+        "path": "/tmp/lccc-research/llvm-23.1.6-complete/bin/clang-23",
+        "sha256": "1b281b7c46c55ec5ce743cc848d52b6652b65eae595650d302925c44a68e9797",
+        "version": "clang version 23.1.6 (https://github.com/llvm/llvm-project 5b10d2d74929eae78912771222c9855af97496f4)"
+      },
+      "icx": {
+        "path": "/tmp/lccc-research/icx-2026.2/opt/intel/oneapi/compiler/2026.2/bin/icx",
+        "sha256": "91ec5016b4a4fef52406e9286f3d932f8bea2da98b3a22228909f908df27832c",
+        "version": "Intel(R) oneAPI DPC++/C++ Compiler 2026.2.1 (2026.2.1.20261118)"
+      }
+    },
+    "flags": [
+      "-O2",
+      "-march=x86-64-v3",
+      "-fwrapv",
+      "-ffp-contract=off"
+    ],
+    "runtime_libraries": {
+      "lccc": [],
+      "before": [],
+      "gcc": [],
+      "clang": [],
+      "icx": [
+        {
+          "path": "/tmp/lccc-research/icx-2026.2/opt/intel/oneapi/compiler/2026.2/lib/libirc.a",
+          "sha256": "182aeaab931a9802ac7d2f950bc525828bcdaa5d9104b5fc6477cb5c81e7af03"
+        }
+      ]
+    },
+    "object_mode": "direct",
+    "driver_sha256": "51065a204ba2fd3da870a117cc96fc8efdff000e39c23aedb868f2897a869d37",
+    "object_protocol_sha256": "198eb4dd525eeb3c140f0df858f6ec4c909e89351822542650b8c500dc0047ce",
+    "header_provider": "gcc-16 (GCC) 16.2.0",
+    "sources": {
+      "zlib_ng_adler32_combine": {
+        "sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+        "flags": []
+      },
+      "zlib_ng_crc32_combine": {
+        "sha256": "152e8b9d5e8266b90aebcac40a0f18142662f3db533fc731cf59b0f62e8636d3",
+        "flags": []
+      }
+    }
+  },
+  "binaries": {
+    "zlib_ng_adler32_combine": {
+      "lccc": "68311c0ce298e81457a54a0583db95ffa3eba9a5e9c2a070a9760fe11dc16635",
+      "before": "68311c0ce298e81457a54a0583db95ffa3eba9a5e9c2a070a9760fe11dc16635",
+      "gcc": "43b0bdeb43a97dd51744afec557279d6da4855569961cf80980eba5fca8b2fbe",
+      "clang": "17286d49dbf4c89a1b04568312f1adf32453ba910b7fd25074e78edd5ec8b5ce",
+      "icx": "7b9602cb79b0a545056f022bd565faea879e1ed46a2184ca6f702a8c896e56db"
+    },
+    "zlib_ng_crc32_combine": {
+      "lccc": "3b194bd12c13df23eb7d592677bc2e5ed5debe3fa90eb6875b67735a7edc61f5",
+      "before": "3b194bd12c13df23eb7d592677bc2e5ed5debe3fa90eb6875b67735a7edc61f5",
+      "gcc": "3af14d73222d0876f530a12dc8a4674c122067a7e3a1508404f5ab6ac53033fa",
+      "clang": "815051b202c059bc9ffa895b914c4eb6d532e1079ae0e83c4b1487ca8380449d",
+      "icx": "f7b0f489fb7dc4650e3a6d40941df3917b1fa3a51e9f24daec655b1b091821c4"
+    }
+  },
+  "body_checks": {
+    "zlib_ng_adler32_combine": {
+      "lccc": {
+        "original_object": "66f197d3ec19ee0bf8bdf7964beea2d65965ca7a8f5df44e3a84c3270b101c1b",
+        "renamed_object": "f92a1719bd562ff3702a475f2e5a0504f8f92805dfab8b66c467bf7d072f0004",
+        "whole_object_identity": true
+      },
+      "before": {
+        "original_object": "66f197d3ec19ee0bf8bdf7964beea2d65965ca7a8f5df44e3a84c3270b101c1b",
+        "renamed_object": "f92a1719bd562ff3702a475f2e5a0504f8f92805dfab8b66c467bf7d072f0004",
+        "whole_object_identity": true
+      },
+      "gcc": {
+        "original_object": "e05f6a027620b2e0e7bddf57cf74a17dc267487a666950ccf898c39c38c442f9",
+        "renamed_object": "b7036ea22f271ce73451e34af40015aace91c7bc98a8a53fdf8ac6fc0ba42c1f",
+        "whole_object_identity": true
+      },
+      "clang": {
+        "original_object": "819c898e890ddace1f60da0758724e272e37eaa8cd744e32f6dc92980718c168",
+        "renamed_object": "da70cacc28c77aafc0e2249fc4f8522fd361363c6a8d68a3527ef0852654697f",
+        "whole_object_identity": true
+      },
+      "icx": {
+        "original_object": "672380a734ab8c9455589dad177e8bcbe439ea1c3a44c96cccff6abe9b3a780e",
+        "renamed_object": "58ae0cd45006c551ae6883cceb3e98ed30a255585dc2a6c1e318e400d2bd959e",
+        "whole_object_identity": true
+      }
+    },
+    "zlib_ng_crc32_combine": {
+      "lccc": {
+        "original_object": "3c0f8b62f04d5ad8f8eef7fb1bfa80eca05ddf0a2d5855e50d6812a077361501",
+        "renamed_object": "447894ee643451c70b030d20aef2401dc3e7023430cc3fdf4d241f436310ddaf",
+        "whole_object_identity": true
+      },
+      "before": {
+        "original_object": "3c0f8b62f04d5ad8f8eef7fb1bfa80eca05ddf0a2d5855e50d6812a077361501",
+        "renamed_object": "447894ee643451c70b030d20aef2401dc3e7023430cc3fdf4d241f436310ddaf",
+        "whole_object_identity": true
+      },
+      "gcc": {
+        "original_object": "00c208ebdd592419abab13fa609fb3778542decc0066bff02462971db132b68c",
+        "renamed_object": "b0388d64aac6af9a84f99267cc7f2dfd0f3a3f229373fc7ad7dd0398a426d24c",
+        "whole_object_identity": true
+      },
+      "clang": {
+        "original_object": "3a0e78301077f2505149b3462e3fd53ff9063aab44eae1e64ba7cf07a950a95e",
+        "renamed_object": "191f43cba88093044266ea87f5c1f6e9cb5ed0abd758685cd55a2137ee762b35",
+        "whole_object_identity": true
+      },
+      "icx": {
+        "original_object": "04fd3cd1c60d2a15d9621efda1bffb5dfa0e350c27208e81b37f7d89638c3cd8",
+        "renamed_object": "0106fa72262525426b331520835d4e7d40b805304c13d677523439b3a5ff11b0",
+        "whole_object_identity": true
+      }
+    }
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "compiler_id": "cicc2021100",
+  "flags": "-O2 -march=core-avx2 -DPASSES=128",
+  "source_sha256": "152e8b9d5e8266b90aebcac40a0f18142662f3db533fc731cf59b0f62e8636d3",
+  "execution": {
+    "code": 0,
+    "okToCache": true,
+    "timedOut": false,
+    "stdout": [
+      {
+        "text": "zlib_ng_crc32_combine: f13e1784"
+      }
+    ],
+    "stderr": [],
+    "truncated": false,
+    "execTime": 22,
+    "processExecutionResultTime": 0.020802000537514687,
+    "didExecute": true,
+    "buildResult": {
+      "inputFilename": "example.c",
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [],
+      "stderr": [
+        {
+          "text": "icc: remark #10441: The Intel(R) C++ Compiler Classic (ICC) is deprecated and will be removed from product release in the second half of 2023. The Intel(R) oneAPI DPC++/C++ Compiler (ICX) is the recommended compiler moving forward. Please transition to use this compiler. Use '-diag-disable=10441' to disable this message."
+        }
+      ],
+      "truncated": false,
+      "execTime": 213,
+      "processExecutionResultTime": 0.026332000270485878,
+      "instructionSet": "amd64",
+      "downloads": [],
+      "executableFilename": "/nosym/tmp/compiler-explorer-compilernjxZLA/output.s",
+      "compilationOptions": [
+        "-g",
+        "-o",
+        "/app/output.s",
+        "-gxx-name=/opt/compiler-explorer/gcc-13.2.0/bin/g++",
+        "-O2",
+        "-march=core-avx2",
+        "-DPASSES=128",
+        "/app/example.c",
+        "-L./lib",
+        "-Wl,-rpath,./lib",
+        "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2023.2.1.8/compiler/latest/linux/compiler/lib/intel64_lin",
+        "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2023.2.1.8/compiler/latest/linux/compiler/lib/ia32_lin"
+      ],
+      "preparedLdPaths": [
+        "/opt/compiler-explorer/intel-cpp-2023.2.1.8/compiler/latest/linux/compiler/lib/intel64_lin",
+        "/opt/compiler-explorer/intel-cpp-2023.2.1.8/compiler/latest/linux/compiler/lib/ia32_lin"
+      ],
+      "defaultExecOptions": {
+        "timeoutMs": 20000,
+        "maxErrorOutput": 5000,
+        "env": {
+          "LD_LIBRARY_PATH": "",
+          "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+          "HOME": "/home/ce"
+        }
+      },
+      "packageStoreTime": 34
+    }
+  },
+  "scope": "remote functional check only; not a native timing comparison"
+}

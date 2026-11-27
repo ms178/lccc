@@ -29,6 +29,12 @@ RISCV_GCC = {"id": "crv64g1610", "name": "riscv64 gcc 16.1"}
 
 
 class ArchOfCompilerTest(unittest.TestCase):
+    def test_current_release_aliases_and_explicit_legacy_channel(self) -> None:
+        self.assertEqual(godbolt.resolve_compiler("arm64gcc"), "carm64g1620")
+        self.assertEqual(godbolt.resolve_compiler("rv64gcc"), "rv64-cgcc1620")
+        self.assertEqual(godbolt.resolve_compiler("crv64g1620"), "rv64-cgcc1620")
+        self.assertEqual(godbolt.resolve_compiler("crv64g1610"), "rv64-cgcc1610")
+
     def test_identifies_the_channels_in_use(self) -> None:
         self.assertEqual(oracle._arch_of_compiler(X86_GCC), "x86")
         self.assertEqual(oracle._arch_of_compiler(AARCH64_GCC), "aarch64")

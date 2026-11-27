@@ -73,6 +73,7 @@ COMPILER_ALIASES: dict[str, str] = {
     # RISC-V (64-bits) GCC channels on CE. "latest-toolchains-only" policy:
     # the trunk channel plus the two newest releases are kept as oracles.
     "crv64gtrunk": "rv64-cgcctrunk",
+    "crv64g1620": "rv64-cgcc1620",
     "crv64g1610": "rv64-cgcc1610",
     "crv64g1520": "rv64-cgcc1520",
     "crv64g1430": "rv64-cgcc1430",
@@ -86,10 +87,10 @@ COMPILER_ALIASES: dict[str, str] = {
     # oracle sets had no way to age -- `crv64g*` were dead ids, so every
     # RISC-V survey reported "no oracles" on stderr and an empty table.
     # Aliases route them through the same audit as the x86 pins.
-    "arm64gcc": "carm64g1610",
+    "arm64gcc": "carm64g1620",
     "arm64gcc-trunk": "carm64gtrunk",
     "armv8clang": "armv8-cclang2310",
-    "rv64gcc": "rv64-cgcc1610",
+    "rv64gcc": "rv64-cgcc1620",
     "rv64gcc-trunk": "rv64-cgcctrunk",
     "rv64clang": "rv64-cclang2310",
 }
@@ -611,6 +612,8 @@ def _validated_local_oracle(name: str) -> tuple[Path, str]:
             # Always reprobe: some filesystems have coarse timestamps, so
             # stat identity alone cannot prove an executable is unchanged.
             if binary is None:
+                if CACHE_ONLY.get():
+                    raise GodboltError(f"{name}: offline mode cannot provision; set {spec['env']} to an installed binary")
                 provisioner = Path(__file__).resolve().parent / spec["provision"]
                 result = subprocess.run([str(provisioner)], capture_output=True, text=True, timeout=3600)
                 if result.returncode:

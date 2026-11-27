@@ -569,21 +569,6 @@ impl Parser {
         }
     }
 
-    /// An OBJECT declaration hides any same-named function: after
-    /// `void f(void);` a block-scope `int f;` makes `"i"(f)` an ordinary
-    /// object value, exactly as it hides a typedef name.  A declaration whose
-    /// last declarator is a function still names the function entity (a
-    /// redeclaration or definition), so it must not clear the record.
-    fn record_object_shadows(&mut self, declarators: &[InitDeclarator]) {
-        for decl in declarators {
-            if !decl.name.is_empty()
-                && !matches!(decl.derived.last(), Some(DerivedDeclarator::Function(..)))
-            {
-                self.function_names.remove(&decl.name);
-            }
-        }
-    }
-
     /// Parse the rest of a function definition after the declarator.
     fn parse_function_def(
         &mut self,
@@ -1126,6 +1111,7 @@ impl Parser {
         // casts to segment-qualified pointers clear parsing_address_space
         // before Declaration::new would read it.
         let decl_addr_space = self.attrs.decl_address_space;
+        let is_typedef = self.attrs.parsing_typedef();
         let spec_maybe_unused = ctx.attrs.is_maybe_unused();
         // A type's `unused` reaches the declarators OF that type only: a
         // pointer to it or an array of it is reported as GCC reports it.
@@ -1137,11 +1123,8 @@ impl Parser {
         // declarator of the statement (`__attribute__((noplt)) void f(), g();`
         // marks both, measured against gcc-16.2.0).
         let spec_noplt = ctx.attrs.is_noplt();
-        let init = if self.consume_if(&TokenKind::Assign) {
-            Some(self.parse_initializer())
-        } else {
-            None
-        };
+        let init =
+            self.parse_declarator_initializer(&type_spec, name.as_deref(), &derived, is_typedef);
         let section = ctx.attrs.section.clone();
         declarators.push(InitDeclarator {
             name: name.unwrap_or_default(),
@@ -1272,6 +1255,13 @@ impl Parser {
             self.attrs.parsing_noinline(),
         );
         self.attrs.set_noinline(false);
+        if is_typedef {
+            self.record_typedef_details(
+                &type_spec,
+                std::slice::from_ref(last_decl),
+                decl_addr_space,
+            );
+        }
 
         if nested_fn_decl_level {
             for d in &mut declarators {
@@ -1346,11 +1336,12 @@ impl Parser {
             self.attrs.set_pure(false);
             self.attrs.set_const_attr(false);
             self.attrs.set_error_attr(false);
-            let dinit = if self.consume_if(&TokenKind::Assign) {
-                Some(self.parse_initializer())
-            } else {
-                None
-            };
+            let dinit = self.parse_declarator_initializer(
+                &type_spec,
+                dname.as_deref(),
+                &dderived,
+                is_typedef,
+            );
             // Attributes seen inside an initializer belong to nested syntax,
             // not this object or the next sibling.
             self.attrs.set_retain(false);
@@ -1443,6 +1434,13 @@ impl Parser {
                 self.attrs.parsing_noinline(),
             );
             self.attrs.set_noinline(false);
+            if is_typedef {
+                self.record_typedef_details(
+                    &type_spec,
+                    std::slice::from_ref(last_decl),
+                    decl_addr_space,
+                );
+            }
             // A trailing attribute written on a later sibling is still a
             // declaration-level verdict for GCC: `int a, b __attribute__
             // ((noreturn));` warns once, at the declaration (measured). The
@@ -1455,12 +1453,11 @@ impl Parser {
             }
         }
 
-        // Register typedef names
-        let is_typedef = self.attrs.parsing_typedef();
+        // Names and typedef metadata were installed per declarator.
+        self.attrs.set_typedef(false);
         let is_transparent_union = self.take_transparent_union();
         let is_designated_init = self.attrs.parsing_designated_init();
         self.attrs.set_designated_init(false);
-        self.register_typedefs(&type_spec, &declarators, decl_addr_space);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
         // `-Wstrict-prototypes` is a property of the declared types, so it is
@@ -1628,38 +1625,61 @@ impl Parser {
         d
     }
 
-    /// Register block-scope typedef names, or record the typedef/object shadows
-    /// introduced by ordinary declarations.  Returns whether the declaration
-    /// was a typedef so the caller can stamp the finished `Declaration`.
-    fn register_local_typedefs(
+    /// Enter one completed declarator into the ordinary-identifier namespace.
+    /// Scope starts before the initializer and before the next comma sibling
+    /// (C11 6.2.1p7), not at the declaration's semicolon.
+    fn declare_declarator_name(
         &mut self,
-        declarators: &[InitDeclarator],
-        decl_addr_space: AddressSpace,
-    ) -> bool {
-        let is_typedef = self.attrs.parsing_typedef();
+        name: Option<&str>,
+        derived: &[DerivedDeclarator],
+        is_typedef: bool,
+    ) {
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            return;
+        };
         if is_typedef {
-            for decl in declarators {
-                if !decl.name.is_empty() {
-                    self.record_typedef_scope_change(&decl.name);
-                }
-            }
-            self.record_typedef_object_spaces(declarators, decl_addr_space);
-            for decl in declarators {
-                if !decl.name.is_empty() {
-                    self.typedefs.insert(decl.name.clone());
-                    self.shadowed_typedefs.remove(&decl.name);
-                }
-            }
-            self.attrs.set_typedef(false);
-        } else {
-            for decl in declarators {
-                if !decl.name.is_empty() && self.typedefs.contains(&decl.name) {
-                    self.shadowed_typedefs.insert(decl.name.clone());
-                }
-            }
-            self.record_object_shadows(declarators);
+            // Log the OLD state exactly once, before installing the new name.
+            self.record_typedef_scope_change(name);
+            self.typedefs.insert(name.to_owned());
+            self.shadowed_typedefs.remove(name);
+        } else if self.block_depth > 0 && self.typedefs.contains(name) {
+            self.shadowed_typedefs.insert(name.to_owned());
         }
-        is_typedef
+        if self.block_depth > 0 {
+            if self.is_parser_enum_constant(name) {
+                self.hide_enum_constant(name);
+            }
+            self.local_constants.remove(name);
+            // An object/typedef hides a function; a function redeclaration
+            // still denotes the function entity (including asm "i" operands).
+            if is_typedef || !DerivedDeclarator::declares_function(derived) {
+                self.function_names.remove(name);
+            }
+        }
+    }
+
+    fn parse_declarator_initializer(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        name: Option<&str>,
+        derived: &[DerivedDeclarator],
+        is_typedef: bool,
+    ) -> Option<Initializer> {
+        // GNU __auto_type / C23 inferred declarations deliberately enter scope
+        // AFTER the initializer; moving every name early would break them.
+        let inferred = matches!(type_spec, TypeSpecifier::AutoType);
+        if !inferred {
+            self.declare_declarator_name(name, derived, is_typedef);
+        }
+        let init = if self.consume_if(&TokenKind::Assign) {
+            Some(self.parse_initializer())
+        } else {
+            None
+        };
+        if inferred {
+            self.declare_declarator_name(name, derived, is_typedef);
+        }
+        init
     }
 
     pub(super) fn parse_local_declaration(&mut self) -> Option<Declaration> {
@@ -1744,6 +1764,7 @@ impl Parser {
 
         let is_static = self.attrs.parsing_static();
         let is_extern = self.attrs.parsing_extern();
+        let is_typedef = self.attrs.parsing_typedef();
 
         let mut declarators = Vec::with_capacity(4);
 
@@ -1805,16 +1826,17 @@ impl Parser {
             for a in [decl_aligned, skip_aligned].iter().copied().flatten() {
                 alignment = Some(alignment.map_or(a, |prev| prev.max(a)));
             }
-            let init = if self.consume_if(&TokenKind::Assign) {
-                Some(self.parse_initializer())
-            } else {
-                None
-            };
+            let init = self.parse_declarator_initializer(
+                &type_spec,
+                name.as_deref(),
+                &derived,
+                is_typedef,
+            );
             // Record a block-scope integer constant so an `asm "i"` operand may
             // name it (see `local_constants` in the parser state).  A
             // declaration with no initializer still SHADOWS an outer record.
             if let Some(decl_name) = name.as_ref() {
-                if !decl_name.is_empty() && !self.attrs.parsing_typedef() {
+                if !decl_name.is_empty() && !is_typedef {
                     match init.as_ref() {
                         Some(init) => self.record_local_constant(decl_name, &derived, init),
                         None => {
@@ -1909,6 +1931,13 @@ impl Parser {
             if let Some(a) = post_init_aligned {
                 alignment = Some(alignment.map_or(a, |prev| prev.max(a)));
             }
+            if is_typedef {
+                self.record_typedef_details(
+                    &type_spec,
+                    std::slice::from_ref(last_decl),
+                    decl_addr_space,
+                );
+            }
             if !self.consume_if(&TokenKind::Comma) {
                 break;
             }
@@ -1922,17 +1951,13 @@ impl Parser {
             .collect();
         let type_spec = self.apply_mode_attribute(mode_kind, type_spec, &mode_derived, start);
 
-        // A block-scope declaration hides an enumerator of the same name.
-        if self.block_depth > 0 {
-            for decl in &declarators {
-                if self.is_parser_enum_constant(&decl.name) {
-                    self.hide_enum_constant(&decl.name);
-                }
-            }
+        // Names were bound before their initializers. Refresh typedef details
+        // after the declaration-wide mode attribute has resolved the base type;
+        // do not log another scope change (that would save the new state).
+        if is_typedef {
+            self.record_typedef_details(&type_spec, &declarators, decl_addr_space);
         }
-
-        // Register typedef names or shadow them for variable declarations
-        let is_typedef = self.register_local_typedefs(&declarators, decl_addr_space);
+        self.attrs.set_typedef(false);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
         // The declaration's address space is lexical to it: consume it now
@@ -2553,28 +2578,36 @@ impl Parser {
         }
     }
 
-    fn register_typedefs(
+    /// Publish a completed typedef's qualifiers and type for later declarators,
+    /// including parser-side sizeof in attributes. Name binding/scope logging
+    /// happens separately, before the initializer.
+    fn record_typedef_details(
         &mut self,
         type_spec: &TypeSpecifier,
         declarators: &[InitDeclarator],
         decl_space: AddressSpace,
     ) {
-        if self.attrs.parsing_typedef() {
-            self.record_typedef_object_spaces(declarators, decl_space);
-            for decl in declarators {
-                if !decl.name.is_empty() {
-                    self.typedefs.insert(decl.name.clone());
-                    // Record the typedef's full type (base spec + derived
-                    // pointer/array layers) so parse-time constant
-                    // expressions can resolve sizeof(typedef) — required for
-                    // e.g. `__attribute__((vector_size(16 * sizeof(int64_t))))`.
-                    self.typedef_type_specs.insert(
-                        decl.name.clone(),
-                        self.typedef_spec_with_derived(type_spec.clone(), &decl.derived),
-                    );
+        self.record_typedef_object_spaces(declarators, decl_space);
+        // Keep block-local types sema-deferred, as before: a spelling-only
+        // alias cache cannot represent which outer binding a local typedef
+        // captured once another declaration shadows that spelling.
+        if self.block_depth > 0 {
+            return;
+        }
+        for decl in declarators {
+            if !decl.name.is_empty() {
+                // A legal same-type redeclaration must not turn T -> int into
+                // the self-cycle T -> T in the parser's size lookup.
+                if decl.derived.is_empty()
+                    && matches!(type_spec, TypeSpecifier::TypedefName(name) if name == &decl.name)
+                {
+                    continue;
                 }
+                self.typedef_type_specs.insert(
+                    decl.name.clone(),
+                    self.typedef_spec_with_derived(type_spec.clone(), &decl.derived),
+                );
             }
-            self.attrs.set_typedef(false);
         }
     }
 
@@ -2643,6 +2676,109 @@ impl Parser {
             message,
             span: assert_span,
         }
+    }
+}
+
+#[cfg(test)]
+mod declarator_scope_tests {
+    use super::*;
+    use crate::frontend::lexer::Lexer;
+
+    fn parse(source: &str) -> (TranslationUnit, Parser) {
+        let mut parser = Parser::new(Lexer::new(source, 0).tokenize());
+        let unit = parser.parse();
+        assert_eq!(parser.error_count, 0, "{source}");
+        (unit, parser)
+    }
+
+    fn initializer<'a>(unit: &'a TranslationUnit, name: &str) -> &'a Expr {
+        let function = unit
+            .decls
+            .iter()
+            .find_map(|decl| match decl {
+                ExternalDecl::FunctionDef(function) => Some(function),
+                _ => None,
+            })
+            .expect("function");
+        let decl = function
+            .body
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                BlockItem::Declaration(decl) => Some(decl),
+                _ => None,
+            })
+            .flat_map(|decl| &decl.declarators)
+            .find(|decl| decl.name == name)
+            .expect("declarator");
+        match decl.init.as_ref().expect("initializer") {
+            Initializer::Expr(expr) => expr,
+            _ => panic!("expression initializer"),
+        }
+    }
+
+    #[test]
+    fn own_and_later_initializers_see_the_object_not_the_typedef() {
+        let (unit, parser) = parse(
+            "typedef char T; int f(void) { int before = sizeof(T), T = sizeof(T), after = sizeof(T), sub = (T) - 1; return 0; }",
+        );
+        assert!(
+            matches!(initializer(&unit, "before"), Expr::Sizeof(arg, _) if matches!(**arg, SizeofArg::Type(_)))
+        );
+        for name in ["T", "after"] {
+            assert!(
+                matches!(initializer(&unit, name), Expr::Sizeof(arg, _) if matches!(**arg, SizeofArg::Expr(_)))
+            );
+        }
+        assert!(matches!(
+            initializer(&unit, "sub"),
+            Expr::BinaryOp(BinOp::Sub, ..)
+        ));
+        assert!(parser.typedefs.contains("T"));
+        assert!(!parser.shadowed_typedefs.contains("T"));
+    }
+
+    #[test]
+    fn inferred_initializer_still_sees_the_outer_typedef() {
+        let (unit, _) =
+            parse("typedef long long T; int f(void) { __auto_type T = (T)7; return T; }");
+        assert!(matches!(initializer(&unit, "T"), Expr::Cast(..)));
+    }
+
+    #[test]
+    fn typedef_is_visible_to_sibling_casts_and_function_parameters() {
+        let (_, parser) = parse(
+            "typedef int A, B[(A)2.5 + 1], (*F)(A); void f(void) { typedef double X, (*Y)(X); }",
+        );
+        for name in ["A", "B", "F"] {
+            assert!(parser.typedefs.contains(name));
+        }
+        assert!(!parser.typedefs.contains("X"));
+        assert!(!parser.typedefs.contains("Y"));
+        assert!(parser.typedef_scope_log.is_empty());
+    }
+
+    #[test]
+    fn local_alias_size_information_stays_sema_deferred() {
+        let (_, parser) = parse(
+            "typedef int T; void f(void) { { typedef volatile long long T, U; } T restored; }",
+        );
+        assert!(matches!(
+            parser.typedef_type_specs.get("T"),
+            Some(TypeSpecifier::Int)
+        ));
+        assert!(!parser.typedef_base_volatile.contains("T"));
+        assert!(!parser.typedefs.contains("U"));
+        assert!(parser.typedef_scope_log.is_empty());
+    }
+
+    #[test]
+    fn same_type_redeclaration_does_not_create_a_size_lookup_cycle() {
+        let (_, parser) = parse("typedef int T; typedef T T;");
+        assert!(matches!(
+            parser.typedef_type_specs.get("T"),
+            Some(TypeSpecifier::Int)
+        ));
     }
 }
 

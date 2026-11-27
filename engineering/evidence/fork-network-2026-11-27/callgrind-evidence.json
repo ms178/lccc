@@ -1,0 +1,4185 @@
+{
+  "before": {
+    "index": {
+      "complete": true,
+      "metric": "bounded whole-program simulated Ir; not runtime",
+      "selected": [
+        "expat_utf8_content",
+        "glibc_dl_hash",
+        "gzip_longest_match",
+        "sqlite_vdbe_serial",
+        "zlib_ng_adler32_combine"
+      ],
+      "results": {
+        "zlib_ng_adler32_combine": {
+          "flags": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=10000",
+          "metrics": {
+            "conditional_mispredicts": [
+              6283,
+              6283
+            ],
+            "d1_misses": [
+              1898,
+              1898
+            ],
+            "i1_misses": [
+              1327,
+              1327
+            ],
+            "indirect_mispredicts": [
+              202,
+              202
+            ],
+            "ir_mine": 13881341,
+            "ir_ratio": 1.0,
+            "ir_ref": 13881341,
+            "ll_misses": [
+              2871,
+              2871
+            ]
+          },
+          "manifest": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/manifest.json"
+        },
+        "gzip_longest_match": {
+          "flags": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DWINDOW_SIZE=4096 -DPASSES=1",
+          "metrics": {
+            "conditional_mispredicts": [
+              5231,
+              5231
+            ],
+            "d1_misses": [
+              4558,
+              4558
+            ],
+            "i1_misses": [
+              1337,
+              1337
+            ],
+            "indirect_mispredicts": [
+              205,
+              205
+            ],
+            "ir_mine": 421484,
+            "ir_ratio": 1.0,
+            "ir_ref": 421484,
+            "ll_misses": [
+              5238,
+              5238
+            ]
+          },
+          "manifest": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/manifest.json"
+        },
+        "expat_utf8_content": {
+          "flags": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDOC_CAP=16384 -DPASSES=4",
+          "metrics": {
+            "conditional_mispredicts": [
+              14263,
+              14263
+            ],
+            "d1_misses": [
+              7136,
+              7136
+            ],
+            "i1_misses": [
+              1348,
+              1348
+            ],
+            "indirect_mispredicts": [
+              98804,
+              98804
+            ],
+            "ir_mine": 4585907,
+            "ir_ratio": 1.0,
+            "ir_ref": 4585907,
+            "ll_misses": [
+              3904,
+              3904
+            ]
+          },
+          "manifest": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/manifest.json"
+        },
+        "sqlite_vdbe_serial": {
+          "flags": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNUM_RECORDS=1024 -DPASSES=2",
+          "metrics": {
+            "conditional_mispredicts": [
+              42806,
+              42806
+            ],
+            "d1_misses": [
+              6597,
+              6597
+            ],
+            "i1_misses": [
+              1335,
+              1335
+            ],
+            "indirect_mispredicts": [
+              44441,
+              44441
+            ],
+            "ir_mine": 3120509,
+            "ir_ratio": 1.0,
+            "ir_ref": 3120509,
+            "ll_misses": [
+              4009,
+              4009
+            ]
+          },
+          "manifest": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/manifest.json"
+        },
+        "glibc_dl_hash": {
+          "flags": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNSYMS=1024 -DNQUERIES=2048 -DPASSES=2",
+          "metrics": {
+            "conditional_mispredicts": [
+              22974,
+              22974
+            ],
+            "d1_misses": [
+              5867,
+              5867
+            ],
+            "i1_misses": [
+              1324,
+              1324
+            ],
+            "indirect_mispredicts": [
+              204,
+              204
+            ],
+            "ir_mine": 3698383,
+            "ir_ratio": 1.0,
+            "ir_ref": 3698383,
+            "ll_misses": [
+              3811,
+              3811
+            ]
+          },
+          "manifest": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/manifest.json"
+        }
+      },
+      "failures": [],
+      "worst_first": [
+        "zlib_ng_adler32_combine",
+        "gzip_longest_match",
+        "expat_utf8_content",
+        "sqlite_vdbe_serial",
+        "glibc_dl_hash"
+      ]
+    },
+    "manifests": {
+      "sqlite_vdbe_serial": {
+        "comparable": 1,
+        "compiler_environment": {
+          "LCCC_AGENT_CACHE_PREFIX": "/tmp/lccc-research/toolchains",
+          "LCCC_BUILD_JOBS": "2",
+          "LCCC_QEMU_PREFIX": "/tmp/lccc-research/toolchains/qemu-user-11.1.3-x86_64",
+          "LCCC_SWAPFILE": "/tmp/lccc-research/lccc.swap"
+        },
+        "failures": {},
+        "geomean_ir_mine_over_ref": 1.0,
+        "geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "33554432,16,64"
+        },
+        "geometry_env_overrides": {},
+        "heavy_opt_in": false,
+        "host": {
+          "libc": [
+            "glibc",
+            "2.36"
+          ],
+          "machine": "x86_64",
+          "platform": "Linux-6.1.189+-x86_64-with-glibc2.36"
+        },
+        "include": "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "instrument_timeout_s": 60,
+        "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+        "opt": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNUM_RECORDS=1024 -DPASSES=2",
+        "opt_tokens": [
+          "-std=gnu17",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DNUM_RECORDS=1024",
+          "-DPASSES=2"
+        ],
+        "paths": {
+          "equal_byte_length": true,
+          "mine": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa",
+          "ref": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb"
+        },
+        "results": {
+          "sqlite_vdbe_serial": {
+            "binary_sha256": {
+              "mine": "b834e7c0cdcf37e95d922a149baffd05666aed2a4d7fcc7aa2e5bf5f5b84e664",
+              "ref": "b834e7c0cdcf37e95d922a149baffd05666aed2a4d7fcc7aa2e5bf5f5b84e664"
+            },
+            "compilation": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DNUM_RECORDS=1024",
+                  "-DPASSES=2",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/sqlite_vdbe_serial.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa/sqlite_vdbe_serial"
+                ],
+                "process": {
+                  "elapsed": 0.10956579999992755,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.compile.json",
+                  "sha256": "50590eba758b4bd3316be5d70fb7c158fb4dc3f568cc8e754867927927112e75"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/baseline/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DNUM_RECORDS=1024",
+                  "-DPASSES=2",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/sqlite_vdbe_serial.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb/sqlite_vdbe_serial"
+                ],
+                "process": {
+                  "elapsed": 0.10416156899964335,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.compile.json",
+                  "sha256": "1f7c244a0de973b976cdc8d6c71af8e7fd2cf6b94a9086f5207f598147c66e2a"
+                }
+              }
+            },
+            "correctness": {
+              "mine": {
+                "elapsed": 0.002281700000366982,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "6dce10992561ae7be8335295877c61477d889e06894e837b1f7868fa994794cc"
+              },
+              "ref": {
+                "elapsed": 0.0017997479999394272,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "6dce10992561ae7be8335295877c61477d889e06894e837b1f7868fa994794cc"
+              }
+            },
+            "instrumentation": {
+              "mine": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.cg",
+                  "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa/sqlite_vdbe_serial"
+                ],
+                "counter_file_sha256": "b2efac8da537b292e10719969340882adde9db40330663391c0c0aab6a239b89",
+                "process": {
+                  "elapsed": 0.3187040349998824,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26303-- warning: L3 cache found, using its data for the LL simulation.\n--26303-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26303-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "69c6c1794cf49c8832b03a984721acd8189a883b8ca5845de04ecf00ac8a78f0",
+                  "stdout_sha256": "6dce10992561ae7be8335295877c61477d889e06894e837b1f7868fa994794cc"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.cg.stdout"
+                }
+              },
+              "ref": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.cg",
+                  "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb/sqlite_vdbe_serial"
+                ],
+                "counter_file_sha256": "307b5c56c25b3f053ad57aa4f971a9aa96e8b7ae53524d357e74e982c55ff0ad",
+                "process": {
+                  "elapsed": 0.3116317640001398,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26304-- warning: L3 cache found, using its data for the LL simulation.\n--26304-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26304-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "1cc3b5899a2e9fefc3cacabef0f5e5789ad55219b3b15996462c4e0debc5ade6",
+                  "stdout_sha256": "6dce10992561ae7be8335295877c61477d889e06894e837b1f7868fa994794cc"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.cg.stdout"
+                }
+              }
+            },
+            "metrics": {
+              "conditional_mispredicts": [
+                42806,
+                42806
+              ],
+              "d1_misses": [
+                6597,
+                6597
+              ],
+              "i1_misses": [
+                1335,
+                1335
+              ],
+              "indirect_mispredicts": [
+                44441,
+                44441
+              ],
+              "ir_mine": 3120509,
+              "ir_ratio": 1.0,
+              "ir_ref": 3120509,
+              "ll_misses": [
+                4009,
+                4009
+              ]
+            },
+            "mine": {
+              "Bc": 455267,
+              "Bcm": 42806,
+              "Bi": 44629,
+              "Bim": 44441,
+              "D1mr": 4736,
+              "D1mw": 1861,
+              "DLmr": 917,
+              "DLmw": 1784,
+              "Dr": 567841,
+              "Dw": 323893,
+              "I1mr": 1335,
+              "ILmr": 1308,
+              "Ir": 3120509
+            },
+            "native": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa/sqlite_vdbe_serial"
+                ],
+                "process": {
+                  "elapsed": 0.002281700000366982,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "6dce10992561ae7be8335295877c61477d889e06894e837b1f7868fa994794cc"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.native.json",
+                  "sha256": "e43d28d1d1f3f964a751a857b55bcec6828dab96074a98c351ba6c389d78defa"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb/sqlite_vdbe_serial"
+                ],
+                "process": {
+                  "elapsed": 0.0017997479999394272,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "6dce10992561ae7be8335295877c61477d889e06894e837b1f7868fa994794cc"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.native.json",
+                  "sha256": "29e09755372d547989b0955d6c4e15a4c8e0d181ddc1b56d65b63eb651a141d0"
+                }
+              }
+            },
+            "ref": {
+              "Bc": 455267,
+              "Bcm": 42806,
+              "Bi": 44629,
+              "Bim": 44441,
+              "D1mr": 4736,
+              "D1mw": 1861,
+              "DLmr": 917,
+              "DLmw": 1784,
+              "Dr": 567841,
+              "Dw": 323893,
+              "I1mr": 1335,
+              "ILmr": 1308,
+              "Ir": 3120509
+            },
+            "source_sha256": "716c4164550d809dd2ca8af7c37897fe8e66296f28972e890326228931affc17",
+            "status": "COMPARABLE-SIMULATION",
+            "workload": {
+              "contract": "registered",
+              "effective_opt_tokens": [
+                "-std=gnu17",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-Wl,--no-as-needed",
+                "-lm",
+                "-DNUM_RECORDS=1024",
+                "-DPASSES=2"
+              ],
+              "overridden_registry_macros": [],
+              "registry_flags": [],
+              "registry_id": "sqlite_vdbe_serial",
+              "source": "/tmp/lccc-research/lccc/tests/benchmark/programs/sqlite_vdbe_serial.c"
+            }
+          }
+        },
+        "schema": "lccc-callgrind-ab-v2",
+        "selected": 1,
+        "tools": {
+          "include_discovery": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "mine": {
+            "command": [
+              "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+            "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "ref": {
+            "command": [
+              "/tmp/lccc-research/evidence/baseline/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/evidence/baseline/lccc-x86",
+            "sha256": "0ba6c80ad8d208c0e2c51dfa6999ff3bfe8fec3d0c14b2bfd78bf676f86b3949",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "valgrind": {
+            "command": [
+              "valgrind"
+            ],
+            "executable": "/usr/bin/valgrind",
+            "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+            "version": "valgrind-3.19.0"
+          }
+        }
+      },
+      "glibc_dl_hash": {
+        "comparable": 1,
+        "compiler_environment": {
+          "LCCC_AGENT_CACHE_PREFIX": "/tmp/lccc-research/toolchains",
+          "LCCC_BUILD_JOBS": "2",
+          "LCCC_QEMU_PREFIX": "/tmp/lccc-research/toolchains/qemu-user-11.1.3-x86_64",
+          "LCCC_SWAPFILE": "/tmp/lccc-research/lccc.swap"
+        },
+        "failures": {},
+        "geomean_ir_mine_over_ref": 1.0,
+        "geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "33554432,16,64"
+        },
+        "geometry_env_overrides": {},
+        "heavy_opt_in": false,
+        "host": {
+          "libc": [
+            "glibc",
+            "2.36"
+          ],
+          "machine": "x86_64",
+          "platform": "Linux-6.1.189+-x86_64-with-glibc2.36"
+        },
+        "include": "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "instrument_timeout_s": 60,
+        "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+        "opt": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNSYMS=1024 -DNQUERIES=2048 -DPASSES=2",
+        "opt_tokens": [
+          "-std=gnu17",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DNSYMS=1024",
+          "-DNQUERIES=2048",
+          "-DPASSES=2"
+        ],
+        "paths": {
+          "equal_byte_length": true,
+          "mine": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa",
+          "ref": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb"
+        },
+        "results": {
+          "glibc_dl_hash": {
+            "binary_sha256": {
+              "mine": "5ba3bc0c73490dec63566ef4df851eb5d6b1d4b6e5179434bf862d7f57522b32",
+              "ref": "5ba3bc0c73490dec63566ef4df851eb5d6b1d4b6e5179434bf862d7f57522b32"
+            },
+            "compilation": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DNSYMS=1024",
+                  "-DNQUERIES=2048",
+                  "-DPASSES=2",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/glibc_dl_hash.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa/glibc_dl_hash"
+                ],
+                "process": {
+                  "elapsed": 0.09889665499986222,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa/glibc_dl_hash.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa/glibc_dl_hash.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa/glibc_dl_hash.compile.json",
+                  "sha256": "dd3b94d1f3b4568837abf3357aff7901397e385663fb6f09c056dc43cbc1a03a"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/baseline/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DNSYMS=1024",
+                  "-DNQUERIES=2048",
+                  "-DPASSES=2",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/glibc_dl_hash.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb/glibc_dl_hash"
+                ],
+                "process": {
+                  "elapsed": 0.0983366370001022,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb/glibc_dl_hash.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb/glibc_dl_hash.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb/glibc_dl_hash.compile.json",
+                  "sha256": "ab619d8c95502eb5172779875229ab30c714bb175572e6ee199a9d19aa277a99"
+                }
+              }
+            },
+            "correctness": {
+              "mine": {
+                "elapsed": 0.00201420000030339,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "2847d7f26f20853f99a55e77c203e90416e82d102eacdc5c1638c1bd168cf7b0"
+              },
+              "ref": {
+                "elapsed": 0.0018985819997396902,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "2847d7f26f20853f99a55e77c203e90416e82d102eacdc5c1638c1bd168cf7b0"
+              }
+            },
+            "instrumentation": {
+              "mine": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa/glibc_dl_hash.cg",
+                  "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa/glibc_dl_hash"
+                ],
+                "counter_file_sha256": "80494527bd941b5db122e5d592bfa0359523fc26407d73c037bfb414afdb2cbd",
+                "process": {
+                  "elapsed": 0.3046488869999848,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26323-- warning: L3 cache found, using its data for the LL simulation.\n--26323-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26323-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "9a7a5976eb825e76d73bb28180fd4ec1ce94d18ee33c4113378489ec92097e54",
+                  "stdout_sha256": "2847d7f26f20853f99a55e77c203e90416e82d102eacdc5c1638c1bd168cf7b0"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa/glibc_dl_hash.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa/glibc_dl_hash.cg.stdout"
+                }
+              },
+              "ref": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb/glibc_dl_hash.cg",
+                  "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb/glibc_dl_hash"
+                ],
+                "counter_file_sha256": "bbad2f49046f349d0bcd2c6b2e0422e869abe5ad25731960a212e71029865936",
+                "process": {
+                  "elapsed": 0.30868553799973597,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26324-- warning: L3 cache found, using its data for the LL simulation.\n--26324-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26324-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "bca67f143cea6a57a18a140e465a4853506a74e735d2624f0bc23a874f0df43b",
+                  "stdout_sha256": "2847d7f26f20853f99a55e77c203e90416e82d102eacdc5c1638c1bd168cf7b0"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb/glibc_dl_hash.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb/glibc_dl_hash.cg.stdout"
+                }
+              }
+            },
+            "metrics": {
+              "conditional_mispredicts": [
+                22974,
+                22974
+              ],
+              "d1_misses": [
+                5867,
+                5867
+              ],
+              "i1_misses": [
+                1324,
+                1324
+              ],
+              "indirect_mispredicts": [
+                204,
+                204
+              ],
+              "ir_mine": 3698383,
+              "ir_ratio": 1.0,
+              "ir_ref": 3698383,
+              "ll_misses": [
+                3811,
+                3811
+              ]
+            },
+            "mine": {
+              "Bc": 421761,
+              "Bcm": 22974,
+              "Bi": 391,
+              "Bim": 204,
+              "D1mr": 4187,
+              "D1mw": 1680,
+              "DLmr": 911,
+              "DLmw": 1603,
+              "Dr": 394208,
+              "Dw": 89432,
+              "I1mr": 1324,
+              "ILmr": 1297,
+              "Ir": 3698383
+            },
+            "native": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa/glibc_dl_hash"
+                ],
+                "process": {
+                  "elapsed": 0.00201420000030339,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "2847d7f26f20853f99a55e77c203e90416e82d102eacdc5c1638c1bd168cf7b0"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa/glibc_dl_hash.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa/glibc_dl_hash.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/aa/glibc_dl_hash.native.json",
+                  "sha256": "725cbb3584d986867a16970b2464815d452abf29c5e01faa1632950f9bfc45b4"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb/glibc_dl_hash"
+                ],
+                "process": {
+                  "elapsed": 0.0018985819997396902,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "2847d7f26f20853f99a55e77c203e90416e82d102eacdc5c1638c1bd168cf7b0"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb/glibc_dl_hash.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb/glibc_dl_hash.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/glibc_dl_hash/bb/glibc_dl_hash.native.json",
+                  "sha256": "ef4e60f7628d3a401caa4be3af2ac0d913679eba2bda836f30644eabb6fc893b"
+                }
+              }
+            },
+            "ref": {
+              "Bc": 421761,
+              "Bcm": 22974,
+              "Bi": 391,
+              "Bim": 204,
+              "D1mr": 4187,
+              "D1mw": 1680,
+              "DLmr": 911,
+              "DLmw": 1603,
+              "Dr": 394208,
+              "Dw": 89432,
+              "I1mr": 1324,
+              "ILmr": 1297,
+              "Ir": 3698383
+            },
+            "source_sha256": "a42905655da8210823680569d084dc0e14521d8ab8f61e299fea7b0afda0f38c",
+            "status": "COMPARABLE-SIMULATION",
+            "workload": {
+              "contract": "registered",
+              "effective_opt_tokens": [
+                "-std=gnu17",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-Wl,--no-as-needed",
+                "-lm",
+                "-DNSYMS=1024",
+                "-DNQUERIES=2048",
+                "-DPASSES=2"
+              ],
+              "overridden_registry_macros": [],
+              "registry_flags": [],
+              "registry_id": "glibc_dl_hash",
+              "source": "/tmp/lccc-research/lccc/tests/benchmark/programs/glibc_dl_hash.c"
+            }
+          }
+        },
+        "schema": "lccc-callgrind-ab-v2",
+        "selected": 1,
+        "tools": {
+          "include_discovery": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "mine": {
+            "command": [
+              "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+            "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "ref": {
+            "command": [
+              "/tmp/lccc-research/evidence/baseline/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/evidence/baseline/lccc-x86",
+            "sha256": "0ba6c80ad8d208c0e2c51dfa6999ff3bfe8fec3d0c14b2bfd78bf676f86b3949",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "valgrind": {
+            "command": [
+              "valgrind"
+            ],
+            "executable": "/usr/bin/valgrind",
+            "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+            "version": "valgrind-3.19.0"
+          }
+        }
+      },
+      "zlib_ng_adler32_combine": {
+        "comparable": 1,
+        "compiler_environment": {
+          "LCCC_AGENT_CACHE_PREFIX": "/tmp/lccc-research/toolchains",
+          "LCCC_BUILD_JOBS": "2",
+          "LCCC_QEMU_PREFIX": "/tmp/lccc-research/toolchains/qemu-user-11.1.3-x86_64",
+          "LCCC_SWAPFILE": "/tmp/lccc-research/lccc.swap"
+        },
+        "failures": {},
+        "geomean_ir_mine_over_ref": 1.0,
+        "geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "33554432,16,64"
+        },
+        "geometry_env_overrides": {},
+        "heavy_opt_in": false,
+        "host": {
+          "libc": [
+            "glibc",
+            "2.36"
+          ],
+          "machine": "x86_64",
+          "platform": "Linux-6.1.189+-x86_64-with-glibc2.36"
+        },
+        "include": "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "instrument_timeout_s": 60,
+        "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+        "opt": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=10000",
+        "opt_tokens": [
+          "-std=gnu17",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=10000"
+        ],
+        "paths": {
+          "equal_byte_length": true,
+          "mine": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa",
+          "ref": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb"
+        },
+        "results": {
+          "zlib_ng_adler32_combine": {
+            "binary_sha256": {
+              "mine": "17f4c6d191991429611878d252a15fe59c40d68665e6b8b252e28509b0294328",
+              "ref": "17f4c6d191991429611878d252a15fe59c40d68665e6b8b252e28509b0294328"
+            },
+            "compilation": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DPASSES=10000",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine"
+                ],
+                "process": {
+                  "elapsed": 0.08664596099970368,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.compile.json",
+                  "sha256": "cb2f7251cc7db9980ecb8caf5da4ef9f43b2e8eb47884352898a8741213a2b44"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/baseline/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DPASSES=10000",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine"
+                ],
+                "process": {
+                  "elapsed": 0.0866256929998599,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.compile.json",
+                  "sha256": "d58b10978b0ac176416ed6d90e700740fcbe787b1700c0bd97f66244bbbe21e3"
+                }
+              }
+            },
+            "correctness": {
+              "mine": {
+                "elapsed": 0.0030673020000904216,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c"
+              },
+              "ref": {
+                "elapsed": 0.003013587000168627,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c"
+              }
+            },
+            "instrumentation": {
+              "mine": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.cg",
+                  "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine"
+                ],
+                "counter_file_sha256": "f163a347519416597a69e0574b5f500ea951b81259da14a7c2067b55d494f355",
+                "process": {
+                  "elapsed": 0.4121962720000738,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26255-- warning: L3 cache found, using its data for the LL simulation.\n--26255-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26255-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "9e1d65d0f4e577b9c6c5216d2d87aa4b7696de22ba6b72bb72731ee5076a5abd",
+                  "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.cg.stdout"
+                }
+              },
+              "ref": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.cg",
+                  "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine"
+                ],
+                "counter_file_sha256": "711f750ced32deccc1ffdaecf0c001cea2a294764b1e9e62c97d1ee59ca602be",
+                "process": {
+                  "elapsed": 0.36540709099972446,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26256-- warning: L3 cache found, using its data for the LL simulation.\n--26256-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26256-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "b16f553cfe5b1ab77ab35fcd0d2fd5b09b36ed58210f03b644f0f607fd097800",
+                  "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.cg.stdout"
+                }
+              }
+            },
+            "metrics": {
+              "conditional_mispredicts": [
+                6283,
+                6283
+              ],
+              "d1_misses": [
+                1898,
+                1898
+              ],
+              "i1_misses": [
+                1327,
+                1327
+              ],
+              "indirect_mispredicts": [
+                202,
+                202
+              ],
+              "ir_mine": 13881341,
+              "ir_ratio": 1.0,
+              "ir_ref": 13881341,
+              "ll_misses": [
+                2871,
+                2871
+              ]
+            },
+            "mine": {
+              "Bc": 1144011,
+              "Bcm": 6283,
+              "Bi": 391,
+              "Bim": 202,
+              "D1mr": 1201,
+              "D1mw": 697,
+              "DLmr": 913,
+              "DLmw": 658,
+              "Dr": 1145199,
+              "Dw": 28672,
+              "I1mr": 1327,
+              "ILmr": 1300,
+              "Ir": 13881341
+            },
+            "native": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine"
+                ],
+                "process": {
+                  "elapsed": 0.0030673020000904216,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.native.json",
+                  "sha256": "3ea14b1d50b69f6c82df813917deec6c576f61c369b6314f2895e0c23a0d70ca"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine"
+                ],
+                "process": {
+                  "elapsed": 0.003013587000168627,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.native.json",
+                  "sha256": "3dea4c5170e406c040c7c7293bb034bd773a1821b8d899a0b27720aaa66333b3"
+                }
+              }
+            },
+            "ref": {
+              "Bc": 1144011,
+              "Bcm": 6283,
+              "Bi": 391,
+              "Bim": 202,
+              "D1mr": 1201,
+              "D1mw": 697,
+              "DLmr": 913,
+              "DLmw": 658,
+              "Dr": 1145199,
+              "Dw": 28672,
+              "I1mr": 1327,
+              "ILmr": 1300,
+              "Ir": 13881341
+            },
+            "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+            "status": "COMPARABLE-SIMULATION",
+            "workload": {
+              "contract": "registered",
+              "effective_opt_tokens": [
+                "-std=gnu17",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-Wl,--no-as-needed",
+                "-lm",
+                "-DPASSES=10000"
+              ],
+              "overridden_registry_macros": [],
+              "registry_flags": [],
+              "registry_id": "zlib_ng_adler32_combine",
+              "source": "/tmp/lccc-research/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c"
+            }
+          }
+        },
+        "schema": "lccc-callgrind-ab-v2",
+        "selected": 1,
+        "tools": {
+          "include_discovery": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "mine": {
+            "command": [
+              "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+            "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "ref": {
+            "command": [
+              "/tmp/lccc-research/evidence/baseline/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/evidence/baseline/lccc-x86",
+            "sha256": "0ba6c80ad8d208c0e2c51dfa6999ff3bfe8fec3d0c14b2bfd78bf676f86b3949",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "valgrind": {
+            "command": [
+              "valgrind"
+            ],
+            "executable": "/usr/bin/valgrind",
+            "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+            "version": "valgrind-3.19.0"
+          }
+        }
+      },
+      "gzip_longest_match": {
+        "comparable": 1,
+        "compiler_environment": {
+          "LCCC_AGENT_CACHE_PREFIX": "/tmp/lccc-research/toolchains",
+          "LCCC_BUILD_JOBS": "2",
+          "LCCC_QEMU_PREFIX": "/tmp/lccc-research/toolchains/qemu-user-11.1.3-x86_64",
+          "LCCC_SWAPFILE": "/tmp/lccc-research/lccc.swap"
+        },
+        "failures": {},
+        "geomean_ir_mine_over_ref": 1.0,
+        "geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "33554432,16,64"
+        },
+        "geometry_env_overrides": {},
+        "heavy_opt_in": false,
+        "host": {
+          "libc": [
+            "glibc",
+            "2.36"
+          ],
+          "machine": "x86_64",
+          "platform": "Linux-6.1.189+-x86_64-with-glibc2.36"
+        },
+        "include": "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "instrument_timeout_s": 60,
+        "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+        "opt": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DWINDOW_SIZE=4096 -DPASSES=1",
+        "opt_tokens": [
+          "-std=gnu17",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DWINDOW_SIZE=4096",
+          "-DPASSES=1"
+        ],
+        "paths": {
+          "equal_byte_length": true,
+          "mine": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa",
+          "ref": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb"
+        },
+        "results": {
+          "gzip_longest_match": {
+            "binary_sha256": {
+              "mine": "5ed35cad44bce2a535da09f854046ef804269886b8c088eaa211079024bdb18d",
+              "ref": "5ed35cad44bce2a535da09f854046ef804269886b8c088eaa211079024bdb18d"
+            },
+            "compilation": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DWINDOW_SIZE=4096",
+                  "-DPASSES=1",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/gzip_longest_match.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa/gzip_longest_match"
+                ],
+                "process": {
+                  "elapsed": 0.18078386100023636,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa/gzip_longest_match.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa/gzip_longest_match.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa/gzip_longest_match.compile.json",
+                  "sha256": "479c36663f5f049f0ebccba92b53d541bdff4c9c4e357dcb82dc44b53473739c"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/baseline/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DWINDOW_SIZE=4096",
+                  "-DPASSES=1",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/gzip_longest_match.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb/gzip_longest_match"
+                ],
+                "process": {
+                  "elapsed": 0.16910870500032615,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb/gzip_longest_match.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb/gzip_longest_match.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb/gzip_longest_match.compile.json",
+                  "sha256": "366a77ab12fbf474413b1a167a4c04c25034584317888c754b37e19806b8370c"
+                }
+              }
+            },
+            "correctness": {
+              "mine": {
+                "elapsed": 0.0016738489998715522,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "7a641c4de87daa9cc61d1e209cdd1313a84fdf1649e67e8c8bae38f86f60c9f5"
+              },
+              "ref": {
+                "elapsed": 0.001601589999609132,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "7a641c4de87daa9cc61d1e209cdd1313a84fdf1649e67e8c8bae38f86f60c9f5"
+              }
+            },
+            "instrumentation": {
+              "mine": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa/gzip_longest_match.cg",
+                  "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa/gzip_longest_match"
+                ],
+                "counter_file_sha256": "9b3f156106abae3a65f88150aa824fb730dd12e137c1b50449524d4022fc5bcb",
+                "process": {
+                  "elapsed": 0.2851466270003584,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26271-- warning: L3 cache found, using its data for the LL simulation.\n--26271-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26271-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "02c9d53749ad58150e5f1bc1b057f03580c54f93f0af873388e23e35b5aea7d2",
+                  "stdout_sha256": "7a641c4de87daa9cc61d1e209cdd1313a84fdf1649e67e8c8bae38f86f60c9f5"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa/gzip_longest_match.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa/gzip_longest_match.cg.stdout"
+                }
+              },
+              "ref": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb/gzip_longest_match.cg",
+                  "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb/gzip_longest_match"
+                ],
+                "counter_file_sha256": "560cbda3010c83076e41a9229a6b5e8e2c0cb3afe4386dc324a558382f5e2e02",
+                "process": {
+                  "elapsed": 0.27597710100008044,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26272-- warning: L3 cache found, using its data for the LL simulation.\n--26272-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26272-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "e076116ac4d61c56ced3d6a8802838e538f1ce7a41ee6be4c07c9f3d3a7305de",
+                  "stdout_sha256": "7a641c4de87daa9cc61d1e209cdd1313a84fdf1649e67e8c8bae38f86f60c9f5"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb/gzip_longest_match.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb/gzip_longest_match.cg.stdout"
+                }
+              }
+            },
+            "metrics": {
+              "conditional_mispredicts": [
+                5231,
+                5231
+              ],
+              "d1_misses": [
+                4558,
+                4558
+              ],
+              "i1_misses": [
+                1337,
+                1337
+              ],
+              "indirect_mispredicts": [
+                205,
+                205
+              ],
+              "ir_mine": 421484,
+              "ir_ratio": 1.0,
+              "ir_ref": 421484,
+              "ll_misses": [
+                5238,
+                5238
+              ]
+            },
+            "mine": {
+              "Bc": 58474,
+              "Bcm": 5231,
+              "Bi": 406,
+              "Bim": 205,
+              "D1mr": 1424,
+              "D1mw": 3134,
+              "DLmr": 913,
+              "DLmw": 3015,
+              "Dr": 60780,
+              "Dw": 38628,
+              "I1mr": 1337,
+              "ILmr": 1310,
+              "Ir": 421484
+            },
+            "native": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa/gzip_longest_match"
+                ],
+                "process": {
+                  "elapsed": 0.0016738489998715522,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "7a641c4de87daa9cc61d1e209cdd1313a84fdf1649e67e8c8bae38f86f60c9f5"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa/gzip_longest_match.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa/gzip_longest_match.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/aa/gzip_longest_match.native.json",
+                  "sha256": "67591010091730ff0af67ad8b6a2e886c6b198f19fdf517adab05faee9a88abf"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb/gzip_longest_match"
+                ],
+                "process": {
+                  "elapsed": 0.001601589999609132,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "7a641c4de87daa9cc61d1e209cdd1313a84fdf1649e67e8c8bae38f86f60c9f5"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb/gzip_longest_match.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb/gzip_longest_match.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/gzip_longest_match/bb/gzip_longest_match.native.json",
+                  "sha256": "bead0d1f84e25a13c7d925bd143215724b300d1a4c066a7c011b94cba464c836"
+                }
+              }
+            },
+            "ref": {
+              "Bc": 58474,
+              "Bcm": 5231,
+              "Bi": 406,
+              "Bim": 205,
+              "D1mr": 1424,
+              "D1mw": 3134,
+              "DLmr": 913,
+              "DLmw": 3015,
+              "Dr": 60780,
+              "Dw": 38628,
+              "I1mr": 1337,
+              "ILmr": 1310,
+              "Ir": 421484
+            },
+            "source_sha256": "18a7a1d5dc782cbfe623ded7eb4d20bebcf75f3613b301f3306c3ec968a8db2b",
+            "status": "COMPARABLE-SIMULATION",
+            "workload": {
+              "contract": "registered",
+              "effective_opt_tokens": [
+                "-std=gnu17",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-Wl,--no-as-needed",
+                "-lm",
+                "-DWINDOW_SIZE=4096",
+                "-DPASSES=1"
+              ],
+              "overridden_registry_macros": [],
+              "registry_flags": [],
+              "registry_id": "gzip_longest_match",
+              "source": "/tmp/lccc-research/lccc/tests/benchmark/programs/gzip_longest_match.c"
+            }
+          }
+        },
+        "schema": "lccc-callgrind-ab-v2",
+        "selected": 1,
+        "tools": {
+          "include_discovery": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "mine": {
+            "command": [
+              "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+            "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "ref": {
+            "command": [
+              "/tmp/lccc-research/evidence/baseline/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/evidence/baseline/lccc-x86",
+            "sha256": "0ba6c80ad8d208c0e2c51dfa6999ff3bfe8fec3d0c14b2bfd78bf676f86b3949",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "valgrind": {
+            "command": [
+              "valgrind"
+            ],
+            "executable": "/usr/bin/valgrind",
+            "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+            "version": "valgrind-3.19.0"
+          }
+        }
+      },
+      "expat_utf8_content": {
+        "comparable": 1,
+        "compiler_environment": {
+          "LCCC_AGENT_CACHE_PREFIX": "/tmp/lccc-research/toolchains",
+          "LCCC_BUILD_JOBS": "2",
+          "LCCC_QEMU_PREFIX": "/tmp/lccc-research/toolchains/qemu-user-11.1.3-x86_64",
+          "LCCC_SWAPFILE": "/tmp/lccc-research/lccc.swap"
+        },
+        "failures": {},
+        "geomean_ir_mine_over_ref": 1.0,
+        "geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "33554432,16,64"
+        },
+        "geometry_env_overrides": {},
+        "heavy_opt_in": false,
+        "host": {
+          "libc": [
+            "glibc",
+            "2.36"
+          ],
+          "machine": "x86_64",
+          "platform": "Linux-6.1.189+-x86_64-with-glibc2.36"
+        },
+        "include": "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "instrument_timeout_s": 60,
+        "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+        "opt": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDOC_CAP=16384 -DPASSES=4",
+        "opt_tokens": [
+          "-std=gnu17",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DDOC_CAP=16384",
+          "-DPASSES=4"
+        ],
+        "paths": {
+          "equal_byte_length": true,
+          "mine": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa",
+          "ref": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb"
+        },
+        "results": {
+          "expat_utf8_content": {
+            "binary_sha256": {
+              "mine": "36e25a7a2ac7ff5494bce2e4b44eca7ed1f6afee74dc517fa06e3c40aa77f44e",
+              "ref": "36e25a7a2ac7ff5494bce2e4b44eca7ed1f6afee74dc517fa06e3c40aa77f44e"
+            },
+            "compilation": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DDOC_CAP=16384",
+                  "-DPASSES=4",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/expat_utf8_content.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa/expat_utf8_content"
+                ],
+                "process": {
+                  "elapsed": 0.14112383299971043,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa/expat_utf8_content.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa/expat_utf8_content.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa/expat_utf8_content.compile.json",
+                  "sha256": "4ab47c94da7adf56be086cd46c96aa1a21d645a4c016dace259fb003ee86b64f"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/baseline/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DDOC_CAP=16384",
+                  "-DPASSES=4",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/expat_utf8_content.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb/expat_utf8_content"
+                ],
+                "process": {
+                  "elapsed": 0.14469434200009346,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb/expat_utf8_content.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb/expat_utf8_content.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb/expat_utf8_content.compile.json",
+                  "sha256": "a308d166a829da76b5d9eb5461fe10339d7fc4a947b543c0689d5720e42d9aee"
+                }
+              }
+            },
+            "correctness": {
+              "mine": {
+                "elapsed": 0.0026735889996416518,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "020e7bd5953e87636382b57504dc33f584f0054693066badd90cee0db6680d12"
+              },
+              "ref": {
+                "elapsed": 0.0026197939996563946,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "020e7bd5953e87636382b57504dc33f584f0054693066badd90cee0db6680d12"
+              }
+            },
+            "instrumentation": {
+              "mine": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa/expat_utf8_content.cg",
+                  "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa/expat_utf8_content"
+                ],
+                "counter_file_sha256": "999b9333071cbbcf0dde21dc502199c34f375e4d55d499b01791ad8877e3d2a4",
+                "process": {
+                  "elapsed": 0.34049011399974916,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26289-- warning: L3 cache found, using its data for the LL simulation.\n--26289-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26289-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "0cc3d9b5627bc990d1dc425054dae9b057f54c3f9954bde2c537b4ea9d5d74e9",
+                  "stdout_sha256": "020e7bd5953e87636382b57504dc33f584f0054693066badd90cee0db6680d12"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa/expat_utf8_content.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa/expat_utf8_content.cg.stdout"
+                }
+              },
+              "ref": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb/expat_utf8_content.cg",
+                  "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb/expat_utf8_content"
+                ],
+                "counter_file_sha256": "6210c9100cb33b7af310eb81cae1b181ca70d406db07cd24c85402ad5e1134e5",
+                "process": {
+                  "elapsed": 0.33697873599976447,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26290-- warning: L3 cache found, using its data for the LL simulation.\n--26290-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26290-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "9b6ca6ef07460fd87b38e5e192f043ef27e82ad6e8970a23c52978b094fb3312",
+                  "stdout_sha256": "020e7bd5953e87636382b57504dc33f584f0054693066badd90cee0db6680d12"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb/expat_utf8_content.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb/expat_utf8_content.cg.stdout"
+                }
+              }
+            },
+            "metrics": {
+              "conditional_mispredicts": [
+                14263,
+                14263
+              ],
+              "d1_misses": [
+                7136,
+                7136
+              ],
+              "i1_misses": [
+                1348,
+                1348
+              ],
+              "indirect_mispredicts": [
+                98804,
+                98804
+              ],
+              "ir_mine": 4585907,
+              "ir_ratio": 1.0,
+              "ir_ref": 4585907,
+              "ll_misses": [
+                3904,
+                3904
+              ]
+            },
+            "mine": {
+              "Bc": 1020021,
+              "Bcm": 14263,
+              "Bi": 241332,
+              "Bim": 98804,
+              "D1mr": 5392,
+              "D1mw": 1744,
+              "DLmr": 917,
+              "DLmw": 1666,
+              "Dr": 939549,
+              "Dw": 167836,
+              "I1mr": 1348,
+              "ILmr": 1321,
+              "Ir": 4585907
+            },
+            "native": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa/expat_utf8_content"
+                ],
+                "process": {
+                  "elapsed": 0.0026735889996416518,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "020e7bd5953e87636382b57504dc33f584f0054693066badd90cee0db6680d12"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa/expat_utf8_content.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa/expat_utf8_content.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/aa/expat_utf8_content.native.json",
+                  "sha256": "928c3e10b3b17a81ee6d03fea1c88f87d9558065b230911d150de91eadf48573"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb/expat_utf8_content"
+                ],
+                "process": {
+                  "elapsed": 0.0026197939996563946,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "020e7bd5953e87636382b57504dc33f584f0054693066badd90cee0db6680d12"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb/expat_utf8_content.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb/expat_utf8_content.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-before/expat_utf8_content/bb/expat_utf8_content.native.json",
+                  "sha256": "f41d18b69da67c2bed527d52a3369373205f250058fb32275d84942b23984eb0"
+                }
+              }
+            },
+            "ref": {
+              "Bc": 1020021,
+              "Bcm": 14263,
+              "Bi": 241332,
+              "Bim": 98804,
+              "D1mr": 5392,
+              "D1mw": 1744,
+              "DLmr": 917,
+              "DLmw": 1666,
+              "Dr": 939549,
+              "Dw": 167836,
+              "I1mr": 1348,
+              "ILmr": 1321,
+              "Ir": 4585907
+            },
+            "source_sha256": "ca0354de49e7d89029cb24d442ff1f681fa26f5aa9b9fea48c73966e242d3ec2",
+            "status": "COMPARABLE-SIMULATION",
+            "workload": {
+              "contract": "registered",
+              "effective_opt_tokens": [
+                "-std=gnu17",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-Wl,--no-as-needed",
+                "-lm",
+                "-DDOC_CAP=16384",
+                "-DPASSES=4"
+              ],
+              "overridden_registry_macros": [],
+              "registry_flags": [],
+              "registry_id": "expat_utf8_content",
+              "source": "/tmp/lccc-research/lccc/tests/benchmark/programs/expat_utf8_content.c"
+            }
+          }
+        },
+        "schema": "lccc-callgrind-ab-v2",
+        "selected": 1,
+        "tools": {
+          "include_discovery": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "mine": {
+            "command": [
+              "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+            "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "ref": {
+            "command": [
+              "/tmp/lccc-research/evidence/baseline/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/evidence/baseline/lccc-x86",
+            "sha256": "0ba6c80ad8d208c0e2c51dfa6999ff3bfe8fec3d0c14b2bfd78bf676f86b3949",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "valgrind": {
+            "command": [
+              "valgrind"
+            ],
+            "executable": "/usr/bin/valgrind",
+            "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+            "version": "valgrind-3.19.0"
+          }
+        }
+      }
+    }
+  },
+  "gcc": {
+    "index": {
+      "complete": true,
+      "metric": "bounded whole-program simulated Ir; not runtime",
+      "selected": [
+        "expat_utf8_content",
+        "glibc_dl_hash",
+        "gzip_longest_match",
+        "sqlite_vdbe_serial",
+        "zlib_ng_adler32_combine"
+      ],
+      "results": {
+        "zlib_ng_adler32_combine": {
+          "flags": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=10000",
+          "metrics": {
+            "conditional_mispredicts": [
+              6283,
+              6282
+            ],
+            "d1_misses": [
+              1899,
+              1897
+            ],
+            "i1_misses": [
+              1327,
+              1329
+            ],
+            "indirect_mispredicts": [
+              202,
+              202
+            ],
+            "ir_mine": 13881337,
+            "ir_ratio": 0.6485711713305329,
+            "ir_ref": 21402951,
+            "ll_misses": [
+              2874,
+              2876
+            ]
+          },
+          "manifest": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/manifest.json"
+        },
+        "gzip_longest_match": {
+          "flags": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DWINDOW_SIZE=4096 -DPASSES=1",
+          "metrics": {
+            "conditional_mispredicts": [
+              5231,
+              5255
+            ],
+            "d1_misses": [
+              4558,
+              4493
+            ],
+            "i1_misses": [
+              1337,
+              1328
+            ],
+            "indirect_mispredicts": [
+              205,
+              205
+            ],
+            "ir_mine": 421470,
+            "ir_ratio": 1.132715916664875,
+            "ir_ref": 372088,
+            "ll_misses": [
+              5236,
+              5229
+            ]
+          },
+          "manifest": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/manifest.json"
+        },
+        "expat_utf8_content": {
+          "flags": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDOC_CAP=16384 -DPASSES=4",
+          "metrics": {
+            "conditional_mispredicts": [
+              14263,
+              20276
+            ],
+            "d1_misses": [
+              7136,
+              7133
+            ],
+            "i1_misses": [
+              1348,
+              1347
+            ],
+            "indirect_mispredicts": [
+              98804,
+              106800
+            ],
+            "ir_mine": 4585893,
+            "ir_ratio": 1.067590831727603,
+            "ir_ref": 4295553,
+            "ll_misses": [
+              3902,
+              3901
+            ]
+          },
+          "manifest": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/manifest.json"
+        },
+        "sqlite_vdbe_serial": {
+          "flags": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNUM_RECORDS=1024 -DPASSES=2",
+          "metrics": {
+            "conditional_mispredicts": [
+              42806,
+              24326
+            ],
+            "d1_misses": [
+              6598,
+              6597
+            ],
+            "i1_misses": [
+              1335,
+              1330
+            ],
+            "indirect_mispredicts": [
+              44441,
+              59188
+            ],
+            "ir_mine": 3120495,
+            "ir_ratio": 1.3026166335289593,
+            "ir_ref": 2395559,
+            "ll_misses": [
+              4007,
+              4006
+            ]
+          },
+          "manifest": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/manifest.json"
+        },
+        "glibc_dl_hash": {
+          "flags": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNSYMS=1024 -DNQUERIES=2048 -DPASSES=2",
+          "metrics": {
+            "conditional_mispredicts": [
+              22974,
+              23119
+            ],
+            "d1_misses": [
+              5866,
+              5864
+            ],
+            "i1_misses": [
+              1322,
+              1323
+            ],
+            "indirect_mispredicts": [
+              204,
+              204
+            ],
+            "ir_mine": 3698355,
+            "ir_ratio": 1.0543689104493952,
+            "ir_ref": 3507648,
+            "ll_misses": [
+              3809,
+              3812
+            ]
+          },
+          "manifest": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/manifest.json"
+        }
+      },
+      "failures": [],
+      "worst_first": [
+        "sqlite_vdbe_serial",
+        "gzip_longest_match",
+        "expat_utf8_content",
+        "glibc_dl_hash",
+        "zlib_ng_adler32_combine"
+      ]
+    },
+    "manifests": {
+      "sqlite_vdbe_serial": {
+        "comparable": 1,
+        "compiler_environment": {
+          "LCCC_AGENT_CACHE_PREFIX": "/tmp/lccc-research/toolchains",
+          "LCCC_BUILD_JOBS": "2",
+          "LCCC_QEMU_PREFIX": "/tmp/lccc-research/toolchains/qemu-user-11.1.3-x86_64",
+          "LCCC_SWAPFILE": "/tmp/lccc-research/lccc.swap"
+        },
+        "failures": {},
+        "geomean_ir_mine_over_ref": 1.3026166335289593,
+        "geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "33554432,16,64"
+        },
+        "geometry_env_overrides": {},
+        "heavy_opt_in": false,
+        "host": {
+          "libc": [
+            "glibc",
+            "2.36"
+          ],
+          "machine": "x86_64",
+          "platform": "Linux-6.1.189+-x86_64-with-glibc2.36"
+        },
+        "include": "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "instrument_timeout_s": 60,
+        "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+        "opt": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNUM_RECORDS=1024 -DPASSES=2",
+        "opt_tokens": [
+          "-std=gnu17",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DNUM_RECORDS=1024",
+          "-DPASSES=2"
+        ],
+        "paths": {
+          "equal_byte_length": true,
+          "mine": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa",
+          "ref": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb"
+        },
+        "results": {
+          "sqlite_vdbe_serial": {
+            "binary_sha256": {
+              "mine": "b834e7c0cdcf37e95d922a149baffd05666aed2a4d7fcc7aa2e5bf5f5b84e664",
+              "ref": "5767902b1a92bf434d38d015388f8b5d694d7e9923498491b1fd137d8544870e"
+            },
+            "compilation": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DNUM_RECORDS=1024",
+                  "-DPASSES=2",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/sqlite_vdbe_serial.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa/sqlite_vdbe_serial"
+                ],
+                "process": {
+                  "elapsed": 0.1051857529996596,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.compile.json",
+                  "sha256": "d14683b70e827f33fac2e6f6a3aeaaf4b96e640b1da6f796aa6407b8b96709b5"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/toolchains/bin/gcc-16",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DNUM_RECORDS=1024",
+                  "-DPASSES=2",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/sqlite_vdbe_serial.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb/sqlite_vdbe_serial"
+                ],
+                "process": {
+                  "elapsed": 0.121814428000107,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.compile.json",
+                  "sha256": "10b0a3cc930536675f5cd5707f15b620e7413ebffd9b2e91b3b398a78a966026"
+                }
+              }
+            },
+            "correctness": {
+              "mine": {
+                "elapsed": 0.0019305750001876731,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "6dce10992561ae7be8335295877c61477d889e06894e837b1f7868fa994794cc"
+              },
+              "ref": {
+                "elapsed": 0.0017211959998348902,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "6dce10992561ae7be8335295877c61477d889e06894e837b1f7868fa994794cc"
+              }
+            },
+            "instrumentation": {
+              "mine": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.cg",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa/sqlite_vdbe_serial"
+                ],
+                "counter_file_sha256": "d9515ef39acd75c16db45770e40ccc1490792b179c0b3700befd145bc9a979aa",
+                "process": {
+                  "elapsed": 0.31395040899997184,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26410-- warning: L3 cache found, using its data for the LL simulation.\n--26410-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26410-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "6e35e9fd4cc07ba0fd356675049274a85e64b31471c506c3ceb389bb99619429",
+                  "stdout_sha256": "6dce10992561ae7be8335295877c61477d889e06894e837b1f7868fa994794cc"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.cg.stdout"
+                }
+              },
+              "ref": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.cg",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb/sqlite_vdbe_serial"
+                ],
+                "counter_file_sha256": "3596d66a05d7622e4f5429140d863c8683383ed3ccbcd4674cc43b74eff14342",
+                "process": {
+                  "elapsed": 0.3103035849999287,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26411-- warning: L3 cache found, using its data for the LL simulation.\n--26411-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26411-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "23fd94c459443fde8003c74d72db29a70ae4645e69c7b7f5ba60fc750e0c2699",
+                  "stdout_sha256": "6dce10992561ae7be8335295877c61477d889e06894e837b1f7868fa994794cc"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.cg.stdout"
+                }
+              }
+            },
+            "metrics": {
+              "conditional_mispredicts": [
+                42806,
+                24326
+              ],
+              "d1_misses": [
+                6598,
+                6597
+              ],
+              "i1_misses": [
+                1335,
+                1330
+              ],
+              "indirect_mispredicts": [
+                44441,
+                59188
+              ],
+              "ir_mine": 3120495,
+              "ir_ratio": 1.3026166335289593,
+              "ir_ref": 2395559,
+              "ll_misses": [
+                4007,
+                4006
+              ]
+            },
+            "mine": {
+              "Bc": 455266,
+              "Bcm": 42806,
+              "Bi": 44629,
+              "Bim": 44441,
+              "D1mr": 4738,
+              "D1mw": 1860,
+              "DLmr": 917,
+              "DLmw": 1782,
+              "Dr": 567833,
+              "Dw": 323893,
+              "I1mr": 1335,
+              "ILmr": 1308,
+              "Ir": 3120495
+            },
+            "native": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa/sqlite_vdbe_serial"
+                ],
+                "process": {
+                  "elapsed": 0.0019305750001876731,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "6dce10992561ae7be8335295877c61477d889e06894e837b1f7868fa994794cc"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/aa/sqlite_vdbe_serial.native.json",
+                  "sha256": "d64f0963c9c4686d91c5334ceb6eeaa0d5a92d0b91911883e10494caab7245f4"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb/sqlite_vdbe_serial"
+                ],
+                "process": {
+                  "elapsed": 0.0017211959998348902,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "6dce10992561ae7be8335295877c61477d889e06894e837b1f7868fa994794cc"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/sqlite_vdbe_serial/bb/sqlite_vdbe_serial.native.json",
+                  "sha256": "8a325eaa2cfe436362bc41484b9f5fd0200095025adc66e192ceac00a68e3b5d"
+                }
+              }
+            },
+            "ref": {
+              "Bc": 363169,
+              "Bcm": 24326,
+              "Bi": 59375,
+              "Bim": 59188,
+              "D1mr": 4735,
+              "D1mw": 1862,
+              "DLmr": 920,
+              "DLmw": 1782,
+              "Dr": 439776,
+              "Dw": 246121,
+              "I1mr": 1330,
+              "ILmr": 1304,
+              "Ir": 2395559
+            },
+            "source_sha256": "716c4164550d809dd2ca8af7c37897fe8e66296f28972e890326228931affc17",
+            "status": "COMPARABLE-SIMULATION",
+            "workload": {
+              "contract": "registered",
+              "effective_opt_tokens": [
+                "-std=gnu17",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-Wl,--no-as-needed",
+                "-lm",
+                "-DNUM_RECORDS=1024",
+                "-DPASSES=2"
+              ],
+              "overridden_registry_macros": [],
+              "registry_flags": [],
+              "registry_id": "sqlite_vdbe_serial",
+              "source": "/tmp/lccc-research/lccc/tests/benchmark/programs/sqlite_vdbe_serial.c"
+            }
+          }
+        },
+        "schema": "lccc-callgrind-ab-v2",
+        "selected": 1,
+        "tools": {
+          "include_discovery": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "mine": {
+            "command": [
+              "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+            "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "ref": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "valgrind": {
+            "command": [
+              "valgrind"
+            ],
+            "executable": "/usr/bin/valgrind",
+            "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+            "version": "valgrind-3.19.0"
+          }
+        }
+      },
+      "glibc_dl_hash": {
+        "comparable": 1,
+        "compiler_environment": {
+          "LCCC_AGENT_CACHE_PREFIX": "/tmp/lccc-research/toolchains",
+          "LCCC_BUILD_JOBS": "2",
+          "LCCC_QEMU_PREFIX": "/tmp/lccc-research/toolchains/qemu-user-11.1.3-x86_64",
+          "LCCC_SWAPFILE": "/tmp/lccc-research/lccc.swap"
+        },
+        "failures": {},
+        "geomean_ir_mine_over_ref": 1.0543689104493952,
+        "geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "33554432,16,64"
+        },
+        "geometry_env_overrides": {},
+        "heavy_opt_in": false,
+        "host": {
+          "libc": [
+            "glibc",
+            "2.36"
+          ],
+          "machine": "x86_64",
+          "platform": "Linux-6.1.189+-x86_64-with-glibc2.36"
+        },
+        "include": "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "instrument_timeout_s": 60,
+        "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+        "opt": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNSYMS=1024 -DNQUERIES=2048 -DPASSES=2",
+        "opt_tokens": [
+          "-std=gnu17",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DNSYMS=1024",
+          "-DNQUERIES=2048",
+          "-DPASSES=2"
+        ],
+        "paths": {
+          "equal_byte_length": true,
+          "mine": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa",
+          "ref": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb"
+        },
+        "results": {
+          "glibc_dl_hash": {
+            "binary_sha256": {
+              "mine": "5ba3bc0c73490dec63566ef4df851eb5d6b1d4b6e5179434bf862d7f57522b32",
+              "ref": "6d85089d9e666b49380ac2d405362c0fce108ac6ec4f66b40ff58931503b6773"
+            },
+            "compilation": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DNSYMS=1024",
+                  "-DNQUERIES=2048",
+                  "-DPASSES=2",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/glibc_dl_hash.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa/glibc_dl_hash"
+                ],
+                "process": {
+                  "elapsed": 0.09643016600011833,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa/glibc_dl_hash.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa/glibc_dl_hash.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa/glibc_dl_hash.compile.json",
+                  "sha256": "4b9cd2d366aa4fb920f33b641ac0557aac77dd10c7a47b23758f9cf83a45f43b"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/toolchains/bin/gcc-16",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DNSYMS=1024",
+                  "-DNQUERIES=2048",
+                  "-DPASSES=2",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/glibc_dl_hash.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb/glibc_dl_hash"
+                ],
+                "process": {
+                  "elapsed": 0.1001687809998657,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb/glibc_dl_hash.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb/glibc_dl_hash.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb/glibc_dl_hash.compile.json",
+                  "sha256": "398de802dcffa726d33ca1a73c56aec8edbf00f4e55fc3d995917fb759e0b465"
+                }
+              }
+            },
+            "correctness": {
+              "mine": {
+                "elapsed": 0.0019375699998818163,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "2847d7f26f20853f99a55e77c203e90416e82d102eacdc5c1638c1bd168cf7b0"
+              },
+              "ref": {
+                "elapsed": 0.001855023999723926,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "2847d7f26f20853f99a55e77c203e90416e82d102eacdc5c1638c1bd168cf7b0"
+              }
+            },
+            "instrumentation": {
+              "mine": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa/glibc_dl_hash.cg",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa/glibc_dl_hash"
+                ],
+                "counter_file_sha256": "8150087d742760939fc6608470ccca03f5074e4952032f065b658b62c2c6ae92",
+                "process": {
+                  "elapsed": 0.3032352299997001,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26433-- warning: L3 cache found, using its data for the LL simulation.\n--26433-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26433-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "60ddc5bab2cdda23932ab6c1dbced8ba83f6faf179b2aeb86e3583f8dc71899c",
+                  "stdout_sha256": "2847d7f26f20853f99a55e77c203e90416e82d102eacdc5c1638c1bd168cf7b0"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa/glibc_dl_hash.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa/glibc_dl_hash.cg.stdout"
+                }
+              },
+              "ref": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb/glibc_dl_hash.cg",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb/glibc_dl_hash"
+                ],
+                "counter_file_sha256": "87e1acd318b18f0f484c90c42285a861342506f7d932baf157bf336c843c2abb",
+                "process": {
+                  "elapsed": 0.30372843800023475,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26435-- warning: L3 cache found, using its data for the LL simulation.\n--26435-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26435-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "1c34144da5f21dc9ab35689e3228cd9979796bcdbb5233b658533096697a0de7",
+                  "stdout_sha256": "2847d7f26f20853f99a55e77c203e90416e82d102eacdc5c1638c1bd168cf7b0"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb/glibc_dl_hash.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb/glibc_dl_hash.cg.stdout"
+                }
+              }
+            },
+            "metrics": {
+              "conditional_mispredicts": [
+                22974,
+                23119
+              ],
+              "d1_misses": [
+                5866,
+                5864
+              ],
+              "i1_misses": [
+                1322,
+                1323
+              ],
+              "indirect_mispredicts": [
+                204,
+                204
+              ],
+              "ir_mine": 3698355,
+              "ir_ratio": 1.0543689104493952,
+              "ir_ref": 3507648,
+              "ll_misses": [
+                3809,
+                3812
+              ]
+            },
+            "mine": {
+              "Bc": 421758,
+              "Bcm": 22974,
+              "Bi": 391,
+              "Bim": 204,
+              "D1mr": 4186,
+              "D1mw": 1680,
+              "DLmr": 911,
+              "DLmw": 1603,
+              "Dr": 394206,
+              "Dw": 89432,
+              "I1mr": 1322,
+              "ILmr": 1295,
+              "Ir": 3698355
+            },
+            "native": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa/glibc_dl_hash"
+                ],
+                "process": {
+                  "elapsed": 0.0019375699998818163,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "2847d7f26f20853f99a55e77c203e90416e82d102eacdc5c1638c1bd168cf7b0"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa/glibc_dl_hash.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa/glibc_dl_hash.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/aa/glibc_dl_hash.native.json",
+                  "sha256": "206c4096ccae6516fd0cdb364e8c69de63248dd86d0e515f7c6669baf615fb52"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb/glibc_dl_hash"
+                ],
+                "process": {
+                  "elapsed": 0.001855023999723926,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "2847d7f26f20853f99a55e77c203e90416e82d102eacdc5c1638c1bd168cf7b0"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb/glibc_dl_hash.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb/glibc_dl_hash.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/glibc_dl_hash/bb/glibc_dl_hash.native.json",
+                  "sha256": "cba2405422bc97b705f11e59d51ac4fb141626ae90d75bdce4a04badb6d5dc9f"
+                }
+              }
+            },
+            "ref": {
+              "Bc": 417734,
+              "Bcm": 23119,
+              "Bi": 391,
+              "Bim": 204,
+              "D1mr": 4183,
+              "D1mw": 1681,
+              "DLmr": 912,
+              "DLmw": 1603,
+              "Dr": 386149,
+              "Dw": 83337,
+              "I1mr": 1323,
+              "ILmr": 1297,
+              "Ir": 3507648
+            },
+            "source_sha256": "a42905655da8210823680569d084dc0e14521d8ab8f61e299fea7b0afda0f38c",
+            "status": "COMPARABLE-SIMULATION",
+            "workload": {
+              "contract": "registered",
+              "effective_opt_tokens": [
+                "-std=gnu17",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-Wl,--no-as-needed",
+                "-lm",
+                "-DNSYMS=1024",
+                "-DNQUERIES=2048",
+                "-DPASSES=2"
+              ],
+              "overridden_registry_macros": [],
+              "registry_flags": [],
+              "registry_id": "glibc_dl_hash",
+              "source": "/tmp/lccc-research/lccc/tests/benchmark/programs/glibc_dl_hash.c"
+            }
+          }
+        },
+        "schema": "lccc-callgrind-ab-v2",
+        "selected": 1,
+        "tools": {
+          "include_discovery": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "mine": {
+            "command": [
+              "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+            "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "ref": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "valgrind": {
+            "command": [
+              "valgrind"
+            ],
+            "executable": "/usr/bin/valgrind",
+            "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+            "version": "valgrind-3.19.0"
+          }
+        }
+      },
+      "zlib_ng_adler32_combine": {
+        "comparable": 1,
+        "compiler_environment": {
+          "LCCC_AGENT_CACHE_PREFIX": "/tmp/lccc-research/toolchains",
+          "LCCC_BUILD_JOBS": "2",
+          "LCCC_QEMU_PREFIX": "/tmp/lccc-research/toolchains/qemu-user-11.1.3-x86_64",
+          "LCCC_SWAPFILE": "/tmp/lccc-research/lccc.swap"
+        },
+        "failures": {},
+        "geomean_ir_mine_over_ref": 0.6485711713305329,
+        "geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "33554432,16,64"
+        },
+        "geometry_env_overrides": {},
+        "heavy_opt_in": false,
+        "host": {
+          "libc": [
+            "glibc",
+            "2.36"
+          ],
+          "machine": "x86_64",
+          "platform": "Linux-6.1.189+-x86_64-with-glibc2.36"
+        },
+        "include": "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "instrument_timeout_s": 60,
+        "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+        "opt": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=10000",
+        "opt_tokens": [
+          "-std=gnu17",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=10000"
+        ],
+        "paths": {
+          "equal_byte_length": true,
+          "mine": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa",
+          "ref": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb"
+        },
+        "results": {
+          "zlib_ng_adler32_combine": {
+            "binary_sha256": {
+              "mine": "17f4c6d191991429611878d252a15fe59c40d68665e6b8b252e28509b0294328",
+              "ref": "de91135eccde0392117da709c04b87194acd2b7f23d7afc8d52b105b0b417e50"
+            },
+            "compilation": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DPASSES=10000",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine"
+                ],
+                "process": {
+                  "elapsed": 0.08300260900023204,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.compile.json",
+                  "sha256": "8531ef224d0878424936adf213a92573eccd8d8cfc24e9dcadd1ee4d0d7a217b"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/toolchains/bin/gcc-16",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DPASSES=10000",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine"
+                ],
+                "process": {
+                  "elapsed": 0.09999076800022522,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.compile.json",
+                  "sha256": "30d24cc0b5fa1bd147d165e6ae882e8e3bcd11d81b15a5cf20389e627b1af316"
+                }
+              }
+            },
+            "correctness": {
+              "mine": {
+                "elapsed": 0.003178635000040231,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c"
+              },
+              "ref": {
+                "elapsed": 0.00499438699989696,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c"
+              }
+            },
+            "instrumentation": {
+              "mine": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.cg",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine"
+                ],
+                "counter_file_sha256": "8d5ac52746dd36856125f10d185e0fb9b11937b7d4ac706d66b8009534d4a302",
+                "process": {
+                  "elapsed": 0.36383795600022495,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26347-- warning: L3 cache found, using its data for the LL simulation.\n--26347-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26347-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "94a745c1a777e72419868008916e2fc2aad2135c5571ebf411b2172d5df20665",
+                  "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.cg.stdout"
+                }
+              },
+              "ref": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.cg",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine"
+                ],
+                "counter_file_sha256": "655aab2f1445f7f5479062076f054096f10ce29a77a703a67e3a382aa2b4bee1",
+                "process": {
+                  "elapsed": 0.39586690799978896,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26348-- warning: L3 cache found, using its data for the LL simulation.\n--26348-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26348-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "b6def6fa8b1b066d9ac03e42fc659471cf074a0e67fcba9ca45c97bace8925e9",
+                  "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.cg.stdout"
+                }
+              }
+            },
+            "metrics": {
+              "conditional_mispredicts": [
+                6283,
+                6282
+              ],
+              "d1_misses": [
+                1899,
+                1897
+              ],
+              "i1_misses": [
+                1327,
+                1329
+              ],
+              "indirect_mispredicts": [
+                202,
+                202
+              ],
+              "ir_mine": 13881337,
+              "ir_ratio": 0.6485711713305329,
+              "ir_ref": 21402951,
+              "ll_misses": [
+                2874,
+                2876
+              ]
+            },
+            "mine": {
+              "Bc": 1144011,
+              "Bcm": 6283,
+              "Bi": 391,
+              "Bim": 202,
+              "D1mr": 1200,
+              "D1mw": 699,
+              "DLmr": 916,
+              "DLmw": 658,
+              "Dr": 1145199,
+              "Dw": 28672,
+              "I1mr": 1327,
+              "ILmr": 1300,
+              "Ir": 13881337
+            },
+            "native": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine"
+                ],
+                "process": {
+                  "elapsed": 0.003178635000040231,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine.native.json",
+                  "sha256": "9e072e98d095ae201f4c1663c595a41bf7c9b56801376ddebeba024faec1034f"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine"
+                ],
+                "process": {
+                  "elapsed": 0.00499438699989696,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine.native.json",
+                  "sha256": "5a369b3bafd22a460a197bb0cb6aa599aebd948d896c1ac18dd9c2d7b8ae034f"
+                }
+              }
+            },
+            "ref": {
+              "Bc": 1154086,
+              "Bcm": 6282,
+              "Bi": 391,
+              "Bim": 202,
+              "D1mr": 1201,
+              "D1mw": 696,
+              "DLmr": 915,
+              "DLmw": 658,
+              "Dr": 1143099,
+              "Dw": 26612,
+              "I1mr": 1329,
+              "ILmr": 1303,
+              "Ir": 21402951
+            },
+            "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+            "status": "COMPARABLE-SIMULATION",
+            "workload": {
+              "contract": "registered",
+              "effective_opt_tokens": [
+                "-std=gnu17",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-Wl,--no-as-needed",
+                "-lm",
+                "-DPASSES=10000"
+              ],
+              "overridden_registry_macros": [],
+              "registry_flags": [],
+              "registry_id": "zlib_ng_adler32_combine",
+              "source": "/tmp/lccc-research/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c"
+            }
+          }
+        },
+        "schema": "lccc-callgrind-ab-v2",
+        "selected": 1,
+        "tools": {
+          "include_discovery": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "mine": {
+            "command": [
+              "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+            "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "ref": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "valgrind": {
+            "command": [
+              "valgrind"
+            ],
+            "executable": "/usr/bin/valgrind",
+            "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+            "version": "valgrind-3.19.0"
+          }
+        }
+      },
+      "gzip_longest_match": {
+        "comparable": 1,
+        "compiler_environment": {
+          "LCCC_AGENT_CACHE_PREFIX": "/tmp/lccc-research/toolchains",
+          "LCCC_BUILD_JOBS": "2",
+          "LCCC_QEMU_PREFIX": "/tmp/lccc-research/toolchains/qemu-user-11.1.3-x86_64",
+          "LCCC_SWAPFILE": "/tmp/lccc-research/lccc.swap"
+        },
+        "failures": {},
+        "geomean_ir_mine_over_ref": 1.132715916664875,
+        "geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "33554432,16,64"
+        },
+        "geometry_env_overrides": {},
+        "heavy_opt_in": false,
+        "host": {
+          "libc": [
+            "glibc",
+            "2.36"
+          ],
+          "machine": "x86_64",
+          "platform": "Linux-6.1.189+-x86_64-with-glibc2.36"
+        },
+        "include": "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "instrument_timeout_s": 60,
+        "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+        "opt": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DWINDOW_SIZE=4096 -DPASSES=1",
+        "opt_tokens": [
+          "-std=gnu17",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DWINDOW_SIZE=4096",
+          "-DPASSES=1"
+        ],
+        "paths": {
+          "equal_byte_length": true,
+          "mine": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa",
+          "ref": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb"
+        },
+        "results": {
+          "gzip_longest_match": {
+            "binary_sha256": {
+              "mine": "5ed35cad44bce2a535da09f854046ef804269886b8c088eaa211079024bdb18d",
+              "ref": "9b6fdc203d872c642fa4f0c0229e320c4381eb8684e7e443d28a6656eb87ffdf"
+            },
+            "compilation": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DWINDOW_SIZE=4096",
+                  "-DPASSES=1",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/gzip_longest_match.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa/gzip_longest_match"
+                ],
+                "process": {
+                  "elapsed": 0.18283738099989932,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa/gzip_longest_match.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa/gzip_longest_match.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa/gzip_longest_match.compile.json",
+                  "sha256": "a775035d604be7b797e45b30b718aa2ce4dfefa4c19fe7d0bc41da7341c38fd9"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/toolchains/bin/gcc-16",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DWINDOW_SIZE=4096",
+                  "-DPASSES=1",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/gzip_longest_match.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb/gzip_longest_match"
+                ],
+                "process": {
+                  "elapsed": 0.13353353100001186,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb/gzip_longest_match.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb/gzip_longest_match.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb/gzip_longest_match.compile.json",
+                  "sha256": "c48fbe2c232f825cdafd2f40259c3e7e0c68b177a00f48db258b44b6aa8b97f5"
+                }
+              }
+            },
+            "correctness": {
+              "mine": {
+                "elapsed": 0.0015744920001452556,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "7a641c4de87daa9cc61d1e209cdd1313a84fdf1649e67e8c8bae38f86f60c9f5"
+              },
+              "ref": {
+                "elapsed": 0.0015199760000541573,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "7a641c4de87daa9cc61d1e209cdd1313a84fdf1649e67e8c8bae38f86f60c9f5"
+              }
+            },
+            "instrumentation": {
+              "mine": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa/gzip_longest_match.cg",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa/gzip_longest_match"
+                ],
+                "counter_file_sha256": "9320a904da7f3cf848bbdb1484644cd3d6648920845024142a1c413992ce0f4a",
+                "process": {
+                  "elapsed": 0.27463335700031166,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26368-- warning: L3 cache found, using its data for the LL simulation.\n--26368-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26368-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "f26afd464395ffc9ddf569671e754d8c3bdc017942bb8305f607255e540d52a1",
+                  "stdout_sha256": "7a641c4de87daa9cc61d1e209cdd1313a84fdf1649e67e8c8bae38f86f60c9f5"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa/gzip_longest_match.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa/gzip_longest_match.cg.stdout"
+                }
+              },
+              "ref": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb/gzip_longest_match.cg",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb/gzip_longest_match"
+                ],
+                "counter_file_sha256": "b1d2c9f966840ec5b80b6bab4389b63084a70551cadece9be2b93353e6de1f4a",
+                "process": {
+                  "elapsed": 0.2734244520001994,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26369-- warning: L3 cache found, using its data for the LL simulation.\n--26369-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26369-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "d3fc6f6f53797e3b5b22adb92fdaf7d10086151d6490d5ba80072d67e2e457a1",
+                  "stdout_sha256": "7a641c4de87daa9cc61d1e209cdd1313a84fdf1649e67e8c8bae38f86f60c9f5"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb/gzip_longest_match.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb/gzip_longest_match.cg.stdout"
+                }
+              }
+            },
+            "metrics": {
+              "conditional_mispredicts": [
+                5231,
+                5255
+              ],
+              "d1_misses": [
+                4558,
+                4493
+              ],
+              "i1_misses": [
+                1337,
+                1328
+              ],
+              "indirect_mispredicts": [
+                205,
+                205
+              ],
+              "ir_mine": 421470,
+              "ir_ratio": 1.132715916664875,
+              "ir_ref": 372088,
+              "ll_misses": [
+                5236,
+                5229
+              ]
+            },
+            "mine": {
+              "Bc": 58473,
+              "Bcm": 5231,
+              "Bi": 406,
+              "Bim": 205,
+              "D1mr": 1426,
+              "D1mw": 3132,
+              "DLmr": 913,
+              "DLmw": 3013,
+              "Dr": 60772,
+              "Dw": 38628,
+              "I1mr": 1337,
+              "ILmr": 1310,
+              "Ir": 421470
+            },
+            "native": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa/gzip_longest_match"
+                ],
+                "process": {
+                  "elapsed": 0.0015744920001452556,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "7a641c4de87daa9cc61d1e209cdd1313a84fdf1649e67e8c8bae38f86f60c9f5"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa/gzip_longest_match.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa/gzip_longest_match.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/aa/gzip_longest_match.native.json",
+                  "sha256": "c3076ad7d925e0bcaccaa9c3db8da23b5b8a51ec1e93192bdec77f51a5344b87"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb/gzip_longest_match"
+                ],
+                "process": {
+                  "elapsed": 0.0015199760000541573,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "7a641c4de87daa9cc61d1e209cdd1313a84fdf1649e67e8c8bae38f86f60c9f5"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb/gzip_longest_match.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb/gzip_longest_match.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/gzip_longest_match/bb/gzip_longest_match.native.json",
+                  "sha256": "1391312df8c5ca1f4b3518572e45cbf275d1e47b7695ede7ae02f2d04fad0824"
+                }
+              }
+            },
+            "ref": {
+              "Bc": 66023,
+              "Bcm": 5255,
+              "Bi": 406,
+              "Bim": 205,
+              "D1mr": 1380,
+              "D1mw": 3113,
+              "DLmr": 914,
+              "DLmw": 3013,
+              "Dr": 50778,
+              "Dw": 34096,
+              "I1mr": 1328,
+              "ILmr": 1302,
+              "Ir": 372088
+            },
+            "source_sha256": "18a7a1d5dc782cbfe623ded7eb4d20bebcf75f3613b301f3306c3ec968a8db2b",
+            "status": "COMPARABLE-SIMULATION",
+            "workload": {
+              "contract": "registered",
+              "effective_opt_tokens": [
+                "-std=gnu17",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-Wl,--no-as-needed",
+                "-lm",
+                "-DWINDOW_SIZE=4096",
+                "-DPASSES=1"
+              ],
+              "overridden_registry_macros": [],
+              "registry_flags": [],
+              "registry_id": "gzip_longest_match",
+              "source": "/tmp/lccc-research/lccc/tests/benchmark/programs/gzip_longest_match.c"
+            }
+          }
+        },
+        "schema": "lccc-callgrind-ab-v2",
+        "selected": 1,
+        "tools": {
+          "include_discovery": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "mine": {
+            "command": [
+              "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+            "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "ref": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "valgrind": {
+            "command": [
+              "valgrind"
+            ],
+            "executable": "/usr/bin/valgrind",
+            "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+            "version": "valgrind-3.19.0"
+          }
+        }
+      },
+      "expat_utf8_content": {
+        "comparable": 1,
+        "compiler_environment": {
+          "LCCC_AGENT_CACHE_PREFIX": "/tmp/lccc-research/toolchains",
+          "LCCC_BUILD_JOBS": "2",
+          "LCCC_QEMU_PREFIX": "/tmp/lccc-research/toolchains/qemu-user-11.1.3-x86_64",
+          "LCCC_SWAPFILE": "/tmp/lccc-research/lccc.swap"
+        },
+        "failures": {},
+        "geomean_ir_mine_over_ref": 1.067590831727603,
+        "geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "33554432,16,64"
+        },
+        "geometry_env_overrides": {},
+        "heavy_opt_in": false,
+        "host": {
+          "libc": [
+            "glibc",
+            "2.36"
+          ],
+          "machine": "x86_64",
+          "platform": "Linux-6.1.189+-x86_64-with-glibc2.36"
+        },
+        "include": "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "instrument_timeout_s": 60,
+        "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+        "opt": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDOC_CAP=16384 -DPASSES=4",
+        "opt_tokens": [
+          "-std=gnu17",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DDOC_CAP=16384",
+          "-DPASSES=4"
+        ],
+        "paths": {
+          "equal_byte_length": true,
+          "mine": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa",
+          "ref": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb"
+        },
+        "results": {
+          "expat_utf8_content": {
+            "binary_sha256": {
+              "mine": "36e25a7a2ac7ff5494bce2e4b44eca7ed1f6afee74dc517fa06e3c40aa77f44e",
+              "ref": "6642777616ec84d09e2e24c0129b145498010f41bbdcaa340207e8d44c5dd343"
+            },
+            "compilation": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DDOC_CAP=16384",
+                  "-DPASSES=4",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/expat_utf8_content.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa/expat_utf8_content"
+                ],
+                "process": {
+                  "elapsed": 0.14152706699996997,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa/expat_utf8_content.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa/expat_utf8_content.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa/expat_utf8_content.compile.json",
+                  "sha256": "d62e6b7e633e37e4d5f13426773debc38182f9febba018a0808410ccce9c7fd6"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/toolchains/bin/gcc-16",
+                  "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                  "-std=gnu17",
+                  "-O2",
+                  "-march=x86-64-v3",
+                  "-fwrapv",
+                  "-DDOC_CAP=16384",
+                  "-DPASSES=4",
+                  "/tmp/lccc-research/lccc/tests/benchmark/programs/expat_utf8_content.c",
+                  "-Wl,--no-as-needed",
+                  "-lm",
+                  "-o",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb/expat_utf8_content"
+                ],
+                "process": {
+                  "elapsed": 0.14057922100028009,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb/expat_utf8_content.compile.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb/expat_utf8_content.compile.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb/expat_utf8_content.compile.json",
+                  "sha256": "e60a916f2189f64a565fa60860d1e96926c9cbf768a20c7fce7f83b18cd9bfd5"
+                }
+              }
+            },
+            "correctness": {
+              "mine": {
+                "elapsed": 0.00264754299996639,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "020e7bd5953e87636382b57504dc33f584f0054693066badd90cee0db6680d12"
+              },
+              "ref": {
+                "elapsed": 0.002583379000043351,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "",
+                "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stdout_sha256": "020e7bd5953e87636382b57504dc33f584f0054693066badd90cee0db6680d12"
+              }
+            },
+            "instrumentation": {
+              "mine": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa/expat_utf8_content.cg",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa/expat_utf8_content"
+                ],
+                "counter_file_sha256": "d49eccd9ce5b7e40f4b903ad461c79815a951459be2cb4563177736dd28a3a20",
+                "process": {
+                  "elapsed": 0.33858181899995543,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26390-- warning: L3 cache found, using its data for the LL simulation.\n--26390-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26390-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "2a732e3b6352fcf4ba23b5297fdc444fb24431bd7cc41276c248729cac0fdc79",
+                  "stdout_sha256": "020e7bd5953e87636382b57504dc33f584f0054693066badd90cee0db6680d12"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa/expat_utf8_content.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa/expat_utf8_content.cg.stdout"
+                }
+              },
+              "ref": {
+                "command": [
+                  "valgrind",
+                  "--tool=callgrind",
+                  "--cache-sim=yes",
+                  "--branch-sim=yes",
+                  "--quiet",
+                  "--I1=32768,8,64",
+                  "--D1=32768,8,64",
+                  "--LL=33554432,16,64",
+                  "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb/expat_utf8_content.cg",
+                  "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb/expat_utf8_content"
+                ],
+                "counter_file_sha256": "ee0ca2233fda44b47cc54cf95b807b910cb5bb767bba3efe95889f44f5ed9115",
+                "process": {
+                  "elapsed": 0.33335972799977753,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "--26391-- warning: L3 cache found, using its data for the LL simulation.\n--26391-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--26391-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+                  "stderr_sha256": "04d77117dfc19cba91a13eb70de4bb0063df9a55a15a6fe9ebe204bd94b5d41b",
+                  "stdout_sha256": "020e7bd5953e87636382b57504dc33f584f0054693066badd90cee0db6680d12"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb/expat_utf8_content.cg.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb/expat_utf8_content.cg.stdout"
+                }
+              }
+            },
+            "metrics": {
+              "conditional_mispredicts": [
+                14263,
+                20276
+              ],
+              "d1_misses": [
+                7136,
+                7133
+              ],
+              "i1_misses": [
+                1348,
+                1347
+              ],
+              "indirect_mispredicts": [
+                98804,
+                106800
+              ],
+              "ir_mine": 4585893,
+              "ir_ratio": 1.067590831727603,
+              "ir_ref": 4295553,
+              "ll_misses": [
+                3902,
+                3901
+              ]
+            },
+            "mine": {
+              "Bc": 1020020,
+              "Bcm": 14263,
+              "Bi": 241332,
+              "Bim": 98804,
+              "D1mr": 5394,
+              "D1mw": 1742,
+              "DLmr": 917,
+              "DLmw": 1664,
+              "Dr": 939541,
+              "Dw": 167836,
+              "I1mr": 1348,
+              "ILmr": 1321,
+              "Ir": 4585893
+            },
+            "native": {
+              "mine": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa/expat_utf8_content"
+                ],
+                "process": {
+                  "elapsed": 0.00264754299996639,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "020e7bd5953e87636382b57504dc33f584f0054693066badd90cee0db6680d12"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa/expat_utf8_content.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa/expat_utf8_content.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/aa/expat_utf8_content.native.json",
+                  "sha256": "3d603be4a1af87375b106b03cf93cb4545461c7a86da0ecf8220b6fadba74dce"
+                }
+              },
+              "ref": {
+                "command": [
+                  "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb/expat_utf8_content"
+                ],
+                "process": {
+                  "elapsed": 0.002583379000043351,
+                  "failure": null,
+                  "returncode": 0,
+                  "stderr_excerpt": "",
+                  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "stdout_sha256": "020e7bd5953e87636382b57504dc33f584f0054693066badd90cee0db6680d12"
+                },
+                "raw_outputs": {
+                  "stderr": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb/expat_utf8_content.native.stderr",
+                  "stdout": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb/expat_utf8_content.native.stdout"
+                },
+                "receipt": {
+                  "path": "/tmp/lccc-research/evidence/callgrind-gcc/expat_utf8_content/bb/expat_utf8_content.native.json",
+                  "sha256": "fa624787680b53d60fff9f28bf5d573f58944284fc0d5f35734beeec7c35d2b3"
+                }
+              }
+            },
+            "ref": {
+              "Bc": 784856,
+              "Bcm": 20276,
+              "Bi": 250638,
+              "Bim": 106800,
+              "D1mr": 5392,
+              "D1mw": 1741,
+              "DLmr": 919,
+              "DLmw": 1663,
+              "Dr": 1124003,
+              "Dw": 158600,
+              "I1mr": 1347,
+              "ILmr": 1319,
+              "Ir": 4295553
+            },
+            "source_sha256": "ca0354de49e7d89029cb24d442ff1f681fa26f5aa9b9fea48c73966e242d3ec2",
+            "status": "COMPARABLE-SIMULATION",
+            "workload": {
+              "contract": "registered",
+              "effective_opt_tokens": [
+                "-std=gnu17",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-Wl,--no-as-needed",
+                "-lm",
+                "-DDOC_CAP=16384",
+                "-DPASSES=4"
+              ],
+              "overridden_registry_macros": [],
+              "registry_flags": [],
+              "registry_id": "expat_utf8_content",
+              "source": "/tmp/lccc-research/lccc/tests/benchmark/programs/expat_utf8_content.c"
+            }
+          }
+        },
+        "schema": "lccc-callgrind-ab-v2",
+        "selected": 1,
+        "tools": {
+          "include_discovery": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "mine": {
+            "command": [
+              "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86"
+            ],
+            "executable": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+            "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+            "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+          },
+          "ref": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16"
+            ],
+            "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+            "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+            "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+          },
+          "valgrind": {
+            "command": [
+              "valgrind"
+            ],
+            "executable": "/usr/bin/valgrind",
+            "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+            "version": "valgrind-3.19.0"
+          }
+        }
+      }
+    }
+  },
+  "crc-default": {
+    "comparable": 1,
+    "compiler_environment": {
+      "LCCC_AGENT_CACHE_PREFIX": "/tmp/lccc-research/toolchains",
+      "LCCC_BUILD_JOBS": "2",
+      "LCCC_QEMU_PREFIX": "/tmp/lccc-research/toolchains/qemu-user-11.1.3-x86_64",
+      "LCCC_SWAPFILE": "/tmp/lccc-research/lccc.swap"
+    },
+    "failures": {},
+    "geomean_ir_mine_over_ref": 1.2309060985953053,
+    "geometry": {
+      "D1": "32768,8,64",
+      "I1": "32768,8,64",
+      "LL": "33554432,16,64"
+    },
+    "geometry_env_overrides": {},
+    "heavy_opt_in": false,
+    "host": {
+      "libc": [
+        "glibc",
+        "2.36"
+      ],
+      "machine": "x86_64",
+      "platform": "Linux-6.1.189+-x86_64-with-glibc2.36"
+    },
+    "include": "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+    "instrument_timeout_s": 120,
+    "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+    "opt": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -ffp-contract=off -lm",
+    "opt_tokens": [
+      "-std=gnu17",
+      "-O2",
+      "-march=x86-64-v3",
+      "-fwrapv",
+      "-ffp-contract=off",
+      "-lm"
+    ],
+    "paths": {
+      "equal_byte_length": true,
+      "mine": "/tmp/lccc-research/evidence/callgrind-crc-default/aa",
+      "ref": "/tmp/lccc-research/evidence/callgrind-crc-default/bb"
+    },
+    "results": {
+      "zlib_ng_crc32_combine": {
+        "binary_sha256": {
+          "mine": "7e940543370ae9ec096c7bb86e6a247941bab1d54e586e1c84f902935c64f660",
+          "ref": "0829e833d5dea4579ae7c1ecc90ef34380572fba36d957beb59e67991f387328"
+        },
+        "compilation": {
+          "mine": {
+            "command": [
+              "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+              "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+              "-std=gnu17",
+              "-O2",
+              "-march=x86-64-v3",
+              "-fwrapv",
+              "-ffp-contract=off",
+              "/tmp/lccc-research/lccc/tests/benchmark/programs/zlib_ng_crc32_combine.c",
+              "-lm",
+              "-o",
+              "/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine"
+            ],
+            "process": {
+              "elapsed": 0.11940357999992557,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "raw_outputs": {
+              "stderr": "/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine.compile.stderr",
+              "stdout": "/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine.compile.stdout"
+            },
+            "receipt": {
+              "path": "/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine.compile.json",
+              "sha256": "fe54ff2537e6a6d90737be8c28d2fbca24dd1ef60f8255af91b7c97e190b047c"
+            }
+          },
+          "ref": {
+            "command": [
+              "/tmp/lccc-research/toolchains/bin/gcc-16",
+              "-I/tmp/lccc-research/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+              "-std=gnu17",
+              "-O2",
+              "-march=x86-64-v3",
+              "-fwrapv",
+              "-ffp-contract=off",
+              "/tmp/lccc-research/lccc/tests/benchmark/programs/zlib_ng_crc32_combine.c",
+              "-lm",
+              "-o",
+              "/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine"
+            ],
+            "process": {
+              "elapsed": 0.13944318300036684,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "raw_outputs": {
+              "stderr": "/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine.compile.stderr",
+              "stdout": "/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine.compile.stdout"
+            },
+            "receipt": {
+              "path": "/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine.compile.json",
+              "sha256": "5de8d6a55533345ad8dd57160b071e923dd45b21fb111ac632e39833a336240e"
+            }
+          }
+        },
+        "correctness": {
+          "mine": {
+            "elapsed": 0.11509080999985599,
+            "failure": null,
+            "returncode": 0,
+            "stderr_excerpt": "",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stdout_sha256": "b44d1392f1a6af05071a63bf056deaaf291033287e1864ee44e81798b3cc5b61"
+          },
+          "ref": {
+            "elapsed": 0.11368789700009074,
+            "failure": null,
+            "returncode": 0,
+            "stderr_excerpt": "",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stdout_sha256": "b44d1392f1a6af05071a63bf056deaaf291033287e1864ee44e81798b3cc5b61"
+          }
+        },
+        "instrumentation": {
+          "mine": {
+            "command": [
+              "valgrind",
+              "--tool=callgrind",
+              "--cache-sim=yes",
+              "--branch-sim=yes",
+              "--quiet",
+              "--I1=32768,8,64",
+              "--D1=32768,8,64",
+              "--LL=33554432,16,64",
+              "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine.cg",
+              "/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine"
+            ],
+            "counter_file_sha256": "d7104f5e5904ab7434999597c231f01e6ccf44dddf5771e687ddc48259c9559d",
+            "process": {
+              "elapsed": 12.81094497200047,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "--95853-- warning: L3 cache found, using its data for the LL simulation.\n--95853-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--95853-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "stderr_sha256": "fb8839cadc2000e01a37804d8b85b941719887c166569255a6591d0047e8f6af",
+              "stdout_sha256": "b44d1392f1a6af05071a63bf056deaaf291033287e1864ee44e81798b3cc5b61"
+            },
+            "raw_outputs": {
+              "stderr": "/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine.cg.stderr",
+              "stdout": "/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine.cg.stdout"
+            }
+          },
+          "ref": {
+            "command": [
+              "valgrind",
+              "--tool=callgrind",
+              "--cache-sim=yes",
+              "--branch-sim=yes",
+              "--quiet",
+              "--I1=32768,8,64",
+              "--D1=32768,8,64",
+              "--LL=33554432,16,64",
+              "--callgrind-out-file=/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine.cg",
+              "/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine"
+            ],
+            "counter_file_sha256": "7c521244cab9637c671ec671f2fc1f515f12b9c5532e64ae775958ea64a05875",
+            "process": {
+              "elapsed": 8.923295859000064,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "--95855-- warning: L3 cache found, using its data for the LL simulation.\n--95855-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--95855-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "stderr_sha256": "a4ca9daf031be196e4766e865513e83a7cacd57c377e8930b0ffcb44fb8dacef",
+              "stdout_sha256": "b44d1392f1a6af05071a63bf056deaaf291033287e1864ee44e81798b3cc5b61"
+            },
+            "raw_outputs": {
+              "stderr": "/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine.cg.stderr",
+              "stdout": "/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine.cg.stdout"
+            }
+          }
+        },
+        "metrics": {
+          "conditional_mispredicts": [
+            45918545,
+            45708769
+          ],
+          "d1_misses": [
+            1904,
+            1894
+          ],
+          "i1_misses": [
+            1331,
+            1329
+          ],
+          "indirect_mispredicts": [
+            202,
+            202
+          ],
+          "ir_mine": 1173263475,
+          "ir_ratio": 1.2309060985953053,
+          "ir_ref": 953170576,
+          "ll_misses": [
+            2856,
+            2853
+          ]
+        },
+        "mine": {
+          "Bc": 145532457,
+          "Bcm": 45918545,
+          "Bi": 391,
+          "Bim": 202,
+          "D1mr": 1207,
+          "D1mw": 697,
+          "DLmr": 911,
+          "DLmw": 641,
+          "Dr": 15332499,
+          "Dw": 9794525,
+          "I1mr": 1331,
+          "ILmr": 1304,
+          "Ir": 1173263475
+        },
+        "native": {
+          "mine": {
+            "command": [
+              "/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine"
+            ],
+            "process": {
+              "elapsed": 0.11509080999985599,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "b44d1392f1a6af05071a63bf056deaaf291033287e1864ee44e81798b3cc5b61"
+            },
+            "raw_outputs": {
+              "stderr": "/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine.native.stderr",
+              "stdout": "/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine.native.stdout"
+            },
+            "receipt": {
+              "path": "/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine.native.json",
+              "sha256": "ccd256260ac4af12128690297a81efc5dea1490b7bb898da3c6791587649788a"
+            }
+          },
+          "ref": {
+            "command": [
+              "/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine"
+            ],
+            "process": {
+              "elapsed": 0.11368789700009074,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "b44d1392f1a6af05071a63bf056deaaf291033287e1864ee44e81798b3cc5b61"
+            },
+            "raw_outputs": {
+              "stderr": "/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine.native.stderr",
+              "stdout": "/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine.native.stdout"
+            },
+            "receipt": {
+              "path": "/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine.native.json",
+              "sha256": "1ca8ccfc4d7e3759c434b475459abe2bae098335c74ca01be81081774d674c54"
+            }
+          }
+        },
+        "ref": {
+          "Bc": 133621931,
+          "Bcm": 45708769,
+          "Bi": 391,
+          "Bim": 202,
+          "D1mr": 1202,
+          "D1mw": 692,
+          "DLmr": 912,
+          "DLmw": 639,
+          "Dr": 6270458,
+          "Dw": 724317,
+          "I1mr": 1329,
+          "ILmr": 1302,
+          "Ir": 953170576
+        },
+        "source_sha256": "152e8b9d5e8266b90aebcac40a0f18142662f3db533fc731cf59b0f62e8636d3",
+        "status": "COMPARABLE-SIMULATION",
+        "workload": {
+          "contract": "registered",
+          "effective_opt_tokens": [
+            "-std=gnu17",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-ffp-contract=off",
+            "-lm"
+          ],
+          "overridden_registry_macros": [],
+          "registry_flags": [],
+          "registry_id": "zlib_ng_crc32_combine",
+          "source": "/tmp/lccc-research/lccc/tests/benchmark/programs/zlib_ng_crc32_combine.c"
+        }
+      }
+    },
+    "schema": "lccc-callgrind-ab-v2",
+    "selected": 1,
+    "tools": {
+      "include_discovery": {
+        "command": [
+          "/tmp/lccc-research/toolchains/bin/gcc-16"
+        ],
+        "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+        "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+        "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+      },
+      "mine": {
+        "command": [
+          "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86"
+        ],
+        "executable": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+        "sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+        "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+      },
+      "ref": {
+        "command": [
+          "/tmp/lccc-research/toolchains/bin/gcc-16"
+        ],
+        "executable": "/tmp/lccc-research/toolchains/bin/gcc-16",
+        "sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+        "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+      },
+      "valgrind": {
+        "command": [
+          "valgrind"
+        ],
+        "executable": "/usr/bin/valgrind",
+        "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+        "version": "valgrind-3.19.0"
+      }
+    }
+  },
+  "accounting": {
+    "lccc": {
+      "events": "Ir Dr Dw I1mr D1mr D1mw ILmr DLmr DLmw Bc Bcm Bi Bim",
+      "summary": "1173263475 15332499 9794525 1331 1207 697 1304 911 641 145532457 45918545 391 202",
+      "totals": "1173263473 15332499 9794525 1330 1207 697 1303 911 641 145532457 45918545 391 202"
+    },
+    "gcc": {
+      "events": "Ir Dr Dw I1mr D1mr D1mw ILmr DLmr DLmw Bc Bcm Bi Bim",
+      "summary": "953170576 6270458 724317 1329 1202 692 1302 912 639 133621931 45708769 391 202",
+      "totals": "955521759 3919273 724317 1328 1202 692 1301 912 639 133621931 45708769 391 202"
+    }
+  }
+}

@@ -1,0 +1,401 @@
+{
+  "scope": "source-level always_inline experiment, NOT an integrated compiler optimization",
+  "original_source": "tests/benchmark/programs/zlib_ng_crc32_combine.c",
+  "original_source_sha256": "152e8b9d5e8266b90aebcac40a0f18142662f3db533fc731cf59b0f62e8636d3",
+  "experiment_sha256": "53e71988ff6d40b5f7dfa007b5ac85f889712219fa5786b66f2839e2074583da",
+  "compiler_sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+  "source_replacement": {
+    "old": "static uint32_t multmodp(uint32_t a, uint32_t b) {",
+    "new": "#ifdef CRC_FORCE_INLINE\nstatic inline __attribute__((always_inline)) uint32_t multmodp(uint32_t a, uint32_t b) {\n#else\nstatic uint32_t multmodp(uint32_t a, uint32_t b) {\n#endif"
+  },
+  "wrapper": "#!/bin/sh\nexec \"/tmp/lccc-research/lccc/target/fastbuild/lccc-x86\" -DCRC_FORCE_INLINE=1 \"$@\"\n",
+  "command": [
+    "python3",
+    "/tmp/lccc-research/lccc/scripts/ab_interleaved.py",
+    "--a",
+    "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+    "--b",
+    "/tmp/lccc-research/evidence/inline-spike/force-inline",
+    "--repo",
+    "/tmp/lccc-research/evidence/inline-spike",
+    "--program",
+    "experiment.c",
+    "--samples",
+    "15",
+    "--cpu",
+    "0",
+    "--flags=-O2 -march=x86-64-v3 -fwrapv -ffp-contract=off",
+    "--json",
+    "/tmp/lccc-research/evidence/inline-spike/results.json"
+  ],
+  "results": {
+    "verdict": "sample-complete",
+    "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+    "builds": [
+      {
+        "compiler": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+        "command": [
+          "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-ffp-contract=off",
+          "-w",
+          "/tmp/lccc-research/evidence/inline-spike/experiment.c",
+          "-o",
+          "/tmp/arena-native-tools-zb9SIh/tmpnzfru_wz/a"
+        ],
+        "env_overrides": {},
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "arm": "a"
+      },
+      {
+        "compiler": "/tmp/lccc-research/evidence/inline-spike/force-inline",
+        "command": [
+          "/tmp/lccc-research/evidence/inline-spike/force-inline",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-ffp-contract=off",
+          "-w",
+          "/tmp/lccc-research/evidence/inline-spike/experiment.c",
+          "-o",
+          "/tmp/arena-native-tools-zb9SIh/tmpnzfru_wz/b"
+        ],
+        "env_overrides": {},
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "arm": "b"
+      }
+    ],
+    "samples": [
+      {
+        "round": 0,
+        "arm": "a",
+        "order": 0,
+        "phase": "warmup",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11691834000066592
+      },
+      {
+        "round": 0,
+        "arm": "b",
+        "order": 1,
+        "phase": "warmup",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11463616800028831
+      },
+      {
+        "round": 1,
+        "arm": "b",
+        "order": 0,
+        "phase": "warmup",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.1143374439998297
+      },
+      {
+        "round": 1,
+        "arm": "a",
+        "order": 1,
+        "phase": "warmup",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.12579378699956578
+      },
+      {
+        "round": 2,
+        "arm": "a",
+        "order": 0,
+        "phase": "warmup",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.15485746699960146
+      },
+      {
+        "round": 2,
+        "arm": "b",
+        "order": 1,
+        "phase": "warmup",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.12106088900054601
+      },
+      {
+        "round": 0,
+        "arm": "a",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.1173826080002982
+      },
+      {
+        "round": 0,
+        "arm": "b",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11366345599981287
+      },
+      {
+        "round": 1,
+        "arm": "b",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11323898899991036
+      },
+      {
+        "round": 1,
+        "arm": "a",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11678617800043867
+      },
+      {
+        "round": 2,
+        "arm": "a",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11512794400005077
+      },
+      {
+        "round": 2,
+        "arm": "b",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11302073600018048
+      },
+      {
+        "round": 3,
+        "arm": "b",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11293813900010718
+      },
+      {
+        "round": 3,
+        "arm": "a",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11483839099946636
+      },
+      {
+        "round": 4,
+        "arm": "a",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11506587599978957
+      },
+      {
+        "round": 4,
+        "arm": "b",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.1128808929997831
+      },
+      {
+        "round": 5,
+        "arm": "b",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11302779600009671
+      },
+      {
+        "round": 5,
+        "arm": "a",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11587502200018207
+      },
+      {
+        "round": 6,
+        "arm": "a",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11620354300066538
+      },
+      {
+        "round": 6,
+        "arm": "b",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11302241299927118
+      },
+      {
+        "round": 7,
+        "arm": "b",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11317285399945831
+      },
+      {
+        "round": 7,
+        "arm": "a",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.1154590329997518
+      },
+      {
+        "round": 8,
+        "arm": "a",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11812676299996383
+      },
+      {
+        "round": 8,
+        "arm": "b",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11372078800013696
+      },
+      {
+        "round": 9,
+        "arm": "b",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11443220999990444
+      },
+      {
+        "round": 9,
+        "arm": "a",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11639613900024415
+      },
+      {
+        "round": 10,
+        "arm": "a",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11681089500052622
+      },
+      {
+        "round": 10,
+        "arm": "b",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11317728699941654
+      },
+      {
+        "round": 11,
+        "arm": "b",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11321307900016109
+      },
+      {
+        "round": 11,
+        "arm": "a",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11566470500019932
+      },
+      {
+        "round": 12,
+        "arm": "a",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11584148200017808
+      },
+      {
+        "round": 12,
+        "arm": "b",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11313856200013106
+      },
+      {
+        "round": 13,
+        "arm": "b",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11341056099990965
+      },
+      {
+        "round": 13,
+        "arm": "a",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11654191400066338
+      },
+      {
+        "round": 14,
+        "arm": "a",
+        "order": 0,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11652931900061958
+      },
+      {
+        "round": 14,
+        "arm": "b",
+        "order": 1,
+        "phase": "timed",
+        "rc": 0,
+        "checksum": "zlib_ng_crc32_combine: 58a5dfaf",
+        "seconds": 0.11863245299991831
+      }
+    ]
+  }
+}

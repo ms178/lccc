@@ -1,0 +1,110 @@
+{
+  "tool": "godbolt_codegen_compare",
+  "mode": "static",
+  "flags": {
+    "requested": "-O2 -march=x86-64-v3 -DPASSES=128",
+    "per_compiler": {
+      "gcc16.2": "-O2 -march=x86-64-v3 -DPASSES=128",
+      "clang": "-O2 -march=x86-64-v3 -DPASSES=128",
+      "icc": "-O2 -march=core-avx2 -DPASSES=128",
+      "icx": "-O2 -march=x86-64-v3 -DPASSES=128"
+    },
+    "translation_notes": [
+      "icc: -march=x86-64-v3 -> -march=core-avx2 (same ISA level, ICC's name for it)"
+    ]
+  },
+  "oracles": [
+    "gcc16.2",
+    "clang",
+    "icc",
+    "icx"
+  ],
+  "local": "/tmp/lccc-research/lccc/target/fastbuild/lccc",
+  "summary": {
+    "functions": 1,
+    "ranked": 0,
+    "lccc_ahead": 0,
+    "lccc_tie": 0,
+    "lccc_behind": 0,
+    "geomean_lccc_over_best": null,
+    "arithmetic_mean_lccc_over_best": null,
+    "best_lccc_over_best": null,
+    "worst_lccc_over_best": null,
+    "median_lccc_over_best": null,
+    "best_compiler_counts": {},
+    "top_gaps": [],
+    "top_wins": []
+  },
+  "rows": [
+    {
+      "source": "zlib_ng_crc32_combine.c",
+      "function": "zng_crc32_combine",
+      "best": "",
+      "lccc_over_best": null,
+      "lccc_runtime_over_best": null,
+      "stats": {
+        "lccc": {
+          "instructions": 55,
+          "loads": 1,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 8,
+          "vectors": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 55,
+          "loads": 1,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 12,
+          "vectors": 0,
+          "calls": 0
+        },
+        "clang": {
+          "instructions": 59,
+          "loads": 1,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 12,
+          "vectors": 0,
+          "calls": 0
+        },
+        "icc": {
+          "instructions": 54,
+          "loads": 2,
+          "stores": 1,
+          "spills": 2,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "branches": 12,
+          "vectors": 0,
+          "calls": 0
+        },
+        "icx": {
+          "instructions": 60,
+          "loads": 1,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 12,
+          "vectors": 0,
+          "calls": 0
+        }
+      },
+      "runtime": {},
+      "errors": {},
+      "compiler_errors": {},
+      "comparable_call_scope": false,
+      "scope_warning": "different call counts: helpers/inlining change the measured scope"
+    }
+  ],
+  "failures": []
+}

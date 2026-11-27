@@ -43,7 +43,9 @@ What is measured (and what is not)
 existing tables.  It is a *screening* metric: a compiler that refuses to
 vectorize emits a tight scalar loop and "wins" the column while doing 8x the
 work per byte, so loop kernels must be ranked with ``scripts/hot_loop_metric.py``
-or the runtime arm.
+or the runtime arm. Rows with different call counts are not ranked: a short
+caller with out-of-line helpers is not the same measurement scope as an inlined
+implementation. Equal call counts still do not prove equal work.
 
 ``--mode runtime`` compiles AND executes the source on Compiler Explorer and
 reports the relative execution time the CE runner measured.  It is the metric
@@ -172,20 +174,35 @@ class Row:
     stats: dict[str, co.AsmStats]
     errors: dict[str, str]
     runtime: dict[str, float] = field(default_factory=dict)
+    # Compilation/transport/execution failures are not the same as a function
+    # legitimately disappearing through inlining. A partial survey must fail.
+    compiler_errors: dict[str, str] = field(default_factory=dict)
+    native_oracles: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def _insns(self, name: str) -> int | None:
         stat = self.stats.get(name)
         return stat.instructions if stat else None
 
     @property
+    def comparable_call_scope(self) -> bool:
+        # Outlining a helper can shrink the measured symbol while moving most
+        # of its work elsewhere. Equal counts do NOT prove equal work, but
+        # unequal counts are enough to refuse this static ranking.
+        return len({stat.calls for stat in self.stats.values()}) <= 1
+
+    @property
     def best_name(self) -> str:
         if self.runtime:
             return min(self.runtime, key=self.runtime.get)
+        if not self.comparable_call_scope:
+            return ""
         live = {n: self._insns(n) for n in self.stats if self._insns(n)}
         return min(live, key=lambda n: live[n]) if live else ""
 
     @property
     def lccc_over_best(self) -> float | None:
+        if not self.comparable_call_scope:
+            return None
         mine = self._insns("lccc")
         others = [self._insns(n) for n in self.stats
                   if n != "lccc" and self._insns(n)]
@@ -211,6 +228,11 @@ class Row:
             "stats": {n: s.__dict__ for n, s in self.stats.items()},
             "runtime": self.runtime,
             "errors": self.errors,
+            "compiler_errors": self.compiler_errors,
+            "native_oracles": self.native_oracles,
+            "comparable_call_scope": self.comparable_call_scope,
+            "scope_warning": (None if self.comparable_call_scope else
+                              "different call counts: helpers/inlining change the measured scope"),
         }
 
 
@@ -266,14 +288,24 @@ def compare_file(path: Path, *, local: str, oracles: list[str], plan: FlagPlan,
                 errs[name] = err
             else:
                 runtime[name] = elapsed
-        return [Row(path.name, "<program>", {}, errs, runtime)]
+        return [Row(path.name, "<program>", {}, errs, runtime, dict(errs))]
 
+    requested = (["lccc"] if local else []) + oracles
     if local:
         lines, err = _local_lines(local, path, plan.for_compiler("lccc"))
         asm["lccc"], errs["lccc"] = lines, err
+    native_oracles: dict[str, dict[str, Any]] = {}
     for name in oracles:
-        cid = godbolt.COMPILER_ALIASES.get(name, name)
-        lines, err = _remote_lines(cid, text, plan.for_compiler(name))
+        if name in godbolt.LOCAL_ORACLES:
+            try:
+                metadata, lines = godbolt.oracle_assembly(name, path, plan.for_compiler(name))
+                native_oracles[name] = metadata
+                err = ""
+            except Exception as exc:  # noqa: BLE001 - preserve other compiler results
+                lines, err = [], f"{type(exc).__name__}: {exc}"
+        else:
+            cid = godbolt.resolve_compiler(name)
+            lines, err = _remote_lines(cid, text, plan.for_compiler(name))
         asm[name], errs[name] = lines, err
     if artifact_dir is not None:
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -298,21 +330,24 @@ def compare_file(path: Path, *, local: str, oracles: list[str], plan: FlagPlan,
         # behavioural rather than syntactic: a symbol is code when at least one
         # requested compiler actually emitted instructions for it.
         targets = []
-        for name in ("lccc", *oracles):
+        for name in requested:
             for fn, body in bodies.get(name, {}).items():
                 if fn in targets:
                     continue
                 if co._stats(body, "x86").instructions >= min_instructions:
                     targets.append(fn)
+    compiler_errors = {name: error for name, error in errs.items() if error}
     if not targets:
-        return [Row(path.name, "<none>", {}, errs or {"all": "no functions emitted"})]
+        return [Row(path.name, "<none>", {},
+                    compiler_errors or {"all": "no functions emitted"},
+                    compiler_errors=dict(compiler_errors), native_oracles=dict(native_oracles))]
 
     rows: list[Row] = []
     arch = "x86"
     for fn in targets:
         stats: dict[str, co.AsmStats] = {}
         row_errs: dict[str, str] = {}
-        for name in ("lccc", *oracles):
+        for name in requested:
             if name in errs and errs[name]:
                 row_errs[name] = errs[name]
                 continue
@@ -321,7 +356,8 @@ def compare_file(path: Path, *, local: str, oracles: list[str], plan: FlagPlan,
                 row_errs[name] = f"function '{fn}' not emitted (inlined/removed)"
                 continue
             stats[name] = co._stats(body, arch)
-        rows.append(Row(path.name, fn, stats, row_errs, dict(runtime)))
+        rows.append(Row(path.name, fn, stats, row_errs, dict(runtime),
+                        dict(compiler_errors), dict(native_oracles)))
     return rows
 
 
@@ -329,10 +365,13 @@ def _fmt(value: float | None) -> str:
     return "-" if value is None else f"{value:.3f}"
 
 
-def render(rows: list[Row], compilers: list[str], mode: str, out=sys.stdout) -> None:
+def render(rows: list[Row], compilers: list[str], mode: str, out=None) -> None:
+    if out is None:
+        out = sys.stdout
     names = (["lccc", *compilers] if any("lccc" in r.stats or "lccc" in r.errors for r in rows)
              else list(compilers))
-    header = f"{'function':<32}{'source':<26}" + "".join(f"{n:>9}" for n in names)
+    column = max(9, max((len(name) for name in names), default=0) + 1)
+    header = f"{'function':<32}{'source':<26}" + "".join(f"{n:>{column}}" for n in names)
     header += f"{'best':>10}{'L/best':>8}"
     print(header, file=out, flush=True)
     print("-" * len(header), file=out, flush=True)
@@ -346,10 +385,13 @@ def render(rows: list[Row], compilers: list[str], mode: str, out=sys.stdout) -> 
                 cell = "-" if value is None else f"{value * 1e3:.1f}"
             else:
                 cell = str(row._insns(name) if row._insns(name) is not None else "!")
-            line += f"{cell:>9}"
+            line += f"{cell:>{column}}"
         ratio = key(row)
         line += f"{row.best_name:>10}{_fmt(ratio):>8}"
         print(line, file=out, flush=True)
+        if mode == "static" and not row.comparable_call_scope:
+            calls = ", ".join(f"{name}={stat.calls}" for name, stat in row.stats.items())
+            print(f"  not ranked: call scopes differ ({calls}); include callee work", file=out)
     if mode == "runtime":
         print("\n(runtime column = CE-measured program seconds x 1e3; "
               "best is the fastest oracle time, not the fewest instructions)",
@@ -375,13 +417,18 @@ def summarize(rows: list[Row], compilers: list[str], mode: str) -> dict[str, Any
         "lccc_behind": len(values) - ahead - tie,
         "geomean_lccc_over_best": (
             statistics.geometric_mean(values) if values else None),
+        "arithmetic_mean_lccc_over_best": statistics.mean(values) if values else None,
+        "best_lccc_over_best": min(values) if values else None,
+        "worst_lccc_over_best": max(values) if values else None,
         "median_lccc_over_best": (
             statistics.median(values) if values else None),
         "best_compiler_counts": winners,
         "top_gaps": [{"function": f, "ratio": round(v, 4)}
-                     for f, v in sorted(ratios, key=lambda t: -t[1])[:10]],
+                     for f, v in sorted((r for r in ratios if r[1] > 1.0),
+                                        key=lambda t: -t[1])[:10]],
         "top_wins": [{"function": f, "ratio": round(v, 4)}
-                     for f, v in sorted(ratios, key=lambda t: t[1])[:10]],
+                     for f, v in sorted((r for r in ratios if r[1] < 1.0),
+                                        key=lambda t: t[1])[:10]],
     }
 
 
@@ -420,6 +467,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("remote program timings cannot rank functions or gate host LCCC performance")
 
     oracles = [o for o in (x.strip() for x in args.oracles.split(",")) if o]
+    if args.mode == "runtime" and any(name in godbolt.LOCAL_ORACLES for name in oracles):
+        parser.error("runtime mode uses CE executors; use the native benchmark runner for local oracles")
     local = "" if args.local in ("", "none") else args.local
     if args.mode == "runtime":
         local = ""
@@ -436,6 +485,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rows: list[Row] = []
     failures: list[str] = []
+    failed_compilers: set[tuple[Path, str]] = set()
 
     def work(path: Path) -> list[Row]:
         godbolt.CACHE_ONLY.set(args.offline)
@@ -454,10 +504,19 @@ def main(argv: list[str] | None = None) -> int:
                 failures.append(f"{path.name}: {type(exc).__name__}: {exc}")
                 continue
             for row in result:
-                if row.errors and (not row.stats or args.function or args.fail_on_behind is not None):
+                if args.fail_on_behind is not None and not row.comparable_call_scope:
+                    failures.append(f"{path.name}::{row.function}: incomparable static call scopes")
+                if row.compiler_errors:
+                    for compiler, error in row.compiler_errors.items():
+                        key = (path, compiler)
+                        if key not in failed_compilers:
+                            failures.append(f"{path.name}::{compiler}: {error}")
+                            failed_compilers.add(key)
+                elif row.errors and (not row.stats or args.function or args.fail_on_behind is not None):
                     failures.append(f"{path.name}::{row.function}: {row.errors}")
             rows.extend(result)
 
+    rows.sort(key=lambda row: (row.source, row.function))
     render(rows, oracles, args.mode)
     summary = summarize(rows, oracles, args.mode)
     print(f"\nfunctions: {summary['functions']}  ranked: {summary['ranked']}  "
@@ -465,6 +524,9 @@ def main(argv: list[str] | None = None) -> int:
           f"behind {summary['lccc_behind']}")
     print(f"LCCC/best  geomean = {_fmt(summary['geomean_lccc_over_best'])}  "
           f"median = {_fmt(summary['median_lccc_over_best'])}")
+    print(f"arithmetic mean = {_fmt(summary['arithmetic_mean_lccc_over_best'])}  "
+          f"best = {_fmt(summary['best_lccc_over_best'])}  "
+          f"worst = {_fmt(summary['worst_lccc_over_best'])}")
     if summary["best_compiler_counts"]:
         print("best-compiler wins: " + ", ".join(
             f"{k}={v}" for k, v in sorted(summary["best_compiler_counts"].items())))
@@ -508,7 +570,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.md:
         args.md.parent.mkdir(parents=True, exist_ok=True)
-        names = ["lccc", *oracles]
+        names = (["lccc"] if local else []) + oracles
         lines = ["| function | source | " + " | ".join(names) +
                  " | best | LCCC/best |", "|---|---|" + "---:|" * (len(names) + 1) + "---:|"]
         key = (lambda r: r.lccc_runtime_over_best) if args.mode == "runtime" \
@@ -525,6 +587,10 @@ def main(argv: list[str] | None = None) -> int:
             lines.append(f"| `{row.function}` | {row.source} | " +
                          " | ".join(cells) +
                          f" | {row.best_name} | {_fmt(key(row))} |")
+        mismatched = [f"`{r.source}::{r.function}`" for r in rows if not r.comparable_call_scope]
+        if mismatched:
+            lines.extend(["", "Not ranked: different call counts / helper scopes in " +
+                          ", ".join(mismatched) + ". Include callee work before comparing."])
         args.md.write_text("\n".join(lines) + "\n")
 
     if failures:

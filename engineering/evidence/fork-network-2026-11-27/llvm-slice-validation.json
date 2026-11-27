@@ -1,0 +1,14 @@
+{
+  "version": "23.1.6",
+  "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.6/LLVM-23.1.6-Linux-X64.tar.zst",
+  "archive_sha256": "59e14234f145927f982b50627e8bafaf2fca50151b7d973d6a0b40796ddcfe9a",
+  "probes": {
+    "asan_ubsan_link_and_run": "pass",
+    "clang": "23.1.6",
+    "lld": "LLD 23.1.6 (https://github.com/llvm/llvm-project 5b10d2d74929eae78912771222c9855af97496f4) (compatible with GNU linkers)"
+  },
+  "scope": "optional research oracle; existing agent-cache/CI pins unchanged",
+  "selected_files": 340,
+  "compiler_sha256": "1b281b7c46c55ec5ce743cc848d52b6652b65eae595650d302925c44a68e9797",
+  "lld_sha256": "5c275e61d9b5e53475b1b82f8aa99490dc4345cd788f08b9cdab6be819094216"
+}

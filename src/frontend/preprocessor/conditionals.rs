@@ -717,14 +717,20 @@ impl<'a> ExprParser<'a> {
             self.advance(); // ?
             let quiet = self.quiet;
             self.quiet = quiet || cond.0 == 0;
-            let then_val = self.parse_ternary();
+            // C11 6.5.15: the middle operand is an expression (including
+            // comma); only the last operand is a conditional-expression.
+            let then_val = self.parse_comma();
             if self.peek_op(":") {
                 self.advance(); // :
             }
             self.quiet = quiet || cond.0 != 0;
             let else_val = self.parse_ternary();
             self.quiet = quiet;
-            if cond.0 != 0 { then_val } else { else_val }
+            // Both arms determine the common type, even the inactive one.
+            // #if has only intmax_t/uintmax_t: conversion to unsigned keeps
+            // the bit pattern and changes how subsequent operators read it.
+            let value = if cond.0 != 0 { then_val.0 } else { else_val.0 };
+            (value, then_val.1 || else_val.1)
         } else {
             cond
         }
@@ -1060,6 +1066,76 @@ impl<'a> ExprParser<'a> {
                 (0, false)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ternary_type_tests {
+    use super::{CharModel, ExprParser, tokenize_expr};
+
+    fn evaluate(expr: &str) -> (i64, bool) {
+        let tokens = tokenize_expr(expr, CharModel::current());
+        let mut parser = ExprParser::new(&tokens);
+        let value = parser.parse_comma();
+        assert_eq!(parser.pos, tokens.len(), "unconsumed tokens in {expr}");
+        assert!(parser.undefined.is_empty(), "unexpected -Wundef: {expr}");
+        value
+    }
+
+    #[test]
+    fn both_arms_determine_the_common_type() {
+        for expr in [
+            "1 ? -1 : 0U",
+            "0 ? 0U : -1",
+            "1 ? -1 : 0xffffffffffffffff",
+            "1 ? (1 ? -1 : 0) : 0U",
+            "1 ? -1 : (0 ? 0 : 1U)",
+        ] {
+            assert_eq!(evaluate(expr), (-1, true), "{expr}");
+        }
+        assert_eq!(evaluate("(0 ? 0U : -1) / 2"), (i64::MAX, true));
+        assert_eq!(evaluate("(1 ? -1 : 0U) < 0"), (0, false));
+    }
+
+    #[test]
+    fn condition_and_logical_operands_do_not_taint_signed_arms() {
+        for expr in [
+            "1U ? -1 : 0",
+            "0 ? 0 : -1",
+            "1 ? -1 : (0U == 0)",
+            "1 ? -1 : !0U",
+        ] {
+            assert_eq!(evaluate(expr), (-1, false), "{expr}");
+        }
+    }
+
+    #[test]
+    fn middle_comma_uses_its_last_value_and_type() {
+        assert_eq!(evaluate("1 ? 0, 7 : 9"), (7, false));
+        assert_eq!(evaluate("0 ? 0, 7U : -1"), (-1, true));
+        assert_eq!(evaluate("1 ? 1U, -1 : 0"), (-1, false));
+        assert_eq!(evaluate("1 ? -1 : (0U, 0)"), (-1, false));
+        assert_eq!(evaluate("1 ? -1 : (0, 0U)"), (-1, true));
+    }
+
+    #[test]
+    fn nested_conditionals_and_outer_commas_keep_their_precedence() {
+        assert_eq!(evaluate("1 ? 0 ? 0 : 1 : 0"), (1, false));
+        assert_eq!(evaluate("0 ? 3 : 1 ? 4U : 5"), (4, true));
+        assert_eq!(evaluate("1 ? 2, 3 : 4, 5"), (5, false));
+        assert_eq!(evaluate("1 ? 0 ? 1 : 2, 3U : 4"), (3, true));
+    }
+
+    #[test]
+    fn inactive_arms_keep_types_without_undefined_macro_diagnostics() {
+        assert_eq!(evaluate("1 ? -1 : (UNDEFINED + 0U)"), (-1, true));
+        assert_eq!(evaluate("0 ? UNDEFINED, 0U : -1"), (-1, true));
+        assert_eq!(evaluate("1 ? 1 : (0 ? UNDEFINED : UNDEFINED)"), (1, false));
+        // Suppression must end with the inactive operand, not leak outwards.
+        let tokens = tokenize_expr("0 ? UNDEFINED : LIVE", CharModel::current());
+        let mut parser = ExprParser::new(&tokens);
+        parser.parse_comma();
+        assert_eq!(parser.undefined, vec!["LIVE"]);
     }
 }
 

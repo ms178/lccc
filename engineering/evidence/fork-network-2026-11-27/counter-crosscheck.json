@@ -1,0 +1,62 @@
+{
+  "lccc": {
+    "command": [
+      "valgrind",
+      "--tool=cachegrind",
+      "--cache-sim=yes",
+      "--branch-sim=yes",
+      "--I1=32768,8,64",
+      "--D1=32768,8,64",
+      "--LL=33554432,16,64",
+      "--cachegrind-out-file=/tmp/lccc-research/evidence/cachegrind-counter-crosscheck/lccc.cg",
+      "/tmp/lccc-research/evidence/callgrind-crc-default/aa/zlib_ng_crc32_combine"
+    ],
+    "exit": 0,
+    "stdout": "zlib_ng_crc32_combine: 58a5dfaf\n",
+    "events": {
+      "Ir": 1173262927,
+      "I1mr": 1336,
+      "ILmr": 1309,
+      "Dr": 15333627,
+      "D1mr": 1452,
+      "DLmr": 1146,
+      "Dw": 9792991,
+      "D1mw": 462,
+      "DLmw": 405,
+      "Bc": 145531458,
+      "Bcm": 45918513,
+      "Bi": 390,
+      "Bim": 201
+    }
+  },
+  "gcc": {
+    "command": [
+      "valgrind",
+      "--tool=cachegrind",
+      "--cache-sim=yes",
+      "--branch-sim=yes",
+      "--I1=32768,8,64",
+      "--D1=32768,8,64",
+      "--LL=33554432,16,64",
+      "--cachegrind-out-file=/tmp/lccc-research/evidence/cachegrind-counter-crosscheck/gcc.cg",
+      "/tmp/lccc-research/evidence/callgrind-crc-default/bb/zlib_ng_crc32_combine"
+    ],
+    "exit": 0,
+    "stdout": "zlib_ng_crc32_combine: 58a5dfaf\n",
+    "events": {
+      "Ir": 953170028,
+      "I1mr": 1334,
+      "ILmr": 1307,
+      "Dr": 6271587,
+      "D1mr": 1446,
+      "DLmr": 1148,
+      "Dw": 722782,
+      "D1mw": 454,
+      "DLmw": 402,
+      "Bc": 133620932,
+      "Bcm": 45708737,
+      "Bi": 390,
+      "Bim": 201
+    }
+  }
+}

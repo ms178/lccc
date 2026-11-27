@@ -1,0 +1,46 @@
+{
+  "source": "static int outer = 17;\nint main(void) { __auto_type outer = &outer; return *outer != 17; }\n",
+  "scope": "pre-existing GNU inferred object binding; not claimed fixed",
+  "results": [
+    {
+      "compiler": "before",
+      "command": [
+        "/tmp/lccc-research/evidence/baseline/lccc-x86",
+        "-O0",
+        "-Werror",
+        "/tmp/lccc-research/evidence/auto-binding-open/probe.c",
+        "-o",
+        "/tmp/lccc-research/evidence/auto-binding-open/before"
+      ],
+      "compile_exit": 1,
+      "stderr": "/tmp/lccc-research/evidence/auto-binding-open/probe.c:2:38: error: initialization of 'int *' from incompatible pointer type 'int **' [-Wincompatible-pointer-types]\n int main(void) { __auto_type outer = &outer; return *outer != 17; }\n                                      ^\nccc: error: 1 error(s) during semantic analysis\n"
+    },
+    {
+      "compiler": "after",
+      "command": [
+        "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+        "-O0",
+        "-Werror",
+        "/tmp/lccc-research/evidence/auto-binding-open/probe.c",
+        "-o",
+        "/tmp/lccc-research/evidence/auto-binding-open/after"
+      ],
+      "compile_exit": 1,
+      "stderr": "/tmp/lccc-research/evidence/auto-binding-open/probe.c:2:38: error: initialization of 'int *' from incompatible pointer type 'int **' [-Wincompatible-pointer-types]\n int main(void) { __auto_type outer = &outer; return *outer != 17; }\n                                      ^\nccc: error: 1 error(s) during semantic analysis\n"
+    },
+    {
+      "compiler": "gcc16.2",
+      "command": [
+        "/tmp/lccc-research/toolchains/bin/gcc-16",
+        "-O0",
+        "-Werror",
+        "/tmp/lccc-research/evidence/auto-binding-open/probe.c",
+        "-o",
+        "/tmp/lccc-research/evidence/auto-binding-open/gcc16.2"
+      ],
+      "compile_exit": 0,
+      "stderr": "",
+      "run_exit": 0
+    }
+  ]
+}

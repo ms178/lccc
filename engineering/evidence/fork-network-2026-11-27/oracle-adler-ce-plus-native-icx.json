@@ -1,0 +1,181 @@
+{
+  "tool": "godbolt_codegen_compare",
+  "mode": "static",
+  "flags": {
+    "requested": "-O2 -march=x86-64-v3 -DPASSES=128",
+    "per_compiler": {
+      "gcc16.2": "-O2 -march=x86-64-v3 -DPASSES=128",
+      "clang": "-O2 -march=x86-64-v3 -DPASSES=128",
+      "icc": "-O2 -march=core-avx2 -DPASSES=128",
+      "icx2026.2": "-O2 -march=x86-64-v3 -DPASSES=128"
+    },
+    "translation_notes": [
+      "icc: -march=x86-64-v3 -> -march=core-avx2 (same ISA level, ICC's name for it)"
+    ]
+  },
+  "oracles": [
+    "gcc16.2",
+    "clang",
+    "icc",
+    "icx2026.2"
+  ],
+  "local": "/tmp/lccc-research/lccc/target/fastbuild/lccc",
+  "summary": {
+    "functions": 1,
+    "ranked": 1,
+    "lccc_ahead": 0,
+    "lccc_tie": 0,
+    "lccc_behind": 1,
+    "geomean_lccc_over_best": 1.1304347826086956,
+    "arithmetic_mean_lccc_over_best": 1.1304347826086956,
+    "best_lccc_over_best": 1.1304347826086956,
+    "worst_lccc_over_best": 1.1304347826086956,
+    "median_lccc_over_best": 1.1304347826086956,
+    "best_compiler_counts": {
+      "icc": 1
+    },
+    "top_gaps": [
+      {
+        "function": "zng_combine",
+        "ratio": 1.1304
+      }
+    ],
+    "top_wins": []
+  },
+  "rows": [
+    {
+      "source": "zlib_ng_adler32_combine.c",
+      "function": "zng_combine",
+      "best": "icc",
+      "lccc_over_best": 1.1304347826086956,
+      "lccc_runtime_over_best": null,
+      "stats": {
+        "lccc": {
+          "instructions": 52,
+          "loads": 0,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 3,
+          "vectors": 0,
+          "calls": 0
+        },
+        "gcc16.2": {
+          "instructions": 47,
+          "loads": 0,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 4,
+          "vectors": 0,
+          "calls": 0
+        },
+        "clang": {
+          "instructions": 47,
+          "loads": 0,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 3,
+          "vectors": 0,
+          "calls": 0
+        },
+        "icc": {
+          "instructions": 46,
+          "loads": 0,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 4,
+          "vectors": 0,
+          "calls": 0
+        },
+        "icx2026.2": {
+          "instructions": 47,
+          "loads": 0,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 3,
+          "vectors": 0,
+          "calls": 0
+        }
+      },
+      "runtime": {},
+      "errors": {},
+      "compiler_errors": {},
+      "native_oracles": {
+        "icx2026.2": {
+          "id": "icx2026.2",
+          "name": "Intel oneAPI DPC++/C++ 2026.2.x (local)",
+          "semver": "2026.2.1",
+          "compilerType": "local-icx",
+          "binary": "/tmp/lccc-research/icx-2026.2/opt/intel/oneapi/compiler/2026.2/bin/icx",
+          "binary_sha256": "91ec5016b4a4fef52406e9286f3d932f8bea2da98b3a22228909f908df27832c",
+          "probe": "__INTEL_LLVM_COMPILER=20260201",
+          "target": "x86_64",
+          "pointer_bits": 64,
+          "provisioning": {
+            "release_line": "2026.2",
+            "semver": "2026.2.1",
+            "repository": "https://apt.repos.intel.com/oneapi",
+            "key_url": "https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB",
+            "key_sha256": "db932ba032a71f732dc415eef5f4f185fc7ae768487d7a357bc2772746b6c48c",
+            "packages": [
+              {
+                "Package": "intel-oneapi-dpcpp-cpp-2026.2",
+                "Version": "2026.2.1-990",
+                "Architecture": "amd64",
+                "Filename": "pool/main/intel-oneapi-dpcpp-cpp-2026.2-2026.2.1-990_amd64.deb",
+                "SHA256": "0857c153ad3d098e8639c6da4a3f45e199525c8448389e44c4d29c1c3eb336c9"
+              },
+              {
+                "Package": "intel-oneapi-compiler-shared-runtime-2026.2",
+                "Version": "2026.2.1-990",
+                "Architecture": "amd64",
+                "Filename": "pool/main/intel-oneapi-compiler-shared-runtime-2026.2-2026.2.1-990_amd64.deb",
+                "SHA256": "22c4329d220ea5b588c32d9844e3cb6f7b11fb94747f50042703926d11471a29"
+              },
+              {
+                "Package": "intel-oneapi-compiler-shared-2026.2",
+                "Version": "2026.2.1-990",
+                "Architecture": "amd64",
+                "Filename": "pool/main/intel-oneapi-compiler-shared-2026.2-2026.2.1-990_amd64.deb",
+                "SHA256": "6cf46bc2a1ea6acc70fa54e0afdc39d5f05a60e6347f6f3b99f98527eb0a96ee"
+              },
+              {
+                "Package": "intel-oneapi-compiler-dpcpp-cpp-common-2026.2",
+                "Version": "2026.2.1-990",
+                "Architecture": "all",
+                "Filename": "pool/main/intel-oneapi-compiler-dpcpp-cpp-common-2026.2-2026.2.1-990_all.deb",
+                "SHA256": "7b279a5c7c215f3dbac1a4182fbdf3c2cf65105e885ae6d4d0048197ff91b15f"
+              },
+              {
+                "Package": "intel-oneapi-compiler-shared-common-2026.2",
+                "Version": "2026.2.1-990",
+                "Architecture": "all",
+                "Filename": "pool/main/intel-oneapi-compiler-shared-common-2026.2-2026.2.1-990_all.deb",
+                "SHA256": "7ff2da0e9b137a19b354889cd07b0d7521e597901b28adfa8d035b5feadb92b4"
+              }
+            ],
+            "apt_metadata_sha256": {
+              "apt.repos.intel.com_oneapi_dists_all_main_binary-amd64_Packages": "d0de3f754e88b1bec147a436ad9fe5ebebd1489868641709d3a37daff6b9b505",
+              "apt.repos.intel.com_oneapi_dists_all_main_binary-all_Packages": "f72ebe43fc98f3da29f9c6df11d9eba8a904d28b99c3e82d67611c004d0a35d1",
+              "apt.repos.intel.com_oneapi_dists_all_InRelease": "2d41634becf75840324d2b963b47554626d63514c93dc8378da8df58b6b8952d"
+            },
+            "binary": "opt/intel/oneapi/compiler/2026.2/bin/icx",
+            "binary_sha256": "91ec5016b4a4fef52406e9286f3d932f8bea2da98b3a22228909f908df27832c"
+          }
+        }
+      },
+      "comparable_call_scope": true,
+      "scope_warning": null
+    }
+  ],
+  "failures": []
+}

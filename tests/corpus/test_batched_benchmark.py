@@ -69,7 +69,32 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text()),old)
             self.assertFalse(Path(str(path)+'.tmp').exists())
 
-if __name__=='__main__':unittest.main()
+class RuntimeLibraryTests(unittest.TestCase):
+    def test_runtime_is_content_pinned_and_belongs_only_to_its_arm(self):
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/'runtime with spaces.a';path.write_bytes(b'!<arch>\n')
+            libraries=runner.runtime_library_inputs(['icx='+str(path)],['gcc','icx'])
+            self.assertEqual(libraries['gcc'],[])
+            self.assertEqual(libraries['icx'],[{'path':str(path),'sha256':runner.sha(path)}])
+            self.assertEqual(runner.runtime_library_paths(libraries,'icx'),[str(path)])
+            path.write_bytes(b'!<arch>\nchanged')
+            with self.assertRaisesRegex(ValueError,'changed'):
+                runner.runtime_library_paths(libraries,'icx')
+
+    def test_unknown_arms_and_external_archive_members_are_refused(self):
+        for spec in ('missing', 'no-such-compiler=/a', 'icx='):
+            with self.assertRaises(ValueError):
+                runner.runtime_library_inputs([spec],['icx'])
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/'thin.a';path.write_bytes(b'!<thin>\n')
+            with self.assertRaisesRegex(ValueError,'self-contained'):
+                runner.runtime_library_inputs(['icx='+str(path)],['icx'])
+
+    def test_runtime_identity_change_invalidates_resume(self):
+        fixture=ResumeTests();old,identity=fixture.fixture()
+        old['identity']['runtime_libraries']={'a':[],'b':[]}
+        identity['runtime_libraries']={'a':[{'path':'/runtime.a','sha256':'new'}],'b':[]}
+        with self.assertRaises(ValueError):fixture.validate(old,identity)
 
 
 class MeasuredObjectCommandTests(unittest.TestCase):
@@ -86,3 +111,6 @@ class MeasuredObjectCommandTests(unittest.TestCase):
     def test_unknown_mode_is_rejected(self):
         with self.assertRaises(ValueError):
             runner.measured_object_commands([], 'cc', 'w.c', 'w.s', 'w.o', 'objcopy')
+
+
+if __name__=='__main__':unittest.main()

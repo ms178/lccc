@@ -36,6 +36,7 @@
   "tls_seg_access": "-DPASSES=100",
   "zlib_ng_adler32": "-DDATA_SIZE=16384 -DPASSES=4",
   "zlib_ng_adler32_combine": "-DPASSES=10000",
+  "zlib_ng_crc32_combine": "-DPASSES=128",
   "zlib_ng_compare256": "-DPASSES=32",
   "zlib_ng_huffman_heap": "-DPASSES=8",
   "expat_xml_scan": "-DXML_SIZE=16384 -DPASSES=4",
