@@ -1627,6 +1627,28 @@ fn shifted_jmp_target_touches_frame(
 /// or a shifted unconditional jmp whose target block accesses a frame slot.
 /// A fall-through/loop-header label deliberately does not reset the depth:
 /// loop back-edges legitimately target a label inside an open push/pop window.
+///
+/// A sibling call the codegen published (`# LCCC_TAIL_CALL` behind its
+/// `jmp`, [`super::liveness::tail_call_marked`]) leaves the function as a
+/// `ret` does, whether it jumps to a symbol or through a register: the
+/// epilogue before it has released the frame, which is the displacement it
+/// is reached at, and nothing behind it is reached from it.  Read as a
+/// branch at a displaced `%rsp`, `jmpq *%r10` gave up the whole function --
+/// `return o->fn(1);` kept the store of the target it had just loaded and
+/// the frame around it,
+///
+/// ```text
+///     subq $8, %rsp
+///     movq (%rdi), %r10
+///     movq %r10, 0(%rsp)
+///     movl $1, %edi
+///     addq $8, %rsp
+///     jmpq *%r10
+/// ```
+///
+/// -- and `jmp f@PLT` was asked what the block behind the next label reads,
+/// which is not where it goes: with a frame access there, every never-read
+/// store of the function stayed.
 fn step_rsp_depth(
     store: &LineStore,
     infos: &[LineInfo],
@@ -1636,12 +1658,14 @@ fn step_rsp_depth(
     path_ended: &mut bool,
 ) -> bool {
     let t = infos[k].trimmed(store.get(k));
+    let sibling_call = matches!(infos[k].kind, LineKind::Jmp | LineKind::JmpIndirect)
+        && super::liveness::tail_call_marked(store, infos, k);
     if infos[k].kind == LineKind::Label {
         if *path_ended {
             *rsp_delta = 0;
         }
         *path_ended = false;
-    } else if infos[k].kind == LineKind::Ret {
+    } else if infos[k].kind == LineKind::Ret || sibling_call {
         *path_ended = true;
     } else if infos[k].kind == LineKind::Jmp {
         if *rsp_delta != 0 && shifted_jmp_target_touches_frame(store, infos, k, func_end) {
@@ -1676,7 +1700,9 @@ fn step_rsp_depth(
         }
     }
     // A branch that leaves RSP displaced cannot be folded into a bare step.
-    *rsp_delta == 0 || !matches!(infos[k].kind, LineKind::CondJmp | LineKind::JmpIndirect)
+    *rsp_delta == 0
+        || sibling_call
+        || !matches!(infos[k].kind, LineKind::CondJmp | LineKind::JmpIndirect)
 }
 
 /// True when `line` is a LEA whose `(%rbp)` operand names a DATA register, not
@@ -1791,6 +1817,95 @@ mod tests {
         assert!(!infos[stores[0]].is_nop() && !infos[stores[1]].is_nop());
         assert!(infos[stores[2]].is_nop() && !infos[stores[3]].is_nop());
         assert!(!eliminate_dead_stores(&store, &mut infos));
+    }
+
+    /// The lines of `asm` that are left and name a frame slot.
+    fn frame_lines_left(asm: &str) -> Vec<String> {
+        let (store, mut infos) = build(asm);
+        eliminate_never_read_stores(&store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim_ascii().to_string())
+            .filter(|t| t.contains("(%rsp)"))
+            .collect()
+    }
+
+    /// `return o->fn(1);` -- the target is loaded, parked in its home and
+    /// jumped through.  Nothing reads the home, and the sibling call leaves
+    /// the function: the store goes.
+    #[test]
+    fn a_never_read_store_before_an_indirect_sibling_call_goes() {
+        let asm = concat!(
+            "c1:\n",
+            ".cfi_startproc\n",
+            "    subq $8, %rsp\n",
+            ".cfi_def_cfa_offset 16\n",
+            "    movq (%rdi), %r10\n",
+            "    movq %r10, 0(%rsp)\n",
+            "    movl $1, %edi\n",
+            "    addq $8, %rsp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    jmpq *%r10\n",
+            "    # LCCC_TAIL_CALL\n",
+            "    # LCCC_CALL_ARGS 1\n",
+            "    # LCCC_CALL_FP 0\n",
+            ".cfi_endproc\n",
+            ".size c1, .-c1\n",
+        );
+        assert_eq!(frame_lines_left(asm), Vec::<String>::new());
+
+        // The control: the same jump without the marker is a computed goto
+        // for all this pass knows, reached at a displaced `%rsp`, and the
+        // function is left as it is.
+        let unmarked = asm.replace("    # LCCC_TAIL_CALL\n", "");
+        assert_eq!(frame_lines_left(&unmarked), ["movq %r10, 0(%rsp)"]);
+
+        // A slot that IS read before the call keeps its store.
+        let read = asm.replace(
+            "    movl $1, %edi\n",
+            "    movl $1, %edi\n    movq 0(%rsp), %rsi\n",
+        );
+        assert_eq!(
+            frame_lines_left(&read),
+            ["movq %r10, 0(%rsp)", "movq 0(%rsp), %rsi"]
+        );
+    }
+
+    /// A direct sibling call in the middle of a function: the block behind
+    /// the next label is not where it goes, so what that block reads says
+    /// nothing about the depth the call leaves at.  The never-read store of
+    /// the function goes; the slot the other path reads keeps its store.
+    #[test]
+    fn a_sibling_call_does_not_ask_the_next_block_what_it_reads() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subq $24, %rsp\n",
+            ".cfi_def_cfa_offset 32\n",
+            "    movq %rsi, 0(%rsp)\n",
+            "    movq %rdx, 8(%rsp)\n",
+            "    testl %edi, %edi\n",
+            "    je .LBB2\n",
+            ".LBB1:\n",
+            "    addq $24, %rsp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    jmp g@PLT\n",
+            "    # LCCC_TAIL_CALL\n",
+            "    # LCCC_CALL_ARGS 1\n",
+            "    # LCCC_CALL_FP 0\n",
+            ".LBB2:\n",
+            ".cfi_def_cfa_offset 32\n",
+            "    movq 8(%rsp), %rax\n",
+            "    addq $24, %rsp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        assert_eq!(
+            frame_lines_left(asm),
+            ["movq %rdx, 8(%rsp)", "movq 8(%rsp), %rax"]
+        );
     }
 
     /// `popcnt` is no `pop`: `%rsp` stands where it stood, and the slot read

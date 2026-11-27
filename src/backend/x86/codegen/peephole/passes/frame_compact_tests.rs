@@ -567,6 +567,71 @@ fn d_a_local_jmp_is_not_a_sibling_call() {
 }
 
 #[test]
+fn d_a_dead_frame_around_a_published_indirect_sibling_call_folds() {
+    // `return o->fn(1);`: the jump through the register is a sibling call
+    // by its marker, and the frame around it holds nothing.
+    let out = run(&f(concat!(
+        "    subq $8, %rsp\n",
+        "    .cfi_def_cfa_offset 16\n",
+        "    movq (%rdi), %r10\n",
+        "    movl $1, %edi\n",
+        "    addq $8, %rsp\n",
+        "    .cfi_def_cfa_offset 8\n",
+        "    jmpq *%r10\n",
+        "    # LCCC_TAIL_CALL\n",
+        "    # LCCC_CALL_ARGS 1\n",
+        "    # LCCC_CALL_FP 0",
+    )));
+    assert_eq!(count(&out, "%rsp"), 0, "{}", out);
+    assert_eq!(count(&out, "jmpq *%r10"), 1, "{}", out);
+    assert_eq!(count(&out, "movq (%rdi), %r10"), 1, "{}", out);
+}
+
+#[test]
+fn d_the_parked_target_of_an_indirect_sibling_call_goes_with_its_frame() {
+    // The same function as the code generator writes it: the target is
+    // parked in its home, which nothing reads.  The store goes
+    // (`eliminate_never_read_stores`) and then the frame.
+    let out = run(&f(concat!(
+        "    subq $8, %rsp\n",
+        "    .cfi_def_cfa_offset 16\n",
+        "    movq (%rdi), %rax\n",
+        "    movq %rax, 0(%rsp)\n",
+        "    movq %rax, %r10\n",
+        "    movq $1, %rdi\n",
+        "    addq $8, %rsp\n",
+        "    .cfi_def_cfa_offset 8\n",
+        "    jmpq *%r10\n",
+        "    # LCCC_TAIL_CALL\n",
+        "    # LCCC_CALL_ARGS 1\n",
+        "    # LCCC_CALL_FP 0",
+    )));
+    assert_eq!(count(&out, "%rsp"), 0, "{}", out);
+    assert_eq!(count(&out, "jmpq *%r10"), 1, "{}", out);
+}
+
+#[test]
+fn d_an_indirect_sibling_call_reached_without_its_epilogue_fails_closed() {
+    // Published or not, an exit that the epilogue does not precede is one
+    // this pass does not understand: the frame stays.
+    let out = run(&f(concat!(
+        "    subq $24, %rsp\n",
+        "    .cfi_def_cfa_offset 32\n",
+        "    testl %edi, %edi\n",
+        "    je .LBB1\n",
+        "    jmpq *%r10\n",
+        "    # LCCC_TAIL_CALL\n",
+        "    # LCCC_CALL_ARGS 0\n",
+        "    # LCCC_CALL_FP 0\n",
+        ".LBB1:\n",
+        "    addq $24, %rsp\n",
+        "    ret",
+    )));
+    assert_eq!(count(&out, "subq $24, %rsp"), 1, "{}", out);
+    assert_eq!(count(&out, "addq $24, %rsp"), 1, "{}", out);
+}
+
+#[test]
 fn d_an_indirect_jmp_is_not_a_sibling_call() {
     // A computed goto / indirect tail stays inside the audit's "unknown"
     // class: the frame must survive.
