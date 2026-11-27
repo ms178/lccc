@@ -697,6 +697,12 @@ impl ParsedDeclAttrs {
         // sets it again says so again (`set_typedef_object_atomic`).
         self.set_flag(parsed_attr_flag::TYPEDEF_OBJECT_ATOMIC, false);
     }
+    /// A `volatile` written behind the typedef name: the object is volatile
+    /// whatever the typedef says, and what it says of `_Atomic` stands.
+    #[inline]
+    pub fn mark_typedef_object_volatile(&mut self) {
+        self.set_flag(parsed_attr_flag::TYPEDEF_OBJECT_VOLATILE, true);
+    }
     /// Call after [`Self::set_typedef_object_volatile`]; holds only while
     /// that flag does.
     #[inline]

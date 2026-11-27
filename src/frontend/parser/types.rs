@@ -534,35 +534,7 @@ impl Parser {
                 {
                     if !any_base_specifier {
                         let name = name.clone();
-                        // A typedef carrying a named space qualifies its uses
-                        // as if `__seg_gs` were written there (C: the qualifier
-                        // of `typedef int __seg_gs T` is part of T). An explicit
-                        // keyword qualifier on the same declaration wins.
-                        if self.attrs.parsing_address_space == AddressSpace::Default {
-                            if let Some(&space) = self.typedef_object_spaces.get(&name) {
-                                self.attrs.parsing_address_space = space;
-                            }
-                        }
-                        // A typedef name is a synonym for its declarator text
-                        // (C 6.7.8), so its qualifiers apply to the use. The base
-                        // qualifier (`typedef volatile int *VPI`: the pointee) is
-                        // the specifier's; the object qualifier (`typedef int
-                        // *volatile VIP`) belongs to the declared object and is
-                        // applied by the declarator.
-                        self.attrs.set_typedef_use(true);
-                        if self.typedef_base_volatile.contains(&name) {
-                            self.attrs.set_volatile(true);
-                            self.attrs.volatile_from_stars = false;
-                        }
-                        // `atomic_int x;` is `_Atomic int x;`.
-                        if self.typedef_base_atomic.contains(&name) {
-                            self.attrs.set_atomic(true);
-                        }
-                        self.attrs.set_typedef_object_volatile(
-                            self.typedef_object_volatile.contains(&name),
-                        );
-                        self.attrs
-                            .set_typedef_object_atomic(self.typedef_object_atomic.contains(&name));
+                        self.apply_typedef_qualifiers(&name);
                         flags.typedef_name = Some(name);
                         self.advance();
                         any_base_specifier = true;
@@ -1396,6 +1368,48 @@ impl Parser {
         TypeSpecifier::Typeof(Box::new(expr), unqual)
     }
 
+    /// What the typedef `name` says of the object declared through it, taken
+    /// into the specifiers that name it: its named address space, its base
+    /// qualifiers and its object qualifiers.
+    fn apply_typedef_qualifiers(&mut self, name: &str) {
+        // A typedef carrying a named space qualifies its uses as if
+        // `__seg_gs` were written there (C: the qualifier of `typedef int
+        // __seg_gs T` is part of T). An explicit keyword qualifier on the
+        // same declaration wins.
+        if self.attrs.parsing_address_space == AddressSpace::Default {
+            if let Some(&space) = self.typedef_object_spaces.get(name) {
+                self.attrs.parsing_address_space = space;
+            }
+        }
+        // A typedef name is a synonym for its declarator text (C 6.7.8), so
+        // its qualifiers apply to the use. The base qualifier (`typedef
+        // volatile int *VPI`: the pointee) is the specifier's; the object
+        // qualifier (`typedef int *volatile VIP`) belongs to the declared
+        // object and is applied by the declarator.
+        self.attrs.set_typedef_use(true);
+        // A `volatile` written before the name qualifies the type the name
+        // stands for, whole (C11 6.7.3p9): with `typedef int (*fn_t)(int);`,
+        // `volatile fn_t f` is `int (*volatile f)(int)`, an object
+        // qualifier.  Read here, before the typedef's base brings the same
+        // flag for what is the pointee's (`VPI p` declares a plain pointer);
+        // one written behind the name is read where it is consumed
+        // (`consume_qualifier_after_base`, `consume_post_type_qualifiers`).
+        let written_volatile = self.attrs.parsing_volatile() && !self.attrs.volatile_from_stars;
+        if self.typedef_base_volatile.contains(name) {
+            self.attrs.set_volatile(true);
+            self.attrs.volatile_from_stars = false;
+        }
+        // `atomic_int x;` is `_Atomic int x;`.
+        if self.typedef_base_atomic.contains(name) {
+            self.attrs.set_atomic(true);
+        }
+        self.attrs.set_typedef_object_volatile(
+            written_volatile || self.typedef_object_volatile.contains(name),
+        );
+        self.attrs
+            .set_typedef_object_atomic(self.typedef_object_atomic.contains(name));
+    }
+
     /// Consume trailing qualifiers and _Complex that may follow a resolved base type.
     /// C allows "int static x;" and "double _Complex".
     /// A `const`, `constexpr`, `volatile` or `restrict` after a base type
@@ -1407,6 +1421,12 @@ impl Parser {
             TokenKind::Volatile => {
                 self.attrs.set_volatile(true);
                 self.attrs.volatile_from_stars = false;
+                // Behind a typedef name it qualifies the named type, as
+                // before it (`fn_t volatile f`; see the typedef name's arm
+                // of `parse_type_specifier`).
+                if self.attrs.parsing_typedef_use() {
+                    self.attrs.mark_typedef_object_volatile();
+                }
             }
             TokenKind::Restrict => self.attrs.set_restrict(true),
             TokenKind::Constexpr => {

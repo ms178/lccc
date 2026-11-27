@@ -2448,6 +2448,12 @@ impl Parser {
                 TokenKind::Volatile => {
                     self.advance();
                     self.attrs.set_volatile(true);
+                    // Behind a typedef name it qualifies the named type
+                    // (`fn_t volatile f`), as `consume_qualifier_after_base`
+                    // reads it.
+                    if self.attrs.parsing_typedef_use() {
+                        self.attrs.mark_typedef_object_volatile();
+                    }
                 }
                 TokenKind::Restrict | TokenKind::Inline | TokenKind::Register => {
                     self.advance();

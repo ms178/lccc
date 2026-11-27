@@ -389,12 +389,13 @@ impl Parser {
             inner_object_volatile
         } else {
             match combined.last() {
-                // A qualifier in the specifiers qualifies the type the
-                // typedef names, whole (C11 6.7.3p9: with `typedef int
-                // (*fn_t)(int);`, `volatile fn_t f` is `int (*volatile
-                // f)(int)`, not a pointer to something volatile), and so
-                // does the typedef's own.
-                None if typedef_use => typedef_object_volatile || spec_volatile,
+                // A typedef name's object qualifier is the typedef's own
+                // (`typedef int *volatile VIP`) or one written beside the
+                // name (`volatile fn_t f`), which the specifiers fold into
+                // the same flag where they read the keyword.  The base
+                // qualifier (`spec_volatile` on a typedef use: `typedef
+                // volatile int *VPI`) is the pointee's or the element's.
+                None if typedef_use => typedef_object_volatile,
                 None => spec_volatile,
                 Some(DerivedDeclarator::Pointer(..)) => last_star_volatile.unwrap_or(false),
                 Some(_) => false,
@@ -2428,6 +2429,8 @@ mod object_volatile_tests {
         let found = object_volatile(
             "typedef int (*fn_t)(int);\n\
              typedef int *ip_t;\n\
+             typedef volatile int *vpi_t;\n\
+             typedef volatile fn_t vfn_t;\n\
              typedef volatile int vint;\n\
              int plain;\n\
              volatile int scalar;\n\
@@ -2444,11 +2447,25 @@ mod object_volatile_tests {
              fn_t volatile typedef_after;\n\
              fn_t plain_typedef;\n\
              volatile ip_t data_typedef;\n\
-             volatile fn_t *to_volatile_typedef;\n",
+             volatile fn_t *to_volatile_typedef;\n\
+             vpi_t pointee_typedef;\n\
+             volatile vpi_t both_before;\n\
+             vpi_t volatile both_after;\n\
+             vfn_t chained;\n\
+             volatile fn_t first, second;\n\
+             fn_t *volatile star_first, star_second;\n\
+             volatile fn_t *pointer_first, plain_second;\n\
+             volatile fn_t array[2];\n\
+             vpi_t pointee_array[2];\n\
+             int after_all;\n",
         );
         let expected = [
             ("fn_t", false),
             ("ip_t", false),
+            // The pointee's qualifier is no qualifier of the pointer ...
+            ("vpi_t", false),
+            // ... and one beside a typedef name is the named type's.
+            ("vfn_t", true),
             ("vint", true),
             ("plain", false),
             ("scalar", true),
@@ -2469,6 +2486,26 @@ mod object_volatile_tests {
             ("plain_typedef", false),
             ("data_typedef", true),
             ("to_volatile_typedef", false),
+            // `typedef volatile int *vpi_t; vpi_t p;` is a plain pointer to
+            // a volatile int: the base qualifier the typedef brings is not
+            // one written beside its name.
+            ("pointee_typedef", false),
+            ("both_before", true),
+            ("both_after", true),
+            ("chained", true),
+            // The specifiers' qualifier is every declarator's, a star's its
+            // own declarator's.
+            ("first", true),
+            ("second", true),
+            ("star_first", true),
+            ("star_second", false),
+            ("pointer_first", false),
+            ("plain_second", true),
+            // An array is no volatile object by this flag: its elements
+            // are, which the base flag says.
+            ("array", false),
+            ("pointee_array", false),
+            ("after_all", false),
         ];
         let expected: Vec<(String, bool)> = expected
             .iter()
