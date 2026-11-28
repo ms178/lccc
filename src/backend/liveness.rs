@@ -342,6 +342,12 @@ struct BlockTouch {
     last: u32,
     /// `first` is a definition (the value is born there, not live-in).
     first_is_def: bool,
+    /// Latest read in `block` strictly preceding `first_redef`.
+    pre_redef_last_use: u32,
+    /// First full-overwrite `Copy` redefinition in `block` after a read.
+    first_redef: u32,
+    /// False if any non-`Copy` def or conflicting event invalidates the split.
+    redef_valid: bool,
 }
 
 /// Per-value, per-block def/use footprints — the local evidence
@@ -390,9 +396,32 @@ impl BlockTouches {
         };
         match slot {
             Some(t) => {
+                if is_def {
+                    // Any non-Copy definition (including same-block multi-def)
+                    // conservatively invalidates same-block redef splitting.
+                    t.redef_valid = false;
+                    t.first_redef = u32::MAX;
+                } else if t.first_redef != u32::MAX {
+                    if point < t.first_redef {
+                        if t.pre_redef_last_use == u32::MAX || point > t.pre_redef_last_use {
+                            t.pre_redef_last_use = point;
+                        }
+                    } else if point == t.first_redef {
+                        t.redef_valid = false;
+                        t.first_redef = u32::MAX;
+                    }
+                } else if !t.first_is_def {
+                    if t.pre_redef_last_use == u32::MAX || point > t.pre_redef_last_use {
+                        t.pre_redef_last_use = point;
+                    }
+                }
                 if point < t.first || (point == t.first && is_def) {
                     t.first = point;
                     t.first_is_def = is_def;
+                    if is_def {
+                        t.redef_valid = false;
+                        t.first_redef = u32::MAX;
+                    }
                 }
                 if point > t.last {
                     t.last = point;
@@ -403,7 +432,37 @@ impl BlockTouches {
                 first: point,
                 last: point,
                 first_is_def: is_def,
+                pre_redef_last_use: if is_def { u32::MAX } else { point },
+                first_redef: u32::MAX,
+                redef_valid: !is_def,
             }),
+        }
+    }
+
+    fn add_copy_redef(&mut self, dense: usize, block: usize, point: u32) {
+        let block_u32 = block as u32;
+        let list = &mut self.per_value[dense];
+        let slot = match list.last_mut() {
+            Some(t) if t.block == block_u32 => Some(t),
+            _ => list.iter_mut().rev().find(|t| t.block == block_u32),
+        };
+        match slot {
+            Some(t) => {
+                if t.redef_valid
+                    && !t.first_is_def
+                    && t.first_redef == u32::MAX
+                    && t.pre_redef_last_use != u32::MAX
+                    && point > t.pre_redef_last_use
+                {
+                    t.first_redef = point;
+                } else if t.first_redef == u32::MAX {
+                    t.redef_valid = false;
+                }
+                if point > t.last {
+                    t.last = point;
+                }
+            }
+            None => self.add(dense, block, point, true),
         }
     }
 
@@ -891,11 +950,16 @@ fn assign_program_points(
             if let Some(dest) = inst.dest() {
                 if !alloca_set.contains(&dest.0) {
                     if let Some(&dense) = id_to_dense.get(&dest.0) {
-                        if def_points[dense] == u32::MAX {
+                        let was_defined = def_points[dense] != u32::MAX;
+                        if !was_defined {
                             def_points[dense] = point;
                         }
                         kill.insert(dense);
-                        touches.add(dense, block_idx, point, true);
+                        if was_defined && matches!(inst, Instruction::Copy { .. }) {
+                            touches.add_copy_redef(dense, block_idx, point);
+                        } else {
+                            touches.add(dense, block_idx, point, true);
+                        }
                     }
                 }
             }
@@ -2497,6 +2561,32 @@ fn build_segments(
                 let e = if lo { be } else { t.last };
                 (s, e)
             });
+
+            // When a block is both live-in and live-out, yet the incoming
+            // value finishes all pre-redef reads and is then unconditionally
+            // overwritten by a full `Copy` redefinition in the same block,
+            // `[pre_redef_last_use, first_redef)` is a genuine hole inside
+            // the block (`chacha20_core` phi accumulators).
+            if li
+                && lo
+                && let Some(t) = touch
+                && t.redef_valid
+                && t.first_redef != u32::MAX
+                && t.pre_redef_last_use != u32::MAX
+                && t.pre_redef_last_use < t.first_redef
+            {
+                let hole_hit =
+                    |p: u32| p != u32::MAX && p > t.pre_redef_last_use && p < t.first_redef;
+                if !hole_hit(def) && !hole_hit(last) {
+                    if t.pre_redef_last_use >= bs {
+                        cover[dense].push((bs, t.pre_redef_last_use));
+                    }
+                    if be >= t.first_redef {
+                        cover[dense].push((t.first_redef, be));
+                    }
+                    return;
+                }
+            }
 
             let piece = match (envelope, local) {
                 (Some((es, ee)), Some((ls, le))) => Some((es.min(ls), ee.max(le))),

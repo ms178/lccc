@@ -4291,12 +4291,125 @@ struct CalleeContext {
     semantic_interposition: bool,
 }
 
+fn live_reachable_function_names<'a>(
+    module: &'a IrModule,
+    value_referenced: &FxHashSet<String>,
+    asm_templates: &[String],
+    asm_context: &crate::common::asm_scan::AsmSymbolContext,
+) -> Option<FxHashSet<&'a str>> {
+    let mut alias_to_name: FxHashMap<&'a str, Vec<&'a str>> = FxHashMap::default();
+    let mut by_name: FxHashMap<&'a str, &'a IrFunction> = FxHashMap::default();
+    for f in &module.functions {
+        if !f.is_declaration {
+            by_name.insert(f.name.as_str(), f);
+            alias_to_name
+                .entry(f.name.as_str())
+                .or_default()
+                .push(f.name.as_str());
+            if let Some(alias) = module.asm_labels.get(&f.name) {
+                alias_to_name
+                    .entry(alias.as_str())
+                    .or_default()
+                    .push(f.name.as_str());
+            }
+        }
+    }
+    let has_toplevel_asm = !module.toplevel_asm.is_empty();
+    let mut roots: Vec<&'a str> = Vec::new();
+    for f in &module.functions {
+        if f.is_declaration {
+            continue;
+        }
+        let asm_alias = module
+            .asm_labels
+            .get(&f.name)
+            .filter(|a| a.as_str() != f.name.as_str())
+            .map(String::as_str);
+        let addr_ref = callee_is_address_referenced(
+            &f.name,
+            asm_alias,
+            value_referenced,
+            asm_templates,
+            asm_context,
+        );
+        let toplevel_ref = has_toplevel_asm
+            && (asm_context.any_blob_references(&module.toplevel_asm, &f.name)
+                || asm_alias
+                    .is_some_and(|a| asm_context.any_blob_references(&module.toplevel_asm, a)));
+        let is_ctor_or_dtor = module.constructors.iter().any(|c| c == &f.name)
+            || module.destructors.iter().any(|d| d == &f.name)
+            || module
+                .aliases
+                .iter()
+                .any(|(a, t, _)| a == &f.name || t == &f.name)
+            || module
+                .ifuncs
+                .iter()
+                .any(|(i, r, _, _)| i == &f.name || r == &f.name);
+        if !f.is_static
+            || f.is_used
+            || f.name == "main"
+            || addr_ref
+            || toplevel_ref
+            || is_ctor_or_dtor
+        {
+            roots.push(f.name.as_str());
+        }
+    }
+    if roots.is_empty() {
+        return None;
+    }
+    let mut live: FxHashSet<&'a str> = FxHashSet::default();
+    let mut worklist: Vec<&'a str> = Vec::new();
+    for r in roots {
+        if live.insert(r) {
+            worklist.push(r);
+        }
+    }
+    while let Some(name) = worklist.pop() {
+        let Some(f) = by_name.get(name) else {
+            continue;
+        };
+        for block in &f.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Call {
+                    func: callee_name, ..
+                } = inst
+                {
+                    if let Some(targets) = alias_to_name.get(callee_name.as_str()) {
+                        for &target in targets {
+                            if live.insert(target) {
+                                worklist.push(target);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(live)
+}
+
 fn callee_context(module: &IrModule) -> CalleeContext {
     let (value_referenced, asm_templates) = collect_value_referenced_functions(module);
     let asm_context = module.asm_symbol_context();
+    // Dead static functions left behind after Pass 1 inlined their callers
+    // still sit in `module.functions` until Phase 11 dead-statics cleanup.
+    // Excluding unreachable static bodies keeps their dead call sites from
+    // inflating `direct_calls` and locking out `loop_guard` targets (`sqlite_get_varint`).
+    let live_funcs =
+        live_reachable_function_names(module, &value_referenced, &asm_templates, &asm_context);
+    let is_live = |f: &IrFunction| {
+        live_funcs
+            .as_ref()
+            .is_none_or(|live| live.contains(f.name.as_str()))
+    };
     let mut call_site_counts: FxHashMap<String, usize> = FxHashMap::default();
     let mut sole_caller: FxHashMap<String, String> = FxHashMap::default();
     for f in &module.functions {
+        if !is_live(f) {
+            continue;
+        }
         for block in &f.blocks {
             for inst in &block.instructions {
                 if let Instruction::Call {
@@ -4389,6 +4502,9 @@ fn callee_context(module: &IrModule) -> CalleeContext {
         // once-called functions (to classify the enclosing caller as cold).
         let mut needs_loop_info_for_census: FxHashSet<usize> = FxHashSet::default();
         for (idx, f) in module.functions.iter().enumerate() {
+            if !is_live(f) {
+                continue;
+            }
             if f.blocks.iter().any(|block| {
                 block.instructions.iter().any(|inst| {
                     matches!(inst, Instruction::Call { func: callee_name, .. }
@@ -4402,6 +4518,9 @@ fn callee_context(module: &IrModule) -> CalleeContext {
         // classification, but only if they actually contain loops.
         let mut sole_caller_indices: FxHashMap<&str, usize> = FxHashMap::default();
         for (idx, f) in module.functions.iter().enumerate() {
+            if !is_live(f) {
+                continue;
+            }
             sole_caller_indices.insert(f.name.as_str(), idx);
         }
         let once_called_names: Vec<String> = module

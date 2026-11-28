@@ -23666,15 +23666,14 @@ fn hoist_fma_a_broadcast(
 /// ZERO-REM-2: the FMA scalar remainder is provably dead, so
 /// `insert_remainder_loop` omits it (and the four blocks that carry it).
 ///
-/// The quad (16 doubles per iteration) packed loop covers
-/// `floor(N / 16) * 16` elements; when the trip count is a compile-time
-/// constant that the width divides exactly, the remainder would run zero
-/// iterations.  What the omission SAVES is not just the loop: the remainder
-/// costs the resume math, re-materialised stream bases, three live pointers,
-/// a scalar body that keeps the FMA unit's operands live across the packed
-/// loop, and the callee-saved pushes and stack spills that holding them
-/// costs.  Measured on the k-unrolled chain shapes, it is most of the
-/// function's frame.
+/// The packed FMA loop covers `floor(N / W) * W` elements (`W = 4` for the
+/// two-vector SSE/NEON forms, `W = 16` for the quad AVX2/FMA form); when
+/// the trip count is a compile-time constant that `W` divides exactly, the
+/// remainder would run zero iterations.  What the omission SAVES is not just
+/// the loop: the remainder costs the resume math, re-materialised stream
+/// bases, three live pointers, a scalar body that keeps the FMA unit's
+/// operands live across the packed loop, and the callee-saved pushes and
+/// stack spills that holding them costs.
 ///
 /// The three conjuncts after the width/unit checks are the proof's other
 /// halves: `const_trip_covers_exactly` gives the element-count arithmetic
@@ -23688,9 +23687,9 @@ fn fma_remainder_is_dead(
     pattern: &VectorizablePattern,
     vec_width: usize,
 ) -> bool {
-    vec_width == 16
+    matches!(vec_width, 4 | 8 | 16)
         && !no_map_zero_rem()
-        && const_trip_covers_exactly(&pattern.limit, 0, 16, 8)
+        && const_trip_covers_exactly(&pattern.limit, 0, vec_width as u64, 8)
         && fma_iv_starts_at_zero(func, pattern)
         && fma_loop_is_closed(func, pattern)
 }
@@ -32810,6 +32809,191 @@ mod map_unroll_policy_tests {
     }
 }
 
+fn distinct_copy_bases(func: &IrFunction, src_base: Value, dst_base: Value) -> bool {
+    if src_base == dst_base {
+        return false;
+    }
+    enum BaseKind<'a> {
+        Global(&'a str),
+        Alloca(Value),
+    }
+    let resolve = |mut v: Value| -> Option<BaseKind<'_>> {
+        for _ in 0..8 {
+            let mut next = None;
+            for b in &func.blocks {
+                for inst in &b.instructions {
+                    match inst {
+                        Instruction::GlobalAddr { dest, name } if *dest == v => {
+                            return Some(BaseKind::Global(name.as_str()));
+                        }
+                        Instruction::Alloca { dest, .. } if *dest == v => {
+                            return Some(BaseKind::Alloca(*dest));
+                        }
+                        Instruction::Copy {
+                            dest,
+                            src: Operand::Value(s),
+                        } if *dest == v => {
+                            next = Some(*s);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            v = next?;
+        }
+        None
+    };
+    match (resolve(src_base), resolve(dst_base)) {
+        (Some(BaseKind::Global(a)), Some(BaseKind::Global(b))) => a != b,
+        (Some(BaseKind::Alloca(a)), Some(BaseKind::Alloca(b))) => a != b,
+        (Some(BaseKind::Global(_)), Some(BaseKind::Alloca(_)))
+        | (Some(BaseKind::Alloca(_)), Some(BaseKind::Global(_))) => true,
+        _ => false,
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+fn try_straight_line_small_copy(
+    func: &mut IrFunction,
+    pattern: &MapPattern,
+    preheader_idx: usize,
+    src_base: Value,
+    dst_base: Value,
+    load_op: IntrinsicOp,
+    store_op: IntrinsicOp,
+    vec_width: u64,
+    elem_size: u32,
+    trip: i64,
+    next_val_id: &mut u32,
+) -> usize {
+    if trip < vec_width as i64 || trip >= (4 * vec_width) as i64 {
+        return 0;
+    }
+    if !matches!(pattern.exit_cmp_op, IrCmpOp::Slt | IrCmpOp::Ult)
+        || !pattern.guarded_streams.is_empty()
+        || pattern.src_geps.len() != 1
+        || !matches!(pattern.expr, MapExpr::Load(0))
+        || !distinct_copy_bases(func, src_base, dst_base)
+    {
+        return 0;
+    }
+    let header_label = func.blocks[pattern.header_idx].label;
+    let outside_preds = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(bi, b)| {
+            !pattern.loop_blocks.contains(bi)
+                && matches!(
+                    &b.terminator,
+                    Terminator::Branch(l) if *l == header_label
+                )
+        })
+        .count();
+    let other_preds = func.blocks.iter().enumerate().any(|(bi, b)| {
+        !pattern.loop_blocks.contains(&bi)
+            && bi != preheader_idx
+            && match &b.terminator {
+                Terminator::Branch(l) => *l == header_label,
+                Terminator::CondBranch {
+                    true_label,
+                    false_label,
+                    ..
+                } => *true_label == header_label || *false_label == header_label,
+                Terminator::Switch { cases, default, .. } => {
+                    *default == header_label || cases.iter().any(|(_, l)| *l == header_label)
+                }
+                _ => false,
+            }
+    });
+    if outside_preds != 1 || other_preds {
+        return 0;
+    }
+    let loop_labels: FxHashSet<BlockId> = pattern
+        .loop_blocks
+        .iter()
+        .map(|&bi| func.blocks[bi].label)
+        .collect();
+    let outside_labels: Vec<BlockId> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(bi, _)| !pattern.loop_blocks.contains(bi))
+        .map(|(_, b)| b.label)
+        .collect();
+    if escaping_iv_uses(func, pattern.iv, &outside_labels) > 0 {
+        return 0;
+    }
+    let exit_has_loop_phi = func.blocks[pattern.exit_idx]
+        .instructions
+        .iter()
+        .any(|inst| {
+            matches!(
+                inst,
+                Instruction::Phi { incoming, .. }
+                    if incoming.iter().any(|(_, l)| loop_labels.contains(l))
+            )
+        });
+    if exit_has_loop_phi {
+        return 0;
+    }
+    let Some(src_plan) = plan_remainder_reference(func, src_base, &pattern.loop_blocks) else {
+        return 0;
+    };
+    let Some(dst_plan) = plan_remainder_reference(func, dst_base, &pattern.loop_blocks) else {
+        return 0;
+    };
+
+    let mut extra = Vec::new();
+    let src_ptr = materialize_remainder_reference(src_plan, &mut extra, next_val_id);
+    let dst_ptr = materialize_remainder_reference(dst_plan, &mut extra, next_val_id);
+    let n = trip as u64;
+    let full_vecs = n / vec_width;
+    let tail = n % vec_width;
+    let mut emit_pair = |disp: i64| {
+        let loaded = Value(*next_val_id);
+        *next_val_id += 1;
+        let mut load_args = vec![Operand::Value(src_ptr), Operand::Const(IrConst::I64(0))];
+        if disp != 0 {
+            load_args.push(Operand::Const(IrConst::I64(disp)));
+        }
+        extra.push(Instruction::Intrinsic {
+            dest: Some(loaded),
+            op: load_op,
+            dest_ptr: None,
+            args: load_args,
+        });
+        let mut store_args = vec![
+            Operand::Value(loaded),
+            Operand::Value(dst_ptr),
+            Operand::Const(IrConst::I64(0)),
+        ];
+        if disp != 0 {
+            store_args.push(Operand::Const(IrConst::I64(disp)));
+        }
+        extra.push(Instruction::Intrinsic {
+            dest: None,
+            op: store_op,
+            dest_ptr: Some(dst_ptr),
+            args: store_args,
+        });
+    };
+    for k in 0..full_vecs {
+        let disp = (k * vec_width * u64::from(elem_size)) as i64;
+        emit_pair(disp);
+    }
+    if tail > 0 {
+        let disp = ((n - vec_width) * u64::from(elem_size)) as i64;
+        emit_pair(disp);
+    }
+    let added = extra.len();
+    let exit_label = func.blocks[pattern.exit_idx].label;
+    func.blocks[preheader_idx].extend_insts(extra, crate::common::source::Span::dummy());
+    func.blocks[preheader_idx].terminator = Terminator::Branch(exit_label);
+    func.next_value_id = *next_val_id;
+    added + 1
+}
+
 fn transform_map_vector(
     func: &mut IrFunction,
     pattern: &MapPattern,
@@ -33198,6 +33382,30 @@ fn transform_map_vector(
         (IrType::I16 | IrType::U16, false) => IntrinsicOp::VecStoreI32x4,
         _ => return 0,
     };
+
+    if !neon && !no_map_zero_rem() {
+        if let Some(trip) = constant_trip {
+            if pattern.src_geps.len() == 1 {
+                let straight_changes = try_straight_line_small_copy(
+                    func,
+                    pattern,
+                    preheader_idx,
+                    src_bases[0],
+                    dst_base,
+                    load_op,
+                    store_op,
+                    vec_width,
+                    elem_size,
+                    trip,
+                    &mut next_val_id,
+                );
+                if straight_changes > 0 {
+                    return straight_changes;
+                }
+            }
+        }
+    }
+
     let bin_op = |op: &IrBinOp| -> Option<IntrinsicOp> {
         match (pattern.elem_ty, avx2, op) {
             (IrType::F64, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddF64x4),

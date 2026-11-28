@@ -1909,6 +1909,64 @@ pub(crate) fn collect_frame_indexed_fold_dests(
         .collect()
 }
 
+/// Non-frame, non-global indexed-fold GEPs (`dest -> (base, index)`) on x86-64.
+/// When both `base` and `index` receive GPR homes, `can_indexed_addr_fold`
+/// skips the GEP and folds `disp(%base,%index,scale)` directly at every access,
+/// so a cross-block GEP dest never needs a register of its own.
+pub(crate) fn collect_reg_indexed_fold_deps(
+    func: &IrFunction,
+    seg_indexed: bool,
+) -> FxHashMap<u32, (u32, u32)> {
+    let use_counts = count_value_uses(func);
+    let stab = analyze_base_stability(func);
+    let map = build_indexed_gep_map(func, &use_counts, &stab, seg_indexed);
+    if map.is_empty() {
+        return FxHashMap::default();
+    }
+    let mut non_reg_bases: FxHashSet<u32> = FxHashSet::default();
+    let mut load_cmp: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Alloca { dest, .. } | Instruction::GlobalAddr { dest, .. } => {
+                    non_reg_bases.insert(dest.0);
+                }
+                _ => {}
+            }
+        }
+        for (_dest, (ptr, _ty, _imm)) in detect_load_cmp_mem_fold(block, &use_counts) {
+            load_cmp.insert(ptr);
+        }
+    }
+    map.into_iter()
+        .filter(|(dest, info)| {
+            !non_reg_bases.contains(&info.base.0)
+                && !load_cmp.contains(dest)
+                && info.shift <= 3
+                && !info.access_tys.is_empty()
+                && info.access_tys.iter().all(|t| {
+                    matches!(
+                        t,
+                        IrType::F64
+                            | IrType::F32
+                            | IrType::D64
+                            | IrType::D32
+                            | IrType::I8
+                            | IrType::U8
+                            | IrType::I16
+                            | IrType::U16
+                            | IrType::I32
+                            | IrType::U32
+                            | IrType::I64
+                            | IrType::U64
+                            | IrType::Ptr
+                    )
+                })
+        })
+        .map(|(dest, info)| (dest, (info.base.0, info.index.0)))
+        .collect()
+}
+
 /// Dest values of INDEXED-fold GEPs (the `base + index*scale` SIB shape),
 /// plus their GlobalAddr BASES. The GEP dests are single-use address
 /// temporaries: when the fold fires (the index holds a register), the GEP

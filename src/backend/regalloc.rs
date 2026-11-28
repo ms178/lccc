@@ -730,6 +730,10 @@ pub struct RegAllocResult {
     /// `defer_const_fold_addresses`); the caller re-admits the addresses of
     /// every base that did not end in `RegAllocConfig::fold_base_regs`.
     pub fold_deferred: FxHashMap<u32, Vec<u32>>,
+    /// Indexed-fold GEP dest -> `(base, index)` deferred in this round (see
+    /// `defer_indexed_fold_addresses`); re-admitted if either `base` or
+    /// `index` fails to get a GPR home.
+    pub indexed_fold_deferred: FxHashMap<u32, (u32, u32)>,
 }
 
 /// Whether x86 can preserve incoming parameters directly in caller-saved homes.
@@ -3856,6 +3860,48 @@ fn defer_const_fold_addresses(
     transfer
 }
 
+/// Defer non-transient register-base indexed-fold GEP dests while both their
+/// `base` and `index` are candidates: on x86-64 the emitter skips the GEP and
+/// emits `disp(%base,%index,scale)` directly whenever both operands get GPRs,
+/// so a cross-block GEP dest would otherwise hold a phantom register without
+/// ever being written or read.
+fn defer_indexed_fold_addresses(
+    func: &IrFunction,
+    eligible: &mut FxHashSet<u32>,
+    readmit: &FxHashSet<u32>,
+) -> (FxHashMap<u32, (u32, u32)>, FxHashMap<u32, Vec<u32>>) {
+    let mut deferred: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
+    let mut transfer: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let seg_indexed = std::env::var_os("CCC_NO_SEG_SIB").is_none();
+    let deps = crate::backend::generation::collect_reg_indexed_fold_deps(func, seg_indexed);
+    if deps.is_empty() {
+        return (deferred, transfer);
+    }
+    let mut by_base: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (&dest, &(base, _)) in &deps {
+        by_base.entry(base).or_default().push(dest);
+    }
+    let transient = transient_fold_addresses(func, &by_base);
+    let mut ordered: Vec<(u32, (u32, u32))> = deps
+        .iter()
+        .filter(|&(_, &(base, index))| !deps.contains_key(&base) && !deps.contains_key(&index))
+        .map(|(&d, &pair)| (d, pair))
+        .collect();
+    ordered.sort_unstable_by_key(|&(d, _)| d);
+    for (dest, (base, index)) in ordered {
+        if !transient.contains(&dest)
+            && !readmit.contains(&dest)
+            && eligible.contains(&base)
+            && eligible.contains(&index)
+            && eligible.remove(&dest)
+        {
+            deferred.insert(dest, (base, index));
+            transfer.entry(base).or_default().push(dest);
+        }
+    }
+    (deferred, transfer)
+}
+
 /// Fold addresses whose deferral relieves no register pressure: every use
 /// sits in the GEP's own block and no instruction between the GEP and its
 /// last use defines a value (`GEP p, C; load`). Such an address dies exactly
@@ -3951,7 +3997,7 @@ pub(crate) fn allocate_registers_with_fold_rounds(
 ) -> RegAllocResult {
     let mut result = allocate_registers(func, config);
     for _ in 0..FOLD_READMIT_ROUNDS {
-        let failed: Vec<u32> = result
+        let mut failed: Vec<u32> = result
             .fold_deferred
             .iter()
             .filter(|(base, _)| {
@@ -3962,6 +4008,11 @@ pub(crate) fn allocate_registers_with_fold_rounds(
             })
             .flat_map(|(_, moved)| moved.iter().copied())
             .collect();
+        for (&dest, &(base, index)) in &result.indexed_fold_deferred {
+            if !result.assignments.contains_key(&base) || !result.assignments.contains_key(&index) {
+                failed.push(dest);
+            }
+        }
         if failed.is_empty() {
             break;
         }
@@ -4671,6 +4722,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             ipa_used: Vec::new(),
             eligible: FxHashSet::default(),
             fold_deferred: FxHashMap::default(),
+            indexed_fold_deferred: FxHashMap::default(),
             assignments: FxHashMap::default(),
             accumulator_assignments: if has_builtin_setjmp {
                 Vec::new()
@@ -5182,15 +5234,34 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     } else {
         FxHashMap::default()
     };
+    let (indexed_fold_deferred, indexed_base_transfer) =
+        if crate::common::types::target_elf_machine() == 62
+            && !config.fold_base_regs.is_empty()
+            && !config.ra_config.no_fold_addr_defer
+            && !config.ra_config.no_folded_index_liveness
+        {
+            defer_indexed_fold_addresses(func, &mut eligible, &config.fold_readmit)
+        } else {
+            (FxHashMap::default(), FxHashMap::default())
+        };
+    let all_fold_transfer = if indexed_base_transfer.is_empty() {
+        fold_use_transfer.clone()
+    } else {
+        let mut combined = fold_use_transfer.clone();
+        for (base, dests) in indexed_base_transfer {
+            combined.entry(base).or_default().extend(dests);
+        }
+        combined
+    };
     // The deferred addresses' accesses read the base's register: they are
     // the base's uses for Phase-1 candidacy (`hot_loop_home`) too. The use
     // MOVES rather than adds: a folded GEP emits nothing, so its own read of
     // the base (already in `use_count`, at the GEP block's weight) is
     // replaced by the accesses' reads. Adding instead double-counted every
     // adjacent `GEP p, C` + access pair and inflated cold bases.
-    if !fold_use_transfer.is_empty() {
-        let def_weight = fold_def_block_weights(func, &fold_use_transfer, &block_loop_weight);
-        for (base, moved) in &fold_use_transfer {
+    if !all_fold_transfer.is_empty() {
+        let def_weight = fold_def_block_weights(func, &all_fold_transfer, &block_loop_weight);
+        for (base, moved) in &all_fold_transfer {
             let mut count = 0u64;
             let mut gep_reads = 0u64;
             let mut depth = 0;
@@ -5249,7 +5320,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             &liveness.block_loop_depth,
             func,
             &config.ra_config,
-            Some(&fold_use_transfer),
+            Some(&all_fold_transfer),
         );
         apply_physical_reg_hints(&mut ranges, &config.reg_hints, &config.reg_prefs);
         bump_folded_index_priority(
@@ -8404,6 +8475,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         liveness: Some(liveness),
         phi_chain,
         fold_deferred: fold_use_transfer,
+        indexed_fold_deferred,
     }
 }
 
@@ -9839,6 +9911,45 @@ fn occupied_pieces(pieces: &[(u32, u32)]) -> Vec<(u32, u32)> {
         .collect()
 }
 
+/// Same-block redef deaths: if `a` has a `Copy { dest: a, .. }` in the same
+/// block after an instruction read at `u`, AND `coverage[a]` ends a non-empty
+/// piece right at `u`, then the old value of `a` dies at `u`
+/// (`chacha20_core` phi accumulators before loop-bottom Copy backedges).
+fn collect_copy_redef_deaths(
+    func: &IrFunction,
+    candidates: &FxHashSet<u32>,
+    coverage: &FxHashMap<u32, Vec<(u32, u32)>>,
+) -> FxHashSet<(u32, u32)> {
+    let mut copy_redef_dies: FxHashSet<(u32, u32)> = FxHashSet::default();
+    let mut pt: u32 = 0;
+    for block in &func.blocks {
+        let mut blk_last_read: FxHashMap<u32, u32> = FxHashMap::default();
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    if candidates.contains(&v.0) {
+                        blk_last_read.insert(v.0, pt);
+                    }
+                }
+            });
+            if let Instruction::Copy { dest, .. } = inst {
+                if let Some(u) = blk_last_read.remove(&dest.0) {
+                    if u < pt
+                        && coverage
+                            .get(&dest.0)
+                            .is_some_and(|ps| ps.iter().any(|&(s, e)| s < e && e == u))
+                    {
+                        copy_redef_dies.insert((dest.0, u));
+                    }
+                }
+            }
+            pt = pt.saturating_add(1);
+        }
+        pt = pt.saturating_add(1);
+    }
+    copy_redef_dies
+}
+
 fn allocate_vector_registers_destructive(
     func: &IrFunction,
     candidates: &FxHashSet<u32>,
@@ -9961,6 +10072,8 @@ fn allocate_vector_registers_destructive(
     let ret_reg_param_loads = x86_return_register_param_loads(func);
     let returned_values = returned_vector_values(func);
 
+    let copy_redef_dies = collect_copy_redef_deaths(func, candidates, &coverage);
+
     // Pass 2: destructive handoff edges.  At the chain instruction defining
     // `d` from first operand `a0`, the edge `d <- a0` is proven when `a0`
     // is never read again afterwards (its exact last read is this very
@@ -10007,10 +10120,12 @@ fn allocate_vector_registers_destructive(
                             && args[pos + 1..]
                                 .iter()
                                 .any(|o| matches!(o, Operand::Value(v) if v.0 == a.0));
+                        let dies_here = last_read.get(&a.0) == Some(&point)
+                            || copy_redef_dies.contains(&(a.0, point));
                         if reused
                             || hidden.contains(&a.0)
                             || liveness.folded_read_points.contains_key(&a.0)
-                            || last_read.get(&a.0) != Some(&point)
+                            || !dies_here
                         {
                             continue;
                         }
