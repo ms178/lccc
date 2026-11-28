@@ -674,6 +674,48 @@ header writes it as a loop over the lanes, or the operands go through the
 stack, it is twenty or a hundred and no test fails. It also found §2.5:
 the first function it wrote for `_mm_sll_epi16` returned an address.
 
+### 2.7 A load inside an operation
+
+`_mm256_add_epi32(a, _mm256_loadu_si256(p + 1))` is one instruction. The
+lowering of a packed operation (`try_native_packed_map`, and the SHA forms
+beside it) does not materialise an operand that is itself a whole-register
+load: it takes the address the load reads (`direct_vector_load_ptr`), and
+the load becomes the memory operand of the instruction. A constant offset
+in that address is moved into the displacement (`split_const_offset`), so
+no `addq` is emitted for it.
+
+The offset is counted as C counts it:
+
+| written | displacement |
+|---|---|
+| `p + 1`, `const __m256i *p` | 32 |
+| `(const __m256i *)(p + 3)`, `const int *p` | 12 |
+| `(const __m256i *)(p + 8)`, a byte pointer | 8 |
+| `p - 1`, `1 + p`, `p + 9 - 4` | the same sums, signed |
+| `(const __m256i *)((const short *)(p + 1) + 3) + 1`, `const int *p` | 4 + 6 + 32 |
+| `(const __m256i *)(p + 12)`, `const void *p` | 12 (GNU C) |
+| `table + 2`, `__m256i table[4]` | 64 |
+
+Each `+` counts in the pointee of the pointer it is applied to, and a cast
+between pointer types changes what the next `+` out counts in. What is not
+an address the whole way stays in the base and is computed as written: a
+sum of integers converted to a pointer afterwards (it wraps at the
+integer's width), a variable index, a pointer into a variable-length array
+type, an unsigned count that does not fit its signed type, and an offset
+beyond a 32-bit displacement.
+
+Until PR #1211 the constant was taken as bytes whatever the pointer
+pointed to, and every cast was seen through. A byte pointer came out
+right. Everything else was wrong code at `-O1` and above with nothing
+said: the first row read at `1(%rdi)`. The only shape any gate ran was a
+`const void *` with no offset.
+
+Gates: `check_x86_int_map_registers.sh` (section 4b: nine forms, each one
+instruction on the displacement of the table above, and GCC 16.2 reading
+the same sources agrees with every row) and the corpus test
+`tests/regression/x86_vector_load_const_offset.c` (35 functions, executed,
+output against GCC's).
+
 ## 3. Call-frame information
 
 Code generation never writes `.cfi_*` directives. `backend/cfi_synth.rs`
@@ -709,6 +751,8 @@ instructions.
 | `qq_*` in `store_forwarding` (unit) | 32-byte store forwarding (§2.3): the six spellings, the self-reload under a live and a dead `zmm` upper half, narrower reloads, and every event that ends the mapping (a write of the register at any width or under a mask, a write into the slot at each edge, `vzeroupper`, a call, a stack adjustment) |
 | `every_signature_holds_for_its_emitter` (unit) | Each operation a homed object may be an operand of, with its operands in registers, in memory and shared with the result: the value the destination ends with is the one the all-in-memory path computes |
 | `x86_macro_gate_tests` (unit) | XSAVE precedence, the AES/PCLMUL/GFNI announcement split, the POPCNT unwind matrix, sticky `-mno-mmx`, `-mprefer-vector-width=` parsing |
+| `check_x86_int_map_registers.sh` | Packed operations on registers and on a folded load: budgets per shape, values against a scalar reference and GCC, and (section 4b) the displacement of a constant offset in the load's address (§2.7) |
+| `tests/regression/x86_vector_load_const_offset.c` (corpus) | §2.7: 35 ways of writing `pointer + constant` inside a packed operation, executed, output against GCC's |
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |
 | `check_target_attribute_isa.sh` | `target()` scoping, ordering, errors and intrinsic verdicts, re-measured on GCC |
 | `check_target_attribute_arguments.py` | The arguments of `target("...")` on definitions and prototypes and of `#pragma GCC target`: errors, order and position against GCC 16.2 |

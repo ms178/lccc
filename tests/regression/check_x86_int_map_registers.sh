@@ -266,6 +266,99 @@ if [ "$EXPECT_DEFECT" = 1 ]; then
 fi
 echo "  ok  every counted shape is register-homed (30 at parity, 5 memory/constant forms, 4 wrappers)"
 
+# --- 4b. a constant offset in the address of a folded load ------------------
+# `op(a, load(pointer + K))` keeps the load in the instruction's r/m slot and
+# K in its displacement.  K counts objects of what the pointer points to, at
+# the level of the expression where it is written, so the displacement is
+# K * sizeof(pointee) summed over the levels.  The lowering took K as bytes
+# whatever the pointee was: `_mm256_loadu_si256(p + 1)` of a `const __m256i
+# *p` was folded as `1(%rdi)`.  Only a byte pointer came out right, and a byte
+# pointer was the only shape this gate ran.
+#
+# Each row is `function:displacement`, the displacement C gives the address.
+# The body must be the packed instruction on exactly that operand and `ret`.
+# What thirty-five such functions compute is compared with GCC by
+# tests/regression/x86_vector_load_const_offset.c; the rows here pin that the
+# right address is still one instruction.
+cat > "$WORK/offset.c" <<'EOF'
+#include <immintrin.h>
+struct triple { long long a, b, c; };
+__m256i off_vec256(const __m256i *p, __m256i a)
+{ return _mm256_add_epi32(a, _mm256_loadu_si256(p + 1)); }
+__m256i off_back(const __m256i *p, __m256i a)
+{ return _mm256_add_epi32(a, _mm256_loadu_si256(p - 1)); }
+__m256i off_ints(const int *p, __m256i a)
+{ return _mm256_add_epi32(a, _mm256_loadu_si256((const __m256i *)(p + 3))); }
+__m256i off_bytes(const unsigned char *p, __m256i a)
+{ return _mm256_add_epi32(a, _mm256_loadu_si256((const __m256i *)(p + 8))); }
+__m256i off_first(const long long *p, __m256i a)
+{ return _mm256_add_epi32(a, _mm256_loadu_si256((const __m256i *)(2 + p))); }
+__m256i off_struct(const struct triple *p, __m256i a)
+{ return _mm256_add_epi32(a, _mm256_loadu_si256((const __m256i *)(p + 1))); }
+__m256i off_casts(const int *p, __m256i a)
+{ return _mm256_add_epi32(a, _mm256_loadu_si256((const __m256i *)((const short *)(p + 1) + 3) + 1)); }
+__m256i off_two(const int *p, __m256i a)
+{ return _mm256_add_epi32(a, _mm256_loadu_si256((const __m256i *)(p + 9 - 4))); }
+__m128i off_vec128(const __m128i *p, __m128i a)
+{ return _mm_add_epi32(a, _mm_loadu_si128(p + 1)); }
+EOF
+OFFSETS="off_vec256:32 off_back:-32 off_ints:12 off_bytes:8 off_first:16 off_struct:24 off_casts:42 off_two:20 off_vec128:16"
+"$CC" "${FLAGS[@]}" -S "$WORK/offset.c" -o "$WORK/offset.s" 2>"$WORK/offset.log" \
+    || { echo "FAIL: cannot emit the constant-offset probe" >&2; cat "$WORK/offset.log" >&2; exit 1; }
+
+# offset_problem <assembly> <name> <displacement>: empty when the body of
+# <name> is one packed instruction reading `<displacement>(%rdi)` and `ret`.
+offset_problem() {
+    local text n
+    text=$(awk -v F="$2:" '$0==F{on=1;next} on&&/^[[:space:]]*\.size/{exit} on' "$1" |
+        grep -E '^[[:space:]]+[a-z]' || true)
+    n=$(printf '%s\n' "$text" | grep -c . || true)
+    if [ "$n" != 2 ]; then
+        echo "$n instructions where the packed operation and ret are 2"
+    elif ! printf '%s\n' "$text" | head -n 1 |
+        grep -qE "^[[:space:]]+v?p[a-z]+[[:space:]]+$3\(%rdi\), %[xy]mm0, %[xy]mm0\$"; then
+        echo "the operation does not read $3(%rdi)"
+    fi
+}
+# The detector first: a displacement nothing emits has to be reported.
+if [ -z "$(offset_problem "$WORK/offset.s" off_vec256 31)" ]; then
+    echo "FAIL: the displacement check accepts 31(%rdi) for off_vec256, so it" >&2
+    echo "      cannot fail." >&2
+    exit 1
+fi
+for entry in $OFFSETS; do
+    name=${entry%%:*}
+    want=${entry##*:}
+    problem=$(offset_problem "$WORK/offset.s" "$name" "$want")
+    if [ -n "$problem" ]; then
+        echo "FAIL: $name: $problem:" >&2
+        awk -v F="$name:" '$0==F{on=1;next} on&&/^[[:space:]]*\.size/{exit} on' "$WORK/offset.s" |
+            grep -E '^[[:space:]]+[a-z]' | sed 's/^/        /' >&2
+        fail=1
+    fi
+done
+# The table against the reference compiler: the displacements above are what
+# C says, and GCC reading the same sources has to agree with every one.
+if [ -n "$REFERENCE" ]; then
+    "$REFERENCE" "${FLAGS[@]}" -S "$WORK/offset.c" -o "$WORK/offset.ref.s" 2>"$WORK/offset.ref.log" \
+        || { echo "FAIL: $REFERENCE cannot build the constant-offset probe" >&2
+             cat "$WORK/offset.ref.log" >&2; exit 1; }
+    for entry in $OFFSETS; do
+        name=${entry%%:*}
+        want=${entry##*:}
+        if ! awk -v F="$name:" '$0==F{on=1;next} on&&/^[[:space:]]*\.size/{exit} on' "$WORK/offset.ref.s" |
+            grep -qE "[[:space:]]$want\(%rdi\),"; then
+            echo "FAIL: $REFERENCE does not read $want(%rdi) in $name, so the" >&2
+            echo "      table of this gate is wrong:" >&2
+            awk -v F="$name:" '$0==F{on=1;next} on&&/^[[:space:]]*\.size/{exit} on' "$WORK/offset.ref.s" |
+                grep -E '^[[:space:]]+[a-z]' | sed 's/^/        /' >&2
+            fail=1
+        fi
+    done
+fi
+[ "$fail" = 0 ] || exit 1
+echo "  ok  a constant offset is the displacement its pointee gives it (9 forms${REFERENCE:+, each as $REFERENCE reads it})"
+
 # --- 5. counterfactual -----------------------------------------------------
 # `CCC_NO_NATIVE_PACKED_MAP` reverts the routing at the one place that makes
 # the decisions, so this is the PRE-FIX lowering rather than a hand-edited

@@ -1690,40 +1690,85 @@ impl Lowerer {
         Some((self.operand_to_value(ptr), disp))
     }
 
-    /// `expr` split into a base pointer expression and its constant byte
-    /// offset.  Casts are transparent (they do not move the address), and
-    /// `+`/`-` chains of constants accumulate; everything else is the base
-    /// with offset 0.  `None`-free by construction: the caller always gets a
-    /// usable base.
+    /// `expr` split into a base pointer expression and its constant BYTE
+    /// offset: `p + 1` for a `const __m256i *p` is `(p, 32)`.
+    ///
+    /// Only what is an address the whole way is peeled:
+    ///
+    /// * `pointer + constant`, `constant + pointer` and `pointer - constant`,
+    ///   where the constant counts objects of the pointer's own pointee type
+    ///   at that level of the expression (one byte for `void` and function
+    ///   pointers, GNU C's rule; an array operand counts its elements). A
+    ///   pointer into a variable-length array type has no constant scale and
+    ///   is the base.
+    /// * a cast from a pointer to a pointer, which changes what the next
+    ///   level out counts in and not the address.
+    ///
+    /// Everything else is the base with what has been peeled so far: an
+    /// integer sum that is converted to a pointer afterwards (it wraps at the
+    /// integer's width, not the pointer's), a constant of an unsigned type
+    /// whose value does not fit the signed one of its width, and an offset
+    /// that leaves the 32 bits an x86 displacement has.
+    ///
+    /// The first version of this function took the constant as bytes at every
+    /// level and saw through every cast: right for `(const __m256i *)(bytes +
+    /// 8)` with a `char` pointer, the shape it was written for, and wrong
+    /// code for every other pointee (`_mm256_add_epi32(acc,
+    /// _mm256_loadu_si256(p + 1))` read at `1(%rdi)`, and `p + 3` of an `int
+    /// *p` at byte 3).
     fn split_const_offset<'e>(&mut self, expr: &'e Expr) -> (&'e Expr, i64) {
         let mut cur = expr;
         let mut disp: i64 = 0;
         loop {
             match cur {
-                Expr::Cast(_, inner, _, _) => cur = inner,
-                Expr::BinaryOp(BinOp::Add, lhs, rhs, _) => {
-                    if let Some(k) = self.eval_const_expr(rhs).and_then(|c| c.to_i64()) {
-                        disp = disp.wrapping_add(k);
-                        cur = lhs;
-                    } else if let Some(k) = self.eval_const_expr(lhs).and_then(|c| c.to_i64()) {
-                        disp = disp.wrapping_add(k);
-                        cur = rhs;
-                    } else {
-                        break;
-                    }
+                Expr::Cast(_, inner, _, _)
+                    if self.expr_is_pointer(cur) && self.expr_is_pointer(inner) =>
+                {
+                    cur = inner;
                 }
-                Expr::BinaryOp(BinOp::Sub, lhs, rhs, _) => {
-                    if let Some(k) = self.eval_const_expr(rhs).and_then(|c| c.to_i64()) {
-                        disp = disp.wrapping_sub(k);
-                        cur = lhs;
-                    } else {
+                Expr::BinaryOp(op @ (BinOp::Add | BinOp::Sub), lhs, rhs, _) => {
+                    let (pointer, count): (&'e Expr, &'e Expr) =
+                        match (self.expr_is_pointer(lhs), self.expr_is_pointer(rhs)) {
+                            (true, false) => (lhs, rhs),
+                            (false, true) if *op == BinOp::Add => (rhs, lhs),
+                            _ => break,
+                        };
+                    let Some(bytes) = self.const_pointer_step(pointer, count) else {
                         break;
+                    };
+                    let moved = if *op == BinOp::Add {
+                        disp.checked_add(bytes)
+                    } else {
+                        disp.checked_sub(bytes)
+                    };
+                    match moved {
+                        Some(moved) if i32::try_from(moved).is_ok() => {
+                            disp = moved;
+                            cur = pointer;
+                        }
+                        _ => break,
                     }
                 }
                 _ => break,
             }
         }
         (cur, disp)
+    }
+
+    /// The bytes `pointer + count` moves the address by, when `count` is a
+    /// constant and the pointee of `pointer` has a constant size.
+    fn const_pointer_step(&self, pointer: &Expr, count: &Expr) -> Option<i64> {
+        if self.get_vla_stride_for_subscript(pointer).is_some() {
+            return None;
+        }
+        let objects = self.eval_const_expr(count)?.to_i64()?;
+        // An unsigned count is zero-extended to the pointer's width: one that
+        // reads as negative here is a count of 2^31 objects or more.
+        if objects < 0 && self.value_ir_type(count).is_unsigned() {
+            return None;
+        }
+        let size = i64::try_from(self.get_pointer_elem_size_from_expr(pointer)).ok()?;
+        objects.checked_mul(size)
     }
 
     /// The lane constant of a whole-register broadcast of a CONSTANT, when
