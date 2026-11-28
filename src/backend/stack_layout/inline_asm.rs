@@ -315,17 +315,12 @@ fn i686_operand_scratch_draw(
     I686ScratchDraw::Registers(if wide { 2 } else { 1 })
 }
 
-/// The pool register a clobber names, through any of its views.
+/// The pool register a clobber names, through any of its views (`sil`,
+/// `dil` and the 64-bit names GCC takes in 32-bit code included: they were
+/// not, so the walk below handed out a register the statement destroys).
 fn i686_clobbered_pool_reg(clobber: &str) -> Option<&'static str> {
-    match crate::backend::inline_asm::normalize_inline_asm_reg_name(clobber) {
-        "eax" | "ax" | "al" | "ah" => Some("eax"),
-        "ebx" | "bx" | "bl" | "bh" => Some("ebx"),
-        "ecx" | "cx" | "cl" | "ch" => Some("ecx"),
-        "edx" | "dx" | "dl" | "dh" => Some("edx"),
-        "esi" | "si" => Some("esi"),
-        "edi" | "di" => Some("edi"),
-        _ => None,
-    }
+    crate::backend::inline_asm::x86_gpr32_of_name(clobber)
+        .filter(|reg| I686_ASM_SCRATCH_POOL.contains(reg))
 }
 
 /// The callee-saved registers the i686 scratch allocator can hand to an

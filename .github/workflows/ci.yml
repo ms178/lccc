@@ -1185,6 +1185,17 @@ jobs:
     # coverage is not uniform (it arity-checks `memcpy` and stays silent for
     # `puts`, but checks `__builtin_puts`). Keep both driver paths in lockstep
     # with the table, including the legacy dialect and withdrawal cases.
+    # The types of the library builtins, measured from GCC as well: a builtin
+    # carries its prototype (`__builtin_sqrt(n)` converts an `int`), and the
+    # table that says so is GCC's answer, not a list kept by hand. The same
+    # script writes tests/regression/builtin_library_arguments.c, which the
+    # regression corpus runs against GCC. Before the arity table: that one
+    # reads the builtins from this one.
+    - name: Library builtin prototypes match GCC 16.2
+      run: |
+        set -euo pipefail
+        python3 scripts/gen_libc_builtin_types.py --self-test
+        python3 scripts/gen_libc_builtin_types.py --gcc gcc-16 --check
     - name: Libc builtin arity table matches GCC 16.2
       run: |
         set -euo pipefail
@@ -2362,6 +2373,60 @@ jobs:
       run: >-
         python3 scripts/check_x86_mflag_macros.py target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
+    # Every x86 `-m` spelling GCC 16.2 has is either an arm of the driver or
+    # a row of the generated table (docs/x86-machine-options.md): accepted
+    # because it names what the compiler does, a hint, or refused with the
+    # reason. The check walks GCC's own list (`--completion=-m`), so a
+    # spelling that reaches the driver's last resort, an option GCC refuses
+    # and lccc accepts, and a warning that is not GCC's all fail here.
+    - name: Verify the x86 machine-option table against GCC 16.2
+      run: >-
+        python3 scripts/gen_x86_mflag_policy.py --check --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
+    # The options of that table that are implemented as a rule about the
+    # finished text: an int3 behind returns and indirect jumps
+    # (-mharden-sls=), cld in front of string instructions (-mcld), notrack
+    # on the jump of a switch under -fcf-protection=branch, the names and
+    # the negatives of the -pg family. Shape per function, GCC's shape
+    # beside it, and the program run with every rule on.
+    - name: Verify the x86 text-rule options against GCC 16.2
+      run: >-
+        python3 tests/regression/check_x86_mflag_effects.py --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
+    # An `asm` operand in a ymm, zmm, mask or MMX register. The back ends
+    # hand out none of these: a 256-bit "x" operand was moved eight bytes
+    # wide into an xmm register (wrong values, no diagnostic), "k" was
+    # refused and "y" got a general register. The lowering rewrites such a
+    # statement to load and store these operands itself; this holds the
+    # text line for line, GCC's template beside it, GCC's diagnostics, and
+    # a few hundred generated statements run against GCC's build of them.
+    - name: Verify x86 asm operands in vector, mask and MMX registers against GCC 16.2
+      run: >-
+        python3 tests/regression/check_x86_asm_register_operands.py --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
+    # A 512-bit vector object that is only read and written whole lives in
+    # one of zmm16..zmm31 instead of 64 bytes of stack. This holds the
+    # shapes (one instruction per operation, no instruction for a copy, no
+    # stack traffic in a loop), the contract the registers rest on (nothing
+    # else lccc emits names a register above 15), and generated programs
+    # with loops, branches, calls that overwrite every register and more
+    # than sixteen values alive, built at every level and run against
+    # GCC's build of them. The programs run where the runner has AVX-512;
+    # elsewhere they are compiled and assembled.
+    - name: Verify 512-bit vector objects in zmm16..zmm31 against GCC 16.2
+      run: >-
+        python3 tests/regression/check_x86_zmm_homes.py --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
+    # The integer a SIMD operation returns (a mask, a lane, a conversion):
+    # it lives in a register, nothing around it goes through the stack or
+    # copies a vector register, a 512-bit mask compare reads its second
+    # source where it is, and each function is as long as GCC's, give or
+    # take what the gate's table says and why. The probe is built by both
+    # compilers and run where the runner has the instructions.
+    - name: Verify the integer results of SIMD operations against GCC 16.2
+      run: >-
+        python3 tests/regression/check_x86_simd_integer_results.py --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
     - name: Verify x86 -mprefer-vector-width= against GCC 16.2
       run: >-
         python3 scripts/check_x86_prefer_vector_width.py target/fastbuild/lccc
@@ -2381,6 +2446,31 @@ jobs:
     - name: Verify the x86 intrinsic census against GCC 16.2's headers
       run: >-
         python3 scripts/x86_intrinsic_census.py --check --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
+    # A call that compiles also has a type, and for 48 intrinsics it was the
+    # implicit `int`: lccc lowers the name itself, no header declares it, and
+    # the call's value is the address of the vector. A variable initialized
+    # from it got the right bytes; `return _mm_sll_epi16(a, n);` returned a
+    # stack address. Every intrinsic lccc has is asserted to have the type GCC
+    # 16.2's header gives it.
+    - name: Verify the type of every x86 intrinsic call against GCC 16.2's headers
+      run: >-
+        python3 scripts/x86_intrinsic_types.py --check --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
+    # Every operator on every kind of operand, lccc's verdict against GCC's:
+    # 200 unary cells and 14,112 binary ones. The operand gate of the
+    # frontend lane pins the messages of the cases somebody wrote down; this
+    # asks the question for all of them, so that an operand kind nobody
+    # thought of (`~` of a double was compiled as the complement of its
+    # bits) is a cell that differs. No cell may be a valid program refused
+    # or an internal error, and the cells lccc still accepts where GCC
+    # refuses are counted in the script and may only become fewer.
+    - name: Self-test the operand-constraint matrix
+      run: python3 scripts/operand_constraint_matrix.py --self-test
+    - name: Every operator on every operand kind against GCC 16.2
+      run: >-
+        python3 scripts/operand_constraint_matrix.py --check
+        --lccc target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
     # Which extension each SIMD helper of include/lcccsimd.h needs is held to
     # a table generated from GCC 16.2's headers. Nothing ran the comparison
@@ -3091,6 +3181,87 @@ jobs:
         bash tests/regression/check_fixed_slp_distances_codegen.sh
         bash tests/regression/check_narrow_cmp_flag_law.sh
         bash tests/regression/check_atomic_backends.sh
+        # `x++`, `x += v`, `x = v` and a read of an `_Atomic` object are
+        # atomic operations (they were a volatile object's plain accesses,
+        # and lost updates under threads): the instruction each becomes on
+        # all four backends, and the threaded program at every level.
+        bash tests/regression/check_atomic_operators.sh
+        # The arguments of `target("...")`: an argument GCC does not know is
+        # an error (it was ignored in silence), in GCC's words, on GCC's
+        # lines; the fixture's comments are re-measured against GCC 16.2.
+        python3 tests/regression/check_target_attribute_arguments.py --lccc target/fastbuild/lccc
+        # Every symbol the compiler defines is typed and sized, the CPUID
+        # probe helper and the profile writer included (objtool refused the
+        # helper: "missing an ELF size annotation"); four targets, readelf.
+        python3 tests/regression/check_symbol_annotations.py
+        # The scalar and system intrinsics of x86gprintrin.h (CLWB, WRPKRU,
+        # XSAVEOPT, ENCLS, ...): the same instruction in the same form as
+        # GCC 16.2's, and, stopped in front of it under GDB, the same
+        # explicit and implicit operands; x86-64 and i686, with four
+        # negative controls. No instruction an intrinsic stands for is
+        # executed (each is stepped over, and both programs must exit
+        # normally), so the verdict is the same on every runner: with
+        # MOVDIRI taken for a register move the gate died of SIGILL on the
+        # processors that lack it.
+        python3 tests/regression/check_x86_gpr_intrinsics.py --lccc target/fastbuild/lccc
+        # Assembler statements and the registers the compiler keeps for
+        # itself: %ebx as the i686 GOT pointer, the frame pointer, every
+        # spelling of a clobber, memory operands that name globals and
+        # thread-local objects in position-independent code. 92 programs
+        # against GCC 16.2 (x86-64 and i686, -O0 to -Os, with and without
+        # PIC), shared libraries linked with -z text, GCC's refusals.
+        python3 tests/regression/check_asm_registers.py --lccc target/fastbuild/lccc
+        # Multi-word adders as adc/sbb chains (docs/x86-carry-chain.md):
+        # the assembly of carry_chain_adders.c, function by function -- how
+        # many adc/sbb, no setc/bt inside a straight chain, no more
+        # instructions than today, and four adc/sbb in a row in the main
+        # loop of every limb loop, which makes no boolean of its carry
+        # (no setc, no bt: the count is a dec). With the carry pass off
+        # the pins must break, with limb_unroll off the fours, and with
+        # the carry_loop peephole off the boolean must be back.
+        python3 tests/regression/check_carry_chain_shape.py --lccc target/fastbuild/lccc
+        # Random limb loops, which limb_unroll splits into four limbs a
+        # trip and a remainder: eight generated programs of eight loops
+        # each (every way a counted loop is spelled; half of them plain,
+        # half with any adder spelling and now and then more than a limb
+        # in the trip), each through eight configurations (the seven of
+        # the adders below, and the split off), every one printing what
+        # GCC 16.2's program prints. One planted wrong carry is the
+        # negative control, and at least 31 of the 64 loops have to be
+        # split.
+        python3 tests/regression/check_carry_chain_fuzz.py --limbs --lccc target/fastbuild/lccc --gcc gcc-16
+        # What a loop carries from one iteration to the next has a
+        # register: the state of zstd_count's generator is not stored to
+        # the frame and not reloaded from it on the way round the query
+        # loop, and the digit loop of csv_field_sum has no register move
+        # and ten instructions. (The codegen gate sees neither: the first
+        # leaves its counts alone, the second is no workload of it.) The
+        # matchers are tried first on the code that had both defects.
+        python3 tests/regression/check_loop_carried_homes.py --lccc target/fastbuild/lccc
+        # A `switch` dispatched through an absolute table (`jmpq
+        # *.Ljt_N(,%reg,8)` over `.quad` entries: the form of -fno-pic, of
+        # the kernel code model and of an executable linked by the same
+        # invocation, so of every benchmark binary) is an edge the
+        # peephole's liveness reads, as the position-independent form is.
+        # Unread, it left every function that holds a table unanalysed: 11
+        # to 19 instructions too many in each function of the fixture.
+        # Held: the fixture's output in 15 configurations, and each of its
+        # functions position-fixed no longer than position-independent
+        # less the three instructions a dispatch saves; the check first
+        # refuses one function as it was emitted before.
+        python3 tests/regression/check_switch_table_liveness.py --lccc target/fastbuild/lccc --gcc gcc-16
+        # A branch on a merge that one way in brings a constant to (`if
+        # (smaller(...)) j++` with `smaller` an inlined `a < b || (a == b &&
+        # c <= d)`) is left by if-conversion and threaded behind the
+        # optimizer's rounds, a level of nested conditions a round; the set
+        # fold then makes what is left of a character class one bit test.
+        # Held: the fixture's output in 14 configurations against GCC
+        # 16.2's, eleven functions no longer than today (seven of them
+        # with a bit test, through helpers that return `int`, `_Bool` and
+        # `unsigned char`), and no constant written to be tested in zlib's
+        # sift loop; with the early position of the threader off every pin
+        # has to break, and with the set fold off every bit test.
+        python3 tests/regression/check_boolean_merge_threads.py --lccc target/fastbuild/lccc --gcc gcc-16
         # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
         # only place the audit's site counts are measurable; the ratchet is
         # what stops them growing back.  Runs in ci_local.sh too.
@@ -3290,6 +3461,12 @@ jobs:
         # file: a second fixed 4 GiB image exhausts a 21 GiB sandbox, and a
         # fixed /tmp swapon diagnostic cannot be written by a non-root caller.
         python3 tests/regression/check_agent_swap_reuse.py
+        # Random multi-word adders, and random things that only look like
+        # them: eight generated programs and carry_chain_adders.c, each
+        # through seven configurations (-O0 to -Os, -m32, the IR verifier,
+        # no register allocation), every one printing what GCC 16.2's
+        # program prints. One planted wrong carry is the negative control.
+        python3 tests/regression/check_carry_chain_fuzz.py --lccc target/fastbuild/lccc --gcc gcc-16
         python3 scripts/edg_corpus_mine.py selftest
         # IPA-RA must not summarize weak/interposable bodies: a strong
         # override linked from another TU clobbers %r8-%r11 (was 55, not 79)

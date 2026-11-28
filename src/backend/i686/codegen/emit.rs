@@ -222,6 +222,15 @@ pub struct I686Codegen {
     /// skipped entirely and %ebx stays a general allocatable register, which
     /// is what keeps leaf functions small in the 32 KiB kernel setup binary.
     pub(super) pic_got_live: bool,
+    /// Frame home of the GOT pointer: where `%ebx` is reloaded from behind
+    /// an assembler statement that took it. `Some` only in a function that
+    /// keeps the pointer in `%ebx` (`pic_got_live`) and has such a
+    /// statement; the prologue stores it there once.
+    pub(super) got_home_slot: Option<StackSlot>,
+    /// The statement being emitted takes `%ebx` (an operand of its own or a
+    /// clobber): what addresses a symbol through the GOT pointer inside the
+    /// template has to do so from another register.
+    pub(super) asm_takes_ebx: bool,
     /// Whether the __x86.get_pc_thunk.bx helper needs to be emitted.
     pub(super) needs_pc_thunk_bx: bool,
     /// Number of integer arguments to pass in registers (-mregparm=N).
@@ -240,6 +249,11 @@ pub struct I686Codegen {
     pub(super) stack_boundary: i64,
     /// Whether to omit the frame pointer (-fomit-frame-pointer).
     pub(super) omit_frame_pointer: bool,
+    /// `-fomit-frame-pointer` as the invocation asked for it.
+    /// `omit_frame_pointer` is what the function being emitted gets: this,
+    /// unless the function needs its frame pointer (a variable-length
+    /// array, `__builtin_frame_address`, ...).
+    pub(super) omit_frame_pointer_requested: bool,
     /// When omit_frame_pointer is true, this holds the offset from ESP (at its
     /// base position after prologue) to where EBP would have pointed.
     /// slot_ref() adds this to convert EBP-relative slot offsets to ESP-relative.
@@ -445,23 +459,43 @@ pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
     }
 }
 
-/// Map inline asm constraint register names to callee-saved PhysReg indices.
+/// The callee-saved register a constraint puts its operand in: one of the
+/// single-register letters, or the register of a register variable
+/// (`{ebx}`, `{bl}`, `{ebp}`: any spelling, as in a clobber).
 pub(super) fn i686_constraint_to_phys(constraint: &str) -> Option<PhysReg> {
-    match constraint {
-        "b" | "{ebx}" | "ebx" => Some(PhysReg(0)),
-        "S" | "{esi}" | "esi" => Some(PhysReg(1)),
-        "D" | "{edi}" | "edi" => Some(PhysReg(2)),
+    let register = match constraint {
+        "b" | "ebx" => "ebx",
+        "S" | "esi" => "esi",
+        "D" | "edi" => "edi",
+        braced if braced.starts_with('{') && braced.ends_with('}') => {
+            crate::backend::inline_asm::x86_gpr32_of_name(braced)?
+        }
+        _ => return None,
+    };
+    match register {
+        "ebx" => Some(PhysReg(0)),
+        "esi" => Some(PhysReg(1)),
+        "edi" => Some(PhysReg(2)),
+        "ebp" => Some(PhysReg(3)),
         _ => None,
     }
 }
 
-/// Map inline asm clobber register names to callee-saved PhysReg indices.
+/// The callee-saved register a clobber names, by any of the spellings GCC
+/// takes for it (`ebx`, `bx`, `bl`, `bh`, `rbx`, with or without `%`).
+///
+/// Only the 32-bit names used to be known, and `%ebp` by none: a statement
+/// that said `"si"`, `"bl"` or `"ebp"` destroyed a register the allocator
+/// went on reading a live value from. FFmpeg's configure (releases 4.4 and
+/// 6.0) asks exactly that, `__asm__ volatile ("xorl %%ebp, %%ebp" :::
+/// "%ebp");`, and enables `ebp_available` for its inline assembly when the
+/// program survives.
 pub(super) fn i686_clobber_to_phys(clobber: &str) -> Option<PhysReg> {
-    let clobber = crate::backend::inline_asm::normalize_inline_asm_reg_name(clobber);
-    match clobber {
+    match crate::backend::inline_asm::x86_gpr32_of_name(clobber)? {
         "ebx" => Some(PhysReg(0)),
         "esi" => Some(PhysReg(1)),
         "edi" => Some(PhysReg(2)),
+        "ebp" => Some(PhysReg(3)),
         _ => None,
     }
 }
@@ -732,12 +766,15 @@ impl I686Codegen {
             conflict_param_slots: FxHashMap::default(),
             param_direct_homes: FxHashMap::default(),
             pic_got_live: false,
+            got_home_slot: None,
+            asm_takes_ebx: false,
             needs_pc_thunk_bx: false,
             regparm: 0,
             base_regparm: 0,
             current_call_regparm: 0,
             stack_boundary: 16,
             omit_frame_pointer: false,
+            omit_frame_pointer_requested: false,
             frame_base_offset: 0,
             esp_adjust: 0,
             dyn_align_cleanup: false,
@@ -776,6 +813,7 @@ impl I686Codegen {
         self.base_regparm = opts.regparm;
         self.regparm = opts.regparm;
         self.omit_frame_pointer = opts.omit_frame_pointer;
+        self.omit_frame_pointer_requested = opts.omit_frame_pointer;
         self.state.emit_cfi = opts.emit_cfi;
         // Function delimiters for the peephole even without unwind tables;
         // stripped after it (see CodegenState::fn_boundary_markers).
@@ -5159,6 +5197,62 @@ pub(crate) fn i686_const_fold_base_reg(phys: crate::backend::regalloc::PhysReg) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clobber names a callee-saved register by any of its spellings.
+    /// (`"si"`, `"bl"`, `"rbx"` and every name of `%ebp` were unknown: the
+    /// allocator kept a live value in a register the statement destroys.)
+    #[test]
+    fn a_clobber_names_its_callee_saved_register_by_any_spelling() {
+        for (reg, spellings) in [
+            (PhysReg(0), &["ebx", "bx", "bl", "bh", "rbx"][..]),
+            (PhysReg(1), &["esi", "si", "sil", "rsi"]),
+            (PhysReg(2), &["edi", "di", "dil", "rdi"]),
+            (PhysReg(3), &["ebp", "bp", "bpl", "rbp"]),
+        ] {
+            for spelling in spellings {
+                assert_eq!(i686_clobber_to_phys(spelling), Some(reg), "{spelling}");
+                assert_eq!(
+                    i686_clobber_to_phys(&format!("%{spelling}")),
+                    Some(reg),
+                    "%{spelling}"
+                );
+                assert_eq!(phys_reg_name(reg), spellings[0]);
+            }
+        }
+        for other in [
+            "eax", "cl", "dx", "esp", "cc", "memory", "xmm0", "st", "EBX", "",
+        ] {
+            assert_eq!(i686_clobber_to_phys(other), None, "{other:?}");
+        }
+    }
+
+    /// A constraint puts its operand in a callee-saved register through a
+    /// single-register letter or a register variable's braces. Letters are
+    /// not names: `"bp"` is the classes `b` and `p`.
+    #[test]
+    fn a_constraint_names_its_callee_saved_register() {
+        for (constraint, reg) in [
+            ("b", Some(PhysReg(0))),
+            ("S", Some(PhysReg(1))),
+            ("D", Some(PhysReg(2))),
+            ("{ebx}", Some(PhysReg(0))),
+            ("{bl}", Some(PhysReg(0))),
+            ("{si}", Some(PhysReg(1))),
+            ("{dil}", Some(PhysReg(2))),
+            ("{ebp}", Some(PhysReg(3))),
+            ("{bp}", Some(PhysReg(3))),
+            ("ebx", Some(PhysReg(0))),
+            ("bp", None),
+            ("si", None),
+            ("a", None),
+            ("{eax}", None),
+            ("r", None),
+            ("m", None),
+            ("", None),
+        ] {
+            assert_eq!(i686_constraint_to_phys(constraint), reg, "{constraint:?}");
+        }
+    }
 
     #[test]
     fn pair_scalars_are_the_eight_byte_moves() {

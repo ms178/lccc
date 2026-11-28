@@ -568,15 +568,7 @@ pub(super) fn collect_inline_asm_callee_saved_x86(func: &IrFunction, used: &mut 
         }
     }
     fn clobber_to_phys(name: &str) -> Option<PhysReg> {
-        let name = crate::backend::inline_asm::normalize_inline_asm_reg_name(name);
-        match name {
-            "rbx" | "ebx" | "bx" | "bl" | "bh" => Some(PhysReg(1)),
-            "r12" | "r12d" | "r12w" | "r12b" => Some(PhysReg(2)),
-            "r13" | "r13d" | "r13w" | "r13b" => Some(PhysReg(3)),
-            "r14" | "r14d" | "r14w" | "r14b" => Some(PhysReg(4)),
-            "r15" | "r15d" | "r15w" | "r15b" => Some(PhysReg(5)),
-            _ => None,
-        }
+        callee_saved_of_register_name(name)
     }
     crate::backend::stack_layout::collect_inline_asm_callee_saved_with_overflow(
         func,
@@ -591,19 +583,31 @@ pub(super) fn collect_inline_asm_callee_saved_x86(func: &IrFunction, used: &mut 
     );
 }
 
+/// The callee-saved register a name designates, by any spelling of it
+/// (`rbx`, `ebx`, `bx`, `bl`, `bh`; with `%` or braces).
+///
+/// `%rbp` is one of them: a function that omits its frame pointer allocates
+/// it, and a statement that said `"rbp"` used to destroy a live value
+/// there. The caller drops it again where the function keeps its frame
+/// pointer (the register is in no pool then, and the statement is refused).
+fn callee_saved_of_register_name(name: &str) -> Option<PhysReg> {
+    let name = crate::backend::inline_asm::normalize_inline_asm_reg_name(name);
+    match crate::backend::inline_asm::x86_normalize_reg_to_64bit(name)?.as_ref() {
+        "rbx" => Some(PhysReg(1)),
+        "r12" => Some(PhysReg(2)),
+        "r13" => Some(PhysReg(3)),
+        "r14" => Some(PhysReg(4)),
+        "r15" => Some(PhysReg(5)),
+        "rbp" => Some(PhysReg(6)),
+        _ => None,
+    }
+}
+
 /// Check if a constraint string refers to a specific x86-64 callee-saved register.
 fn constraint_to_callee_saved_x86(constraint: &str) -> Option<PhysReg> {
     // Handle explicit register constraint: {regname}
     if constraint.starts_with('{') && constraint.ends_with('}') {
-        let reg = &constraint[1..constraint.len() - 1];
-        return match reg {
-            "rbx" | "ebx" | "bx" | "bl" | "bh" => Some(PhysReg(1)),
-            "r12" | "r12d" | "r12w" | "r12b" => Some(PhysReg(2)),
-            "r13" | "r13d" | "r13w" | "r13b" => Some(PhysReg(3)),
-            "r14" | "r14d" | "r14w" | "r14b" => Some(PhysReg(4)),
-            "r15" | "r15d" | "r15w" | "r15b" => Some(PhysReg(5)),
-            _ => None,
-        };
+        return callee_saved_of_register_name(constraint);
     }
     // Check single-character constraint letters
     // Note: 'a','c','d','S','D' are caller-saved, no save needed
@@ -1149,6 +1153,11 @@ pub struct X86Codegen {
     /// Per-function measured copy policy: only audited wide conversion/cast
     /// webs use ZMM aggregate copies. Plain memcpy loops retain YMM.
     pub(super) wide_simd_copies: bool,
+    /// The 512-bit vector objects of the current function that live in a
+    /// register: the `Alloca`'s value to the number of its `zmm` register
+    /// (`IrFunction::zmm_homes`, decided by `backend::x86_zmm_homes`). Such
+    /// an object has no stack slot and no address.
+    pub(super) zmm_homes: FxHashMap<u32, u8>,
     /// AVX-512VL *with* the F base (see `CodegenOptions::avx512vl`): the
     /// 128/256-bit EVEX permission.  Gates the xmm/ymm `vprold` rotate —
     /// one µop where the AVX2 form needs vpslld+vpsrld+vpor.
@@ -1221,6 +1230,20 @@ pub struct X86Codegen {
     /// materialization (setcc/movzbl/store) and the consumer uses the live
     /// flags directly (jcc/cmovcc).
     pub(super) fused_cmp_dests: FxHashMap<u32, u32>,
+    /// Success flags of compare-exchanges that are the last instruction of
+    /// their block and are read by its conditional branch alone: the retry
+    /// test of every compare-exchange loop. `lock cmpxchg` leaves the answer
+    /// in ZF, so the branch takes it from there (`lock cmpxchg; jne retry`,
+    /// as GCC and Clang emit) and the `sete; movzbl; test` in between is
+    /// never emitted. Computed by the prologue scan beside
+    /// `fused_cmp_dests`.
+    pub(super) fused_cmpxchg_dests: crate::common::fx_hash::FxHashSet<u32>,
+    /// Atomic read-modify-writes whose result -- the object's previous
+    /// value -- has no use of any kind. Such an update is one locked ALU
+    /// instruction on the memory operand (`lock add`, `lock or`); see
+    /// `emit_atomic_rmw_impl`. Computed by the prologue scan from every use,
+    /// pointer operands included.
+    pub(super) unused_atomic_rmw_dests: crate::common::fx_hash::FxHashSet<u32>,
     /// Destinations of the flag-neutral forwarding Copy/Cast instructions in a
     /// fused Cmp chain. Their value is never materialized (the consumer uses
     /// the live flags), so their emitters must skip them — emitting them would
@@ -1726,6 +1749,7 @@ impl X86Codegen {
             isa: super::super::isa::X86Isa::default(),
             avx512_enabled: false,
             wide_simd_copies: false,
+            zmm_homes: FxHashMap::default(),
             avx512vl_enabled: false,
             optimize_for_size: false,
             skip_i32_sext: false,
@@ -1737,6 +1761,8 @@ impl X86Codegen {
             zext_loaded_values: FxHashSet::default(),
             narrow_call_arg_sign_casts: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
+            fused_cmpxchg_dests: Default::default(),
+            unused_atomic_rmw_dests: Default::default(),
             fused_forward_dests: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
             cmp_replay_multi: FxHashMap::default(),
@@ -5468,9 +5494,38 @@ impl X86Codegen {
                             .with_out_checked(|o| o.emit_instr_imm_reg("    movabsq", *v, reg));
                     }
                 }
-                _ => self
-                    .state
-                    .emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
+                // Every other constant is the 64-bit image `operand_to_rax`
+                // gives it: a float's bits, a decimal's container, the low
+                // half of a 128-bit integer. This arm used to zero the
+                // register whatever the constant was, so a floating constant
+                // staged here was 0.0: `__atomic_store(&d, &v, order)` with
+                // `v` a known `3.25` -- which is `atomic_store(&d, 3.25)` on
+                // an `_Atomic double` -- stored zero, and the exchange and
+                // compare-exchange forms did the same with their operand.
+                other => {
+                    let image: u64 = match other {
+                        IrConst::F32(v) => u64::from(v.to_bits()),
+                        IrConst::F64(v) | IrConst::LongDouble(v, _) => v.to_bits(),
+                        IrConst::D32(v) => u64::from(*v),
+                        IrConst::D64(v) => *v,
+                        IrConst::I128(v) => *v as u64,
+                        _ => 0,
+                    };
+                    if image == 0 {
+                        self.state
+                            .emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg)));
+                    } else if let Ok(low) = u32::try_from(image) {
+                        // `movl` zero-extends; spell the upper half of the
+                        // unsigned range as its negative twin.
+                        self.state.with_out_checked(|o| {
+                            o.emit_instr_imm_reg("    movl", low as i32 as i64, reg_name_to_32(reg))
+                        });
+                    } else {
+                        self.state.with_out_checked(|o| {
+                            o.emit_instr_imm_reg("    movabsq", image as i64, reg)
+                        });
+                    }
+                }
             },
             Operand::Value(v) => {
                 self.value_to_reg(v, reg);
@@ -10712,6 +10767,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_fused_bit_test_modify_branch(&mut self, test_dest: &Value, modify_dest: &Value, op: IrBinOp, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_modify_branch_impl;
         fn emit_fused_bit_test_cmp(&mut self, dest: &Value, base: &Operand, index: &Operand, ty: IrType, bit_clear: bool) -> bool => emit_fused_bit_test_cmp_impl;
         fn emit_fused_bit_test_add(&mut self, dest: &Value, base: &Operand, index: &Operand, bt_ty: IrType, addend: &Operand, addend2: Option<&Operand>, sub: bool, ty: IrType) -> bool => emit_fused_bit_test_add_impl;
+        fn emit_carry_pair(&mut self, word: &Value, out: &Value, op: crate::ir::intrinsics::CarryOp, args: &[Operand]) -> bool => emit_carry_pair_impl;
         fn emit_cond_branch_blocks(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) => emit_cond_branch_blocks_impl;
         fn begin_home_write_block(&mut self, label: BlockId) => begin_home_write_block_impl;
         fn begin_ir_point(&mut self) => settle_transient_home_evictions;
@@ -11272,6 +11328,52 @@ impl X86Codegen {
 /// allocator's fold-deferral pool so the two cannot drift apart.
 pub(crate) fn x86_const_fold_base_reg(phys: PhysReg) -> bool {
     !is_xmm_reg(phys) && !matches!(phys.0, 10 | 16)
+}
+
+#[cfg(test)]
+mod asm_callee_saved_name_tests {
+    use super::*;
+
+    /// Every spelling of a callee-saved register is that register, `%rbp`
+    /// among them (it had none: a statement that said `"rbp"` destroyed the
+    /// frame pointer the function went on addressing its slots through).
+    #[test]
+    fn a_name_is_its_callee_saved_register_by_any_spelling() {
+        for (reg, spellings) in [
+            (PhysReg(1), &["rbx", "ebx", "bx", "bl", "bh"][..]),
+            (PhysReg(2), &["r12", "r12d", "r12w", "r12b"]),
+            (PhysReg(3), &["r13", "r13d", "r13w", "r13b"]),
+            (PhysReg(4), &["r14", "r14d", "r14w", "r14b"]),
+            (PhysReg(5), &["r15", "r15d", "r15w", "r15b"]),
+            (PhysReg(6), &["rbp", "ebp", "bp", "bpl"]),
+        ] {
+            for spelling in spellings {
+                for written in [
+                    spelling.to_string(),
+                    format!("%{spelling}"),
+                    format!("{{{spelling}}}"),
+                ] {
+                    assert_eq!(
+                        callee_saved_of_register_name(&written),
+                        Some(reg),
+                        "{written}"
+                    );
+                }
+                assert_eq!(
+                    constraint_to_callee_saved_x86(&format!("{{{spelling}}}")),
+                    Some(reg),
+                    "{{{spelling}}}"
+                );
+            }
+        }
+        for other in [
+            "rax", "ecx", "dl", "rsi", "dil", "r8", "r11d", "rsp", "cc", "memory", "xmm0", "",
+        ] {
+            assert_eq!(callee_saved_of_register_name(other), None, "{other:?}");
+        }
+        assert!(X86_CALLEE_SAVED_WITH_RBP.contains(&PhysReg(6)));
+        assert!(!X86_CALLEE_SAVED.contains(&PhysReg(6)));
+    }
 }
 
 #[cfg(test)]

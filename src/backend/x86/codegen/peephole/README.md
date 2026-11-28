@@ -752,6 +752,56 @@ Corollaries, all enforced:
   (fold-still-fires) controls; `scripts/peephole_families.py`'s shiftchain
   `far_use` kind generates the shape at stress scale.
 
+### Jump tables are edges, in both forms
+
+One control transfer with an unknown destination makes a function
+unanalysable: the liveness oracle (`FileLiveness`) answers nothing in it, and
+every pass that needs a death proof falls back to its syntactic one or gives
+up. A `switch` dispatched through a table is an indirect jump, so the oracle
+reads the table (`FileLiveness::resolve_jump_tables`): the successors of the
+dispatch are the labels the table names, and the dispatch reads the registers
+its operand mentions.
+
+| build | dispatch | table |
+|---|---|---|
+| position-independent (`-fPIC`, `-fPIE`; what `-c` and `-S` emit by default) | `leaq .Ljt_N(%rip), %rB; movslq (%rB,%rA,4), %rT; addq %rB, %rT; jmpq *%rT`, or `jmp __x86_indirect_thunk_rT` in place of the jump | `.long .LBBa - .Ljt_N` |
+| position-fixed (`-fno-pic`, `-mcmodel=kernel`, and an executable linked by the same invocation: `lccc prog.c -o prog`) | `jmpq *.Ljt_N(,%rA,8)` | `.quad .LBBa` |
+
+Both matches are exact, so that no edge is invented: the staging lines of the
+first are the three in front of the jump and name the registers it names; the
+operand of the second has no base and one index scaled by eight, its table is
+named as the code generator names one (`.Ljt_`), is a label of the function,
+and every entry down to the first line that is no `.quad` names a label of the
+function. A computed goto, a tail call through a register and a table a
+program wrote itself stay unknown transfers.
+
+The second form was not read until 2026-11-26, and it is the form of every
+benchmark binary (the harness compiles and links in one invocation) and of the
+kernel. Each function of `tests/regression/switch_table_liveness.c` carried 11
+to 19 instructions too many in it (71 for 57, 81 for 63, 107 for 88, 118 for
+100): arguments copied out of their registers on entry, a temporary and a move
+in front of every return, moves of a call's result that nothing reads. Executed
+instructions of the five corpus programs that hold a table, as the harness
+builds them (cachegrind, `tests/benchmark/callgrind_sizes.json`):
+
+| program | before | after | |
+|---|---|---|---|
+| `expat_utf8_content` | 4,617,315 | 4,375,832 | −5.23 % |
+| `sqlite_varint` | 819,082 | 785,589 | −4.09 % |
+| `sqlite_vdbe_serial` | 3,126,913 | 3,087,601 | −1.26 % |
+| `switch_dispatch` | 497,358 | 496,143 | −0.24 % |
+| `expat_siphash24` | 11,506,434 | 11,497,614 | −0.08 % |
+
+The other 83 of the 88 corpus programs hold no table, and their binaries are
+byte for byte what they were.
+`tests/regression/check_switch_table_liveness.py` holds it: the fixture's
+output in 15 configurations, and each of its functions position-fixed no
+longer than position-independent less the three instructions a dispatch saves
+(no function there names a global, so the two forms differ in nothing else).
+
+Not done: the vector-register oracle (`fp_liveness.rs`) gives up at every
+indirect jump, in both forms.
+
 ### Exact-width shift/sign-extension folding
 
 `CCC_PEEPHOLE_SKIP=shift_signext` independently disables the fold from

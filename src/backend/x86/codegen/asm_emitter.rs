@@ -208,10 +208,6 @@ impl InlineAsmEmitter for X86Codegen {
         // adds a segment prefix (e.g., %%gs:) before the operand — using a register
         // indirect like (%rcx) would use the absolute address as a segment offset,
         // but a direct symbol(%rip) reference provides the correct per-CPU offset.
-        if let Some(ref sym) = op.imm_symbol {
-            op.mem_addr = format!("{}(%rip)", sym);
-            return None; // no scratch register used
-        }
         let alloc_gp_tmp = |this: &mut Self| -> String {
             let mut r = this.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
             if r.is_empty() {
@@ -219,6 +215,50 @@ impl InlineAsmEmitter for X86Codegen {
             }
             r
         };
+        if let Some(sym) = op.imm_symbol.clone() {
+            // A symbol another module may define in its place (default
+            // visibility, `-fPIC`) has its address in the GOT, as everywhere
+            // else in the function. `counter(%rip)` is a PC-relative
+            // relocation against it: no linker makes a shared object of that
+            // ("relocation R_X86_64_PC32 against 'counter' can not be used
+            // when making a shared object; recompile with -fPIC" -- of code
+            // that was), and where it links, the statement and the C around
+            // it address two objects once the executable has a copy.
+            let (name, addend) = crate::backend::inline_asm::split_symbol_addend(&sym);
+            if self.state.tls_symbols.contains(name) {
+                // A thread-local object is no address the linker knows:
+                // `incl tls_var(%rip)` incremented the initialisation image
+                // every later thread is copied from, and this thread's
+                // variable stayed what it was. The operand is the object
+                // itself where the offset is known when the program starts,
+                // as GCC writes it; the dynamic models call for the address,
+                // and the pointer the operand carries is that address.
+                use crate::common::tls::TlsModel;
+                match self.state.tls_model(name) {
+                    TlsModel::LocalExec => {
+                        op.mem_addr = format!("%fs:{}@TPOFF{}", name, addend);
+                        return None;
+                    }
+                    TlsModel::InitialExec => {
+                        let tmp = alloc_gp_tmp(self);
+                        self.state
+                            .emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %{}", name, tmp));
+                        op.mem_addr = format!("%fs:{}(%{})", addend.trim_start_matches('+'), tmp);
+                        return Some(tmp);
+                    }
+                    TlsModel::GlobalDynamic | TlsModel::LocalDynamic => {}
+                }
+            } else if self.state.needs_got_for_addr(name) {
+                let tmp = alloc_gp_tmp(self);
+                self.state
+                    .emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %{}", name, tmp));
+                op.mem_addr = format!("{}(%{})", addend.trim_start_matches('+'), tmp);
+                return Some(tmp);
+            } else {
+                op.mem_addr = format!("{}(%rip)", sym);
+                return None; // no scratch register used
+            }
+        }
         // Load the pointer value into a temporary register for indirect addressing.
         // Each memory operand gets its own unique register via assign_scratch_reg,
         // so multiple "=m" outputs don't overwrite each other's addresses.

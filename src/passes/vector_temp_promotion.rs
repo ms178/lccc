@@ -466,12 +466,18 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
             };
         }
 
-        // 256-bit stores and unary consumers.
+        // 256-bit stores and unary consumers.  The two float sign masks read
+        // their operand as the byte mask does (`simd_load_arg_to` on x86-64,
+        // `emit_avx_load` on i686: a whole unaligned load); without their
+        // rows `_mm256_movemask_ps(_mm256_cmp_ps(a, b, 1))` kept the
+        // compare's result in a 32-byte-aligned home and copied it there.
         O::Storeu256
         | O::Store256
         | O::StoreuPs256
         | O::StoreuPd256
         | O::Pmovmskb256
+        | O::MovemaskPs256
+        | O::MovemaskPd256
         | O::HorizontalAddF64x4
         | O::HorizontalAddI32x8
         | O::Pabsb256
@@ -601,6 +607,46 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::MulF64x4
         | O::AddI32x8 => 32,
 
+        // `vtestps`: two operands and a flag result.
+        O::TestzPs256 => 32,
+
+        // Three 256-bit vector operands, each loaded whole and unaligned
+        // before the one instruction (`avx_load_arg_to` on x86-64,
+        // `emit_avx_load` on i686): the variable blends (mask, a, b), the
+        // FMA3 forms (a, b, c) and the VNNI dot products (sum, a, b).
+        O::BlendvPs256
+        | O::BlendvPd256
+        | O::FmaPs132v256
+        | O::FmaPs213v256
+        | O::FmaPs231v256
+        | O::FmaPd132v256
+        | O::FmaPd213v256
+        | O::FmaPd231v256
+        | O::FmsubPs132v256
+        | O::FmsubPd132v256
+        | O::FnmaddPs132v256
+        | O::FnmaddPd132v256
+        | O::FnmsubPs132v256
+        | O::FnmsubPd132v256
+        | O::FmaddsubPs132v256
+        | O::FmaddsubPd132v256
+        | O::FmsubaddPs132v256
+        | O::FmsubaddPd132v256
+        | O::Dpbusd256
+        | O::Dpbusds256
+        | O::Dpwusd256
+        | O::Dpwusds256
+        | O::Dpbssd256
+        | O::Dpbssds256
+        | O::Dpbsud256
+        | O::Dpbsuds256
+        | O::Dpbuud256
+        | O::Dpbuuds256
+        | O::Dpwuud256
+        | O::Dpwuuds256
+        | O::Dpwssd256
+        | O::Dpwssds256 => return (index < 3).then_some(32),
+
         // Two vector operands followed by an immediate/control operand.
         O::Permute2x128 => 32,
 
@@ -724,7 +770,7 @@ fn as_whole_vector_read(inst: &Instruction, width: usize, home: u32) -> bool {
 /// means that this pass cannot prove the use safe.  Address-valued scalar or
 /// immediate positions therefore fail closed rather than being mistaken for
 /// vector data.
-fn intrinsic_arg_required_alignment(op: IntrinsicOp, index: usize) -> Option<usize> {
+pub(super) fn intrinsic_arg_required_alignment(op: IntrinsicOp, index: usize) -> Option<usize> {
     use IntrinsicOp as O;
     if op == O::Load256 && index == 0 {
         return Some(32);
@@ -773,7 +819,7 @@ fn intrinsic_arg_required_alignment(op: IntrinsicOp, index: usize) -> Option<usi
     safe.then_some(0)
 }
 
-fn intrinsic_dest_required_alignment(
+pub(super) fn intrinsic_dest_required_alignment(
     op: IntrinsicOp,
     has_result: bool,
     alloca_size: usize,
@@ -4370,6 +4416,108 @@ mod tests {
             )],
         );
         assert_eq!(promote_in_function(&mut function), 0);
+    }
+
+    /// The 256-bit operations whose operands had no row: each reads every
+    /// vector operand whole through an unaligned load, so a home it reads may
+    /// lose its alignment and a load in front of it may be forwarded -- and
+    /// no position past its vector operands is a vector.
+    #[test]
+    fn wide_consumers_without_a_row_have_one_per_vector_operand() {
+        use IntrinsicOp::*;
+        for op in [MovemaskPs256, MovemaskPd256] {
+            assert_eq!(op.vector_result_width(), None, "{op:?} is scalar");
+            assert_eq!(pointer_vector_arg_width(op, 0), Some(32), "{op:?}");
+            assert_eq!(pointer_vector_arg_width(op, 1), None, "{op:?}");
+            assert_eq!(intrinsic_arg_required_alignment(op, 0), Some(0), "{op:?}");
+        }
+        assert_eq!(TestzPs256.vector_result_width(), None);
+        for index in 0..4 {
+            assert_eq!(
+                pointer_vector_arg_width(TestzPs256, index),
+                (index < 2).then_some(32),
+                "TestzPs256 arg {index}"
+            );
+        }
+        for op in [
+            BlendvPs256,
+            BlendvPd256,
+            FmaPs132v256,
+            FmaPs213v256,
+            FmaPs231v256,
+            FmaPd132v256,
+            FmaPd213v256,
+            FmaPd231v256,
+            FmsubPs132v256,
+            FmsubPd132v256,
+            FnmaddPs132v256,
+            FnmaddPd132v256,
+            FnmsubPs132v256,
+            FnmsubPd132v256,
+            FmaddsubPs132v256,
+            FmaddsubPd132v256,
+            FmsubaddPs132v256,
+            FmsubaddPd132v256,
+            Dpbusd256,
+            Dpbusds256,
+            Dpwusd256,
+            Dpwusds256,
+            Dpbssd256,
+            Dpbssds256,
+            Dpbsud256,
+            Dpbsuds256,
+            Dpbuud256,
+            Dpbuuds256,
+            Dpwuud256,
+            Dpwuuds256,
+            Dpwssd256,
+            Dpwssds256,
+        ] {
+            assert_eq!(op.vector_result_width(), Some(32), "{op:?}");
+            assert_eq!(
+                intrinsic_dest_required_alignment(op, true, 32),
+                Some(0),
+                "{op:?}"
+            );
+            for index in 0..5 {
+                assert_eq!(
+                    pointer_vector_arg_width(op, index),
+                    (index < 3).then_some(32),
+                    "{op:?} arg {index}"
+                );
+            }
+            assert!(!op.writes_memory_via_args(), "{op:?}");
+        }
+    }
+
+    /// `_mm256_movemask_ps(_mm256_cmp_ps(a, b, 1))`: the compare's result
+    /// lives in a home the mask reads. With the mask's row the home is no
+    /// longer aligned to 32, so it is a direct slot the store forwarder sees.
+    #[test]
+    fn a_home_read_by_a_float_sign_mask_loses_its_alignment() {
+        for mask in [IntrinsicOp::MovemaskPs256, IntrinsicOp::MovemaskPd256] {
+            let mut f = function(
+                "signs",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        intrinsic(
+                            Some(1),
+                            IntrinsicOp::CmpPs256,
+                            Some(0),
+                            vec![
+                                Operand::Value(Value(10)),
+                                Operand::Value(Value(11)),
+                                Operand::Const(IrConst::I32(1)),
+                            ],
+                        ),
+                        intrinsic(Some(2), mask, None, vec![Operand::Value(Value(0))]),
+                    ],
+                )],
+            );
+            assert_eq!(downgrade_in_function(&mut f), 1, "{mask:?}");
+        }
     }
 
     #[test]

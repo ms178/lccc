@@ -390,6 +390,25 @@ pub(crate) fn unimplemented_names() -> impl Iterator<Item = &'static str> {
 //     accepting it silently would ignore a prologue promise. It is refused
 //     until that codegen exists, a measured stricter-than-gcc deviation.
 //
+//   * `interrupt` is not a calling convention between two functions, it is
+//     the contract with the CPU: the handler is entered with an interrupt
+//     frame on the stack, must leave every register as it found it and
+//     returns with `iret`. Measured, gcc 16.2 `-O2 -mgeneral-regs-only`:
+//
+//         void __attribute__((interrupt)) fault(struct frame *f, unsigned long code)
+//         { ticks += code; }
+//
+//         pushq %rax; movl ticks(%rip), %eax; addl 8(%rsp), %eax
+//         movl %eax, ticks(%rip); popq %rax; addq $8, %rsp; iretq
+//
+//     lccc compiled the same function as an ordinary one: the error code read
+//     from %rsi, %rdi and %rsi overwritten, and a `ret` into the saved frame.
+//     Nothing about that links wrongly or warns; it faults the first time
+//     the interrupt fires. Until the entry and exit exist it is refused on
+//     both targets, like every convention gcc honours and lccc does not.
+//     (The table is x86's: `interrupt` on Arm or RISC-V is another attribute
+//     and is not read here.)
+//
 // `ms_struct` is the one verdict that rejects a program gcc accepts, and that is
 // deliberate rather than an unfinished edge. On a tag gcc really does apply the
 // Microsoft layout (measured: `{char; int:5; int:3;}` grows from 4 to 8 bytes)
@@ -506,6 +525,7 @@ pub(crate) const ABI_VERDICTS: &[(&str, AbiEffect, AbiEffect)] = &[
     ),
     ("ms_struct", AbiEffect::Unsupported, AbiEffect::Unsupported),
     ("gcc_struct", AbiEffect::Default, AbiEffect::Default),
+    ("interrupt", AbiEffect::Unsupported, AbiEffect::Unsupported),
 ];
 
 /// The convention each ABI attribute selects, in the words the diagnostic uses.
@@ -519,6 +539,7 @@ pub(crate) fn abi_convention(name: &str) -> &'static str {
         "no_caller_saved_registers" => "the no-caller-saved-registers contract",
         "no_callee_saved_registers" | "preserve_none" => "a non-preserving calling convention",
         "callee_pop_aggregate_return" => "a callee-pops aggregate return",
+        "interrupt" => "the entry and exit of an interrupt handler",
         _ => "a calling convention",
     }
 }
@@ -570,7 +591,7 @@ pub(crate) fn abi_effect(
 /// attributes that are not conventions without reading the target out of its
 /// thread-local (one TLS load per attribute would be a measurable cost in a
 /// header-heavy translation unit, and this predicate is a compare against
-/// fifteen static strings).
+/// sixteen static strings).
 pub(crate) fn is_abi_attribute(name: &str) -> bool {
     lookup(name).is_some()
 }

@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 554.39,
+      "predicted_gate_seconds": 615.03,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -384,6 +384,46 @@
           "name": "bash tests/regression/check_atomic_backends.sh"
         },
         {
+          "measured_s": 3.14,
+          "name": "bash tests/regression/check_atomic_operators.sh"
+        },
+        {
+          "measured_s": 0.62,
+          "name": "python3 tests/regression/check_target_attribute_arguments.py --lccc target/fastbuild/lccc"
+        },
+        {
+          "measured_s": 0.78,
+          "name": "python3 tests/regression/check_symbol_annotations.py"
+        },
+        {
+          "measured_s": 2.79,
+          "name": "python3 tests/regression/check_x86_gpr_intrinsics.py --lccc target/fastbuild/lccc"
+        },
+        {
+          "measured_s": 11.39,
+          "name": "python3 tests/regression/check_asm_registers.py --lccc target/fastbuild/lccc"
+        },
+        {
+          "measured_s": 6.04,
+          "name": "python3 tests/regression/check_carry_chain_shape.py --lccc target/fastbuild/lccc"
+        },
+        {
+          "measured_s": 26.35,
+          "name": "python3 tests/regression/check_carry_chain_fuzz.py --limbs --lccc target/fastbuild/lccc --gcc gcc-16"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 tests/regression/check_loop_carried_homes.py --lccc target/fastbuild/lccc"
+        },
+        {
+          "measured_s": 3.11,
+          "name": "python3 tests/regression/check_switch_table_liveness.py --lccc target/fastbuild/lccc --gcc gcc-16"
+        },
+        {
+          "measured_s": 6.17,
+          "name": "python3 tests/regression/check_boolean_merge_threads.py --lccc target/fastbuild/lccc --gcc gcc-16"
+        },
+        {
           "measured_s": 0.25,
           "name": "python3 scripts/audit_census.py --selftest"
         },
@@ -416,7 +456,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 577.53,
+      "predicted_gate_seconds": 604.06,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -673,7 +713,7 @@
           "name": "env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_pp_directive_comment_bridge.sh"
         },
         {
-          "measured_s": 3.0,
+          "measured_s": 0.47,
           "name": "env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_malformed_define.sh"
         },
         {
@@ -681,7 +721,7 @@
           "name": "python3 scripts/lccc_options_inventory.py --self-test"
         },
         {
-          "measured_s": 12.0,
+          "measured_s": 0.37,
           "name": "python3 scripts/lccc_options_inventory.py --check --lccc target/fastbuild/lccc"
         },
         {
@@ -983,6 +1023,10 @@
         {
           "measured_s": 0.25,
           "name": "python3 tests/regression/check_agent_swap_reuse.py"
+        },
+        {
+          "measured_s": 40.69,
+          "name": "python3 tests/regression/check_carry_chain_fuzz.py --lccc target/fastbuild/lccc --gcc gcc-16"
         }
       ]
     },
@@ -1617,7 +1661,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 354.82,
+      "predicted_gate_seconds": 355.2,
       "shards": 3,
       "steps": [
         {
@@ -1855,6 +1899,10 @@
         {
           "measured_s": 0.25,
           "name": "Surface vector-extension codegen failures in annotations"
+        },
+        {
+          "measured_s": 0.38,
+          "name": "Library builtin prototypes match GCC 16.2"
         },
         {
           "measured_s": 0.85,
@@ -2102,8 +2150,8 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/gates.tsv",
-      "measured_seconds_total": 1127.78,
-      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s; SV-03 cond-load-sink gate measured locally as max of 3 runs (0.30 s); vec-store-contracts and its self-test measured locally as worst-of-5 (1.36 s each; static scan, no compiler); SV-03 four-ISA cross, same-width cast-range, best-tool and matrix gates remeasured locally with the pinned cache toolchain (cross full 0.41 s / self-test 0.04 s, cast full 1.44 s / self-test 0.06 s (32-bit induction proof, worst-of-3), best-tools full 2.13 s / self-test 0.04 s, matrix full 16.63 s / self-test 0.04 s; bit-select fold remeasured worst-of-3 at 3.59 s after the induction runtime oracle); hosted Clang path is pinned on the command line; guarded folds remeasured worst-of-3 at 2.80 s with 21 verdict mutations, Clang 23.1.5 and a strict hosted ICX 2026.2 contract; asm-goto equivalence register check on AArch64 and RISC-V (one planted fault per target, built at -O0 by the target driver and run under qemu-user) added to shard a, measured locally as max of 3 runs (8.87 s; fastbuild binaries); loop-rotation profit gate (the default policy's decision, read off x86-64 assembly: three shapes that pay with rotation off as the negative control, three that are left byte-identical, the switches) added to shard a, measured locally as max of 3 runs (1.29 s; fastbuild binary); linear-form alias gate (which stores LICM may call disjoint from a load: marching, starting on it, wrapping round to it under unsigned and -fwrapv arithmetic; x86-64 assembly, 25 cells) added to shard a, measured locally as max of 3 runs (1.32 s; fastbuild binary); volatile-access gate remeasured locally as max of 3 runs after its atomic section was added (22 cells: an _Atomic object named by a typedef, by the qualifier, as a member, behind a pointer and through a cast is read and written in its loop, not hoisted and not kept in a register, and so is an object reached by a cast through a typedef of a volatile type; 1.95 s, +0.76 s; fastbuild binaries); loop-rotation profit gate remeasured locally as max of 3 runs after its fed-header section was added (13 cells: `while (n--)` is one block closed by its test, and an ordered test on the old counter, a body that reads the value from before the step and a header that tests memory are left alone; 0.88 s, -0.41 s; fastbuild binary); i686 mul-accumulate narrow-operand gate (the fused 64-bit `res * base + val` extends an 8- or 16-bit addend itself and reads a narrow base from the slot its cast wrote: the test program at five levels, each recurrence against itself through memory, and 15 cells read off the -O2 assembly) added to shard a, measured locally as max of 3 runs (1.33 s; fastbuild binaries); AU-01/MB-01 gates added 2026-11-24 (check_malformed_define.sh and both lccc_options_inventory.py invocations): the authoring sandbox had no Rust toolchain and therefore no built lccc, so these three could not be measured with scripts/ci_gate_costs.py; the values are estimates from the sibling check_pp_directive_comment_bridge.sh (1.70 s over 25 compiler invocations) and from the inventory's 37 rows (one compile plus at most one binutils view each), with the self-test floored at 0.25 s per this file's convention. Re-measure on a toolchain-bearing host and update this plan."
+      "measured_seconds_total": 1219.09,
+      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s; SV-03 cond-load-sink gate measured locally as max of 3 runs (0.30 s); vec-store-contracts and its self-test measured locally as worst-of-5 (1.36 s each; static scan, no compiler); SV-03 four-ISA cross, same-width cast-range, best-tool and matrix gates remeasured locally with the pinned cache toolchain (cross full 0.41 s / self-test 0.04 s, cast full 1.44 s / self-test 0.06 s (32-bit induction proof, worst-of-3), best-tools full 2.13 s / self-test 0.04 s, matrix full 16.63 s / self-test 0.04 s; bit-select fold remeasured worst-of-3 at 3.59 s after the induction runtime oracle); hosted Clang path is pinned on the command line; guarded folds remeasured worst-of-3 at 2.80 s with 21 verdict mutations, Clang 23.1.5 and a strict hosted ICX 2026.2 contract; asm-goto equivalence register check on AArch64 and RISC-V (one planted fault per target, built at -O0 by the target driver and run under qemu-user) added to shard a, measured locally as max of 3 runs (8.87 s; fastbuild binaries); loop-rotation profit gate (the default policy's decision, read off x86-64 assembly: three shapes that pay with rotation off as the negative control, three that are left byte-identical, the switches) added to shard a, measured locally as max of 3 runs (1.29 s; fastbuild binary); linear-form alias gate (which stores LICM may call disjoint from a load: marching, starting on it, wrapping round to it under unsigned and -fwrapv arithmetic; x86-64 assembly, 25 cells) added to shard a, measured locally as max of 3 runs (1.32 s; fastbuild binary); volatile-access gate remeasured locally as max of 3 runs after its atomic section was added (22 cells: an _Atomic object named by a typedef, by the qualifier, as a member, behind a pointer and through a cast is read and written in its loop, not hoisted and not kept in a register, and so is an object reached by a cast through a typedef of a volatile type; 1.95 s, +0.76 s; fastbuild binaries); loop-rotation profit gate remeasured locally as max of 3 runs after its fed-header section was added (13 cells: `while (n--)` is one block closed by its test, and an ordered test on the old counter, a body that reads the value from before the step and a header that tests memory are left alone; 0.88 s, -0.41 s; fastbuild binary); i686 mul-accumulate narrow-operand gate (the fused 64-bit `res * base + val` extends an 8- or 16-bit addend itself and reads a narrow base from the slot its cast wrote: the test program at five levels, each recurrence against itself through memory, and 15 cells read off the -O2 assembly) added to shard a, measured locally as max of 3 runs (1.33 s; fastbuild binaries); AU-01/MB-01 gates added 2026-11-24 (check_malformed_define.sh and both lccc_options_inventory.py invocations) were entered as estimates (3.0 s, 0.25 s, 12.0 s) by a sandbox without a Rust toolchain; re-measured on a toolchain-bearing host as max of 3 runs: 0.47 s (25 cases, GCC 16.2 oracle), 0.11 s floored at 0.25 s, 0.37 s (37 rows; fastbuild binary), -14.16 s in shard b; atomic-operators gate (`x++`, `x += v`, `x = v` and a read of an `_Atomic` object are locked instructions or compare-exchange loops on x86-64, i686, AArch64 and RISC-V, read off the assembly of a probe on all four, and the threaded test program at five levels) added to shard a, measured locally as max of 3 runs (3.14 s; fastbuild binaries); target-attribute-arguments gate (two fixtures: 91 declarations and 73 errors in GCC's words on definitions, prototypes and `#pragma GCC target`, lccc and GCC 16.2 each against the fixtures' comments) added to shard a, remeasured locally as max of 3 runs after the second fixture (0.62 s; fastbuild binary); symbol-annotations gate (18 objects on x86-64, i686, AArch64 and RISC-V: every symbol the compiler defines, the CPUID probe helper and the profile writer included, is typed and sized, with an untyped assembly source as the negative control) added to shard a, measured locally as max of 3 runs (0.78 s; fastbuild binaries, readelf); x86-gpr-intrinsics gate (the 76 x86-64 and 53 i686 callers of the scalar and system intrinsics: instruction and form against GCC 16.2, and 122 operand sets compared in front of the instruction under GDB, with three planted differences) added to shard a, measured locally as max of 3 runs (2.79 s; fastbuild binary, GDB 18.1); asm-registers gate (92 programs against GCC 16.2 for x86-64 and i686 at -O0 to -Os with and without PIC, 2 shared libraries linked with -z text, 10 refusals, 212 clobber names) added to shard a, measured locally as max of 3 runs (11.39 s; fastbuild binary, 2 jobs); carry-chain shape gate (the assembly of carry_chain_adders.c, with the pass off as the negative control) added to shard a and carry-chain fuzz gate (eight generated programs and the fixture through seven configurations against GCC 16.2, one planted carry) added to shard b, measured locally as max of 3 runs (2.24 s and 35.13 s; fastbuild binary, 2 cores); carry-chain limb-loop fuzz gate (eight generated programs of eight limb loops each through eight configurations against GCC 16.2, one planted carry, and a floor under the share of the loops that limb_unroll splits) added to shard a, measured locally as max of 3 runs (26.35 s; fastbuild binary, 2 cores); the shape gate remeasured after it also holds four adc/sbb in a row for the 14 limb loops, with limb_unroll off as a second negative control (3.72 s, +1.48 s), and the fuzz gate of the adders remeasured in the same sitting (40.69 s, +5.56 s); loop-carried-homes gate (two compiles and a scan of the assembly; the matchers tried on five witnesses) added to shard a, measured locally as max of 3 runs (0.18 s, floored at 0.25 s); the shape gate remeasured after it also holds, for 17 limb loops, a main loop that makes no boolean of its carry, with the carry_loop peephole off as a third negative control (4.60 s, +0.88 s; four compiles of the fixture); the shape gate remeasured after two limb loops behind a guard joined its fixture (19 loops; 5.27 s, +0.67 s); and again after the double word joined it (27 loops, 102 functions; 6.04 s, +0.77 s); switch-table-liveness gate (the fixture's output in 15 configurations against GCC 16.2's, and each of its five functions at three levels under two position-fixed code models no longer than its position-independent form less the three instructions a dispatch saves, with one function as it was emitted before as the negative control) added to shard a, measured locally as max of 4 runs (3.11 s; fastbuild binary); boolean-merge-threads gate (the fixture's output in 14 configurations against GCC 16.2's, eleven functions of it no longer than today and seven of them with a bit test, no constant written to be tested in the sift loop of zlib_ng_huffman_heap.c, with the early position of the threader and the set fold off as the two negative controls) added to shard a, measured locally as max of 3 runs (6.17 s; fastbuild binary)"
     },
     "codegen": {
       "costs": "/home/user/lccc-bench/split/costs.tsv",
@@ -2113,7 +2161,7 @@
     "frontend": {
       "costs": "/home/user/checkpoints/ci-main-union-costs.tsv",
       "measured_seconds_total": 1062.95,
-      "source": "Union with main 662b771c0; retain both sides coverage and previously measured diagnostic gate costs. Four 2026-11-04 GCC-16.2 follow-up gates added to frontend-a with locally measured worst-of-3 wall times (scripts/ci_local.sh toolchain, fastbuild binaries): asm-constraints 1.65 s, vectorizer-openmp 0.93 s, gnu-declaration-corners 0.55 s, parser-depth-limits 0.34 s (worst-of-3 remeasured after the 64-spelling red-team differential gate landed). GNU object-placement declarator scopes added to frontend-a (local worst of three 2.00 s; fastbuild and GCC 16.2). Feature capability truthfulness added to frontend-b (local worst-of-3 wall 0.63 s; fastbuild, GCC 16.2 / Clang 23.1.5 oracles). 2026-11-22 modifiable-lvalue gate (C11 6.3.2.1p3 const-member structural rule) added to frontend-a with locally measured worst-of-3 wall time 0.50 s (8 error-contract cases incl. live gcc-16 wording cross-check). Every-input compilation (the driver compiles each input of a command line and reports each failure, as GCC 16.2 and Clang 23.1.5 do) added to frontend-b (local worst-of-3 wall 0.29 s; fastbuild, GCC 16.2 oracle). Intrinsic differential corpus remeasured with its five new cases (compare predicates, shift counts, 512-bit reductions, carry-less selectors, extended state), at -O2 as before (local worst-of-3 wall 7.59 s, was 5.0 s with eleven cases; fastbuild); the cases without optimization run in the unsharded backend job against GCC 16.2."
+      "source": "Union with main 662b771c0; retain both sides coverage and previously measured diagnostic gate costs. Four 2026-11-04 GCC-16.2 follow-up gates added to frontend-a with locally measured worst-of-3 wall times (scripts/ci_local.sh toolchain, fastbuild binaries): asm-constraints 1.65 s, vectorizer-openmp 0.93 s, gnu-declaration-corners 0.55 s, parser-depth-limits 0.34 s (worst-of-3 remeasured after the 64-spelling red-team differential gate landed). GNU object-placement declarator scopes added to frontend-a (local worst of three 2.00 s; fastbuild and GCC 16.2). Feature capability truthfulness added to frontend-b (local worst-of-3 wall 0.63 s; fastbuild, GCC 16.2 / Clang 23.1.5 oracles). 2026-11-22 modifiable-lvalue gate (C11 6.3.2.1p3 const-member structural rule) added to frontend-a with locally measured worst-of-3 wall time 0.50 s (8 error-contract cases incl. live gcc-16 wording cross-check). Every-input compilation (the driver compiles each input of a command line and reports each failure, as GCC 16.2 and Clang 23.1.5 do) added to frontend-b (local worst-of-3 wall 0.29 s; fastbuild, GCC 16.2 oracle). Intrinsic differential corpus remeasured with its five new cases (compare predicates, shift counts, 512-bit reductions, carry-less selectors, extended state), at -O2 as before (local worst-of-3 wall 7.59 s, was 5.0 s with eleven cases; fastbuild); the cases without optimization run in the unsharded backend job against GCC 16.2. Library builtin prototypes (the generated table of GCC's types for the library builtins and the generated argument test, checked against gcc-16) added to frontend-b, before the arity table that reads it (local worst-of-3 wall 0.38 s for the self-test and --check; GCC 16.2, no compiler binary)."
     }
   }
 }

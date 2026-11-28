@@ -627,7 +627,7 @@
     "vpcmpb128": {
       "enforce": true,
       "gcc_header": "avx512vlbwintrin.h",
-      "intrinsic": "_mm_cmp_epi8_mask",
+      "intrinsic": "_mm_mask_cmp_epi8_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -638,7 +638,7 @@
     "vpcmpb256": {
       "enforce": true,
       "gcc_header": "avx512vlbwintrin.h",
-      "intrinsic": "_mm256_cmp_epi8_mask",
+      "intrinsic": "_mm256_mask_cmp_epi8_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -649,7 +649,7 @@
     "vpcmpb512": {
       "enforce": true,
       "gcc_header": "avx512bwintrin.h",
-      "intrinsic": "_mm512_cmp_epi8_mask",
+      "intrinsic": "_mm512_mask_cmp_epi8_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -659,7 +659,7 @@
     "vpcmpd128": {
       "enforce": true,
       "gcc_header": "avx512vlintrin.h",
-      "intrinsic": "_mm_cmp_epi32_mask",
+      "intrinsic": "_mm_mask_cmp_epi32_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -669,7 +669,7 @@
     "vpcmpd256": {
       "enforce": true,
       "gcc_header": "avx512vlintrin.h",
-      "intrinsic": "_mm256_cmp_epi32_mask",
+      "intrinsic": "_mm256_mask_cmp_epi32_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -679,7 +679,7 @@
     "vpcmpd512": {
       "enforce": true,
       "gcc_header": "avx512fintrin.h",
-      "intrinsic": "_mm512_cmp_epi32_mask",
+      "intrinsic": "_mm512_mask_cmp_epi32_mask",
       "note": "",
       "required_features": [
         "Avx512F"
@@ -688,7 +688,7 @@
     "vpcmpq128": {
       "enforce": true,
       "gcc_header": "avx512vlintrin.h",
-      "intrinsic": "_mm_cmp_epi64_mask",
+      "intrinsic": "_mm_mask_cmp_epi64_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -698,7 +698,7 @@
     "vpcmpq256": {
       "enforce": true,
       "gcc_header": "avx512vlintrin.h",
-      "intrinsic": "_mm256_cmp_epi64_mask",
+      "intrinsic": "_mm256_mask_cmp_epi64_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -708,7 +708,7 @@
     "vpcmpq512": {
       "enforce": true,
       "gcc_header": "avx512fintrin.h",
-      "intrinsic": "_mm512_cmp_epi64_mask",
+      "intrinsic": "_mm512_mask_cmp_epi64_mask",
       "note": "",
       "required_features": [
         "Avx512F"
@@ -717,7 +717,7 @@
     "vpcmpub128": {
       "enforce": true,
       "gcc_header": "avx512vlbwintrin.h",
-      "intrinsic": "_mm_cmp_epu8_mask",
+      "intrinsic": "_mm_mask_cmp_epu8_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -728,7 +728,7 @@
     "vpcmpub256": {
       "enforce": true,
       "gcc_header": "avx512vlbwintrin.h",
-      "intrinsic": "_mm256_cmp_epu8_mask",
+      "intrinsic": "_mm256_mask_cmp_epu8_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -739,7 +739,7 @@
     "vpcmpub512": {
       "enforce": true,
       "gcc_header": "avx512bwintrin.h",
-      "intrinsic": "_mm512_cmp_epu8_mask",
+      "intrinsic": "_mm512_mask_cmp_epu8_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -749,7 +749,7 @@
     "vpcmpud128": {
       "enforce": true,
       "gcc_header": "avx512vlintrin.h",
-      "intrinsic": "_mm_cmp_epu32_mask",
+      "intrinsic": "_mm_mask_cmp_epu32_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -759,7 +759,7 @@
     "vpcmpud256": {
       "enforce": true,
       "gcc_header": "avx512vlintrin.h",
-      "intrinsic": "_mm256_cmp_epu32_mask",
+      "intrinsic": "_mm256_mask_cmp_epu32_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -769,7 +769,7 @@
     "vpcmpud512": {
       "enforce": true,
       "gcc_header": "avx512fintrin.h",
-      "intrinsic": "_mm512_cmp_epu32_mask",
+      "intrinsic": "_mm512_mask_cmp_epu32_mask",
       "note": "",
       "required_features": [
         "Avx512F"
@@ -778,7 +778,7 @@
     "vpcmpuq128": {
       "enforce": true,
       "gcc_header": "avx512vlintrin.h",
-      "intrinsic": "_mm_cmp_epu64_mask",
+      "intrinsic": "_mm_mask_cmp_epu64_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -788,7 +788,7 @@
     "vpcmpuq256": {
       "enforce": true,
       "gcc_header": "avx512vlintrin.h",
-      "intrinsic": "_mm256_cmp_epu64_mask",
+      "intrinsic": "_mm256_mask_cmp_epu64_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -798,7 +798,7 @@
     "vpcmpuq512": {
       "enforce": true,
       "gcc_header": "avx512fintrin.h",
-      "intrinsic": "_mm512_cmp_epu64_mask",
+      "intrinsic": "_mm512_mask_cmp_epu64_mask",
       "note": "",
       "required_features": [
         "Avx512F"
@@ -807,7 +807,7 @@
     "vpcmpuw128": {
       "enforce": true,
       "gcc_header": "avx512vlbwintrin.h",
-      "intrinsic": "_mm_cmp_epu16_mask",
+      "intrinsic": "_mm_mask_cmp_epu16_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -818,7 +818,7 @@
     "vpcmpuw256": {
       "enforce": true,
       "gcc_header": "avx512vlbwintrin.h",
-      "intrinsic": "_mm256_cmp_epu16_mask",
+      "intrinsic": "_mm256_mask_cmp_epu16_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -829,7 +829,7 @@
     "vpcmpuw512": {
       "enforce": true,
       "gcc_header": "avx512bwintrin.h",
-      "intrinsic": "_mm512_cmp_epu16_mask",
+      "intrinsic": "_mm512_mask_cmp_epu16_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -839,7 +839,7 @@
     "vpcmpw128": {
       "enforce": true,
       "gcc_header": "avx512vlbwintrin.h",
-      "intrinsic": "_mm_cmp_epi16_mask",
+      "intrinsic": "_mm_mask_cmp_epi16_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -850,7 +850,7 @@
     "vpcmpw256": {
       "enforce": true,
       "gcc_header": "avx512vlbwintrin.h",
-      "intrinsic": "_mm256_cmp_epi16_mask",
+      "intrinsic": "_mm256_mask_cmp_epi16_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -861,7 +861,7 @@
     "vpcmpw512": {
       "enforce": true,
       "gcc_header": "avx512bwintrin.h",
-      "intrinsic": "_mm512_cmp_epi16_mask",
+      "intrinsic": "_mm512_mask_cmp_epi16_mask",
       "note": "",
       "required_features": [
         "Avx512F",
@@ -1077,5 +1077,5 @@
   "schema": 1,
   "source": "GCC 16.2.0 intrinsic headers (harness-cache-8 tag cache)",
   "unique_mnemonics": 126,
-  "wrapper_pairs": 189
+  "wrapper_pairs": 477
 }

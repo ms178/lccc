@@ -319,11 +319,11 @@ pub(super) enum MoveSize {
     /// byte-range passes see the true 32-byte extent — as `Other` lines
     /// these moves registered a conservative READ of their own slot and
     /// the never-read elimination could never delete a dead `%ymm`
-    /// return-buffer or argument-home store. Store FORWARDING never maps
-    /// QQ slots (`xmm_mnemonic` has no QQ arm and the gsf handlers screen
-    /// it): a forwarded 32-byte reload would have to reproduce the VEX
-    /// upper-zeroing of bits 256..MAXVL, which the 16-byte register forms
-    /// do not.
+    /// return-buffer or argument-home store. Store forwarding maps a QQ
+    /// slot to the register that filled it and serves a 32-byte reload
+    /// with the 256-bit register move, which zeroes bits 256..MAXVL as the
+    /// load does (`gsf_forward_ymm_reload`); the pair-fusion relays stay
+    /// at 16 bytes and below (`xmm_mnemonic` has no QQ arm).
     QQ,
 }
 
@@ -1586,7 +1586,9 @@ fn frame_operand_start(prefix: &[u8]) -> usize {
 }
 
 /// Parse a scalar-FP / SSE stack move: `movsd`, `movss`, `movd` (or AVX
-/// `vmovsd`/`vmovss`) between an XMM register and a frame slot. Returns
+/// `vmovsd`/`vmovss`), or one of the six packed moves (`movdqu`, `movdqa`,
+/// `movups`, `movaps`, `movupd`, `movapd`, each with or without `v`),
+/// between an XMM register and a frame slot. Returns
 /// (is_store, offset_str, size). The string-op and reg-reg forms are
 /// rejected by construction (the slot operand, not `%ds:/%es:` or an XMM,
 /// must be one of the two ends), and `is_direct_frame_slot` is what enforces
@@ -1609,9 +1611,13 @@ pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
         (r, MoveSize::DQ)
     } else if let Some(r) = s.strip_prefix("movapd ") {
         (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movupd ") {
+        (r, MoveSize::DQ)
     } else if let Some(r) = s.strip_prefix("vmovaps ") {
         (r, MoveSize::DQ)
     } else if let Some(r) = s.strip_prefix("vmovapd ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovupd ") {
         (r, MoveSize::DQ)
     } else if let Some(r) = s.strip_prefix("vmovsd ") {
         (r, MoveSize::SD)
@@ -4028,6 +4034,23 @@ mod fp_slot_move_width_tests {
             parse_fp_slot_move("movapd %xmm0, -16(%rbp)"),
             Some((true, "-16", MoveSize::DQ))
         );
+        // All six packed spellings, legacy and VEX, in both directions: the
+        // unaligned double-precision one was the only one left to the
+        // unclassified path, and with it every `__m128d`/`__m256d` home.
+        for stem in ["movdqu", "movdqa", "movups", "movaps", "movupd", "movapd"] {
+            for vex in ["", "v"] {
+                assert_eq!(
+                    parse_fp_slot_move(&format!("{vex}{stem} %xmm3, 40(%rsp)")),
+                    Some((true, "40", MoveSize::DQ)),
+                    "{vex}{stem}"
+                );
+                assert_eq!(
+                    parse_fp_slot_move(&format!("{vex}{stem} -48(%rbp), %xmm12")),
+                    Some((false, "-48", MoveSize::DQ)),
+                    "{vex}{stem}"
+                );
+            }
+        }
     }
 
     /// The packed mnemonics are width-polymorphic in the register operand:
@@ -4051,7 +4074,25 @@ mod fp_slot_move_width_tests {
             parse_fp_slot_move("vmovdqu %ymm0, -32(%rbp)"),
             Some((true, "-32", MoveSize::QQ))
         );
-        for line in ["vmovaps 64(%rsp), %zmm3", "vmovapd %zmm3, 64(%rsp)"] {
+        for stem in [
+            "vmovdqu", "vmovdqa", "vmovups", "vmovaps", "vmovupd", "vmovapd",
+        ] {
+            assert_eq!(
+                parse_fp_slot_move(&format!("{stem} %ymm5, 64(%rsp)")),
+                Some((true, "64", MoveSize::QQ)),
+                "{stem}"
+            );
+            assert_eq!(
+                parse_fp_slot_move(&format!("{stem} 64(%rsp), %ymm5")),
+                Some((false, "64", MoveSize::QQ)),
+                "{stem}"
+            );
+        }
+        for line in [
+            "vmovaps 64(%rsp), %zmm3",
+            "vmovapd %zmm3, 64(%rsp)",
+            "vmovupd %zmm3, 64(%rsp)",
+        ] {
             assert_eq!(parse_fp_slot_move(line), None, "{line}");
         }
     }

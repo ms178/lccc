@@ -130,6 +130,42 @@ class MergeReports(unittest.TestCase):
             self.merge(report(["a"]), other)
         self.assertIn("compiler identities differ", str(caught.exception))
 
+    def test_the_log_names_each_host_and_says_what_a_ratio_compares_with(self):
+        # The job log is the only copy of the report the API hands back, and
+        # one kernel's ratio differs more between two hosted CPU models than
+        # between two compilers under review: a report that does not name its
+        # host reads as a regression of whatever was pushed last.
+        intel = report(["a"])
+        amd = report(["b"])
+        intel["metadata"]["cpu_models"] = ["Intel test"]
+        amd["metadata"]["cpu_models"] = ["AMD test"]
+        merged = self.merge(intel, amd)
+        terminal = bench.render_terminal(merged)
+        self.assertIn("CPU model(s): shard-0.json: Intel test | shard-1.json: AMD test", terminal)
+        self.assertIn(bench.COMPARABILITY_NOTE, terminal)
+        self.assertIn(f"- **Comparability:** {bench.COMPARABILITY_NOTE}", bench.render_markdown(merged))
+        self.assertIn("same CPU model", bench.COMPARABILITY_NOTE)
+
+        single = report(["a"])
+        self.assertIn("CPU model(s): test\n", bench.render_terminal(single))
+        self.assertEqual(bench.measurement_hosts(single), ["test"])
+
+        nameless = report(["a"])
+        del nameless["metadata"]["cpu_models"]
+        self.assertEqual(bench.measurement_hosts(nameless), ["unknown"])
+        self.assertIn("CPU model(s): unknown\n", bench.render_terminal(nameless))
+        two = report(["a"])
+        two["metadata"]["cpu_models"] = ["P core", "E core"]
+        self.assertEqual(bench.measurement_hosts(two), ["P core; E core"])
+
+    def test_a_report_without_timings_makes_no_claim_about_ratios(self):
+        untimed = report(["a"])
+        untimed["settings"] = dict(untimed["settings"], skip_perf=True)
+        terminal = bench.render_terminal(untimed)
+        self.assertIn("CPU model(s): test", terminal)
+        self.assertNotIn(bench.COMPARABILITY_NOTE, terminal)
+        self.assertNotIn("Comparability", bench.render_markdown(untimed))
+
     def test_merged_report_renders_like_a_single_corpus(self):
         merged = self.merge(report(["a", "b"]), report(["c"]))
         markdown = bench.render_markdown(merged)

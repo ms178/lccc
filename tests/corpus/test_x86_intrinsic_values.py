@@ -62,6 +62,22 @@ class TheTestWritten(unittest.TestCase):
         load = values.Test("_mm_loadu_ps", "__m128", shape("float const *__P"), {})
         self.assertNotIn("lv_mix(b0", load.line(0), "what is only read is not a result")
 
+    def test_what_saves_the_processor_state_gets_room_for_it(self):
+        # FXSAVE writes 512 bytes and XSAVE what the mask selects (2,696
+        # with AVX-512): into the 256 bytes every pointer had, the store ran
+        # over the objects behind it, and off the end of the program's data
+        # where the mask selected enough (`_xsave64&` died under one
+        # compiler's layout and not under the other's).
+        for name in ("_fxsave", "_fxsave64", "_xsave", "_xsave64", "_xsaveopt64", "_xsavec"):
+            self.assertEqual(values.buffer_of(name), values.STATE_BUFFER, name)
+            line = values.Test(name, "void", shape("void *__P", "long long __M"), {}).line(0)
+            self.assertIn(f"static unsigned char b0[{values.STATE_BUFFER}] "
+                          "__attribute__((aligned(64)));", line)
+            self.assertIn(f"lv_fill(b0, {values.STATE_BUFFER}, 0);", line)
+        self.assertGreaterEqual(values.STATE_BUFFER, 10944)
+        for name in ("_mm_storeu_ps", "_mm512_storeu_si512", "_xgetbv", "_mm_stream_si32"):
+            self.assertEqual(values.buffer_of(name), values.BUFFER, name)
+
     def test_an_aligned_access_gets_an_aligned_address(self):
         line = values.Test("_mm_load_ps", "__m128", shape("float const *__P"), {}).line(0)
         self.assertIn("(b0 + 0)", line)
@@ -91,6 +107,149 @@ class TheTestWritten(unittest.TestCase):
             self.assertTrue(values.NOT_RUN.match(name), name)
         for name in ("_xgetbv", "_mm_add_ps", "_mm_getcsr"):
             self.assertFalse(values.NOT_RUN.match(name), name)
+
+
+class TheConversionTwins(unittest.TestCase):
+    """A scalar argument in an object of another type: the call converts it."""
+
+    INSERT = shape("__m128i __D", "int __S", "const int __N")
+    # Type -> (bits, signed).
+    INTEGERS = {
+        "char": (8, True), "short": (16, True), "int": (32, True),
+        "unsigned char": (8, False), "unsigned short": (16, False),
+        "unsigned int": (32, False), "unsigned": (32, False),
+        "__mmask8": (8, False), "__mmask16": (16, False), "__mmask32": (32, False),
+        "long long": (64, True), "long long int": (64, True),
+        "unsigned long long": (64, False), "__mmask64": (64, False),
+    }
+
+    def test_an_integer_arrives_in_a_double_only_truncation_gives_back(self):
+        twin = values.Test("_mm_insert_epi32", "__m128i", self.INSERT, {2: 1}, "@")
+        line = twin.line(0)
+        self.assertEqual(twin.label, "_mm_insert_epi32#1@")
+        self.assertIn("int a1; lv_fill(&a1, sizeof a1, 0);", line)
+        self.assertIn("double x1 = (double)a1; x1 += x1 < 0 ? -0.75 : 0.75;", line)
+        self.assertIn("_mm_insert_epi32(a0, x1, 1)", line)
+
+    def test_a_narrow_integer_arrives_under_an_upper_half_to_drop(self):
+        twin = values.Test("_mm_insert_epi32", "__m128i", self.INSERT, {2: 1}, "&")
+        line = twin.line(0)
+        self.assertEqual(twin.label, "_mm_insert_epi32#1&")
+        self.assertIn("long long x1 = (long long)((unsigned long long)(unsigned)a1"
+                      " | 0x5a5a5a5a5a5a5a5aull << 8 * sizeof a1);", line)
+        self.assertIn("_mm_insert_epi32(a0, x1, 1)", line)
+
+    def test_a_64_bit_integer_arrives_by_its_low_half_and_narrower(self):
+        signed = shape("__m128d __A", "long long __B")
+        self.assertIn("double x1 = (double)(int)a1;",
+                      values.Test("_mm_cvtsi64_sd", "__m128d", signed, {}, "@").line(0))
+        self.assertIn("int x1 = (int)a1; __m128d r = _mm_cvtsi64_sd(a0, x1);",
+                      values.Test("_mm_cvtsi64_sd", "__m128d", signed, {}, "&").line(0))
+        unsigned = shape("unsigned long long __X", "unsigned long long __Y")
+        self.assertIn("double x0 = (double)(unsigned)a0;",
+                      values.Test("_pdep_u64", "unsigned long long", unsigned, {}, "@").line(0))
+        self.assertIn("signed char x1 = (signed char)a1;",
+                      values.Test("_pdep_u64", "unsigned long long", unsigned, {}, "&").line(0))
+
+    def test_a_floating_parameter_gets_an_integer_and_one_twin(self):
+        tests = values.variants_of("_mm_set_ss", "__m128", shape("float __F"), [])
+        self.assertEqual([t.label for t in tests], ["_mm_set_ss", "_mm_set_ss@"])
+        line = tests[1].line(0)
+        self.assertIn("short s0; lv_fill(&s0, sizeof s0, 0); long long x0 = s0;", line)
+        self.assertIn("_mm_set_ss(x0)", line)
+
+    def test_what_is_no_scalar_is_passed_as_before(self):
+        store = shape("int *__P", "__m128i __A", "__mmask8 __U")
+        line = values.Test("_x", "void", store, {}, "@").line(0)
+        self.assertIn("_x((int *)(void *)(b0 + 0), a1, x2)", line)
+        self.assertEqual(values.Test("_x", "void", store, {}, "@").carried(), [2])
+        # Nothing to convert: no twin.
+        for parameters in (["__m128 __A", "__m128 __B"], ["const float *__P"],
+                           ["__m128i __A", "_Float16 __B"]):
+            tests = values.variants_of("_x", "__m128", shape(*parameters), [])
+            self.assertEqual([t.label for t in tests], ["_x"], parameters)
+
+    def test_an_immediate_stays_the_literal_it_is(self):
+        tests = values.variants_of("_mm_shuffle_epi32", "__m128i",
+                                   shape("__m128i __A", "const int __mask"), [1])
+        self.assertFalse([t.label for t in tests if t.spelling in values.CONVERSIONS])
+        twin = values.Test("_mm_insert_epi32", "__m128i", self.INSERT, {2: 3}, "&")
+        self.assertEqual(twin.carried(), [1])
+
+    def test_the_twins_go_with_the_first_choices_of_the_immediates(self):
+        tests = values.variants_of("_mm_insert_epi32", "__m128i", self.INSERT, [2])
+        twins = [t.label for t in tests if t.spelling in values.CONVERSIONS]
+        first = values.IMMEDIATES[:values.EXPRESSION_TWINS]
+        self.assertEqual(twins, [f"_mm_insert_epi32#{n}{spelling}" for n in first
+                                 for spelling in values.CONVERSIONS])
+        self.assertEqual(len(tests), len(values.IMMEDIATES) + 3 * values.EXPRESSION_TWINS)
+        self.assertEqual(len({t.label for t in tests}), len(tests))
+
+    def test_a_twin_draws_the_arguments_of_its_test(self):
+        plain = values.Test("_mm_cvtsi32_si128", "__m128i", shape("int __A"), {})
+        for spelling in values.CONVERSIONS:
+            twin = values.Test("_mm_cvtsi32_si128", "__m128i", shape("int __A"), {}, spelling)
+            self.assertEqual(twin.label, "_mm_cvtsi32_si128" + spelling)
+            self.assertEqual(twin.seed, plain.seed)
+
+    def test_the_rules_of_an_argument_are_applied_before_it_is_carried(self):
+        scan = values.Test("_bit_scan_forward", "int", shape("int __A"), {}, "@").line(0)
+        self.assertLess(scan.index("a0 |= 1;"), scan.index("double x0"))
+        csr = values.Test("_mm_setcsr", "void", shape("unsigned int __I"), {}, "&").line(0)
+        self.assertLess(csr.index(values.ARGUMENT_RULES["_mm_setcsr"]), csr.index("long long x0"))
+        self.assertIn("_mm_setcsr(x0)", csr)
+
+    def test_every_integer_type_of_the_headers_has_both_carriers(self):
+        self.assertEqual(set(values.CARRIED_INTEGERS), set(self.INTEGERS))
+        self.assertEqual(set(values.CARRIED_NARROW) | set(values.CARRIED_WIDE), set(self.INTEGERS))
+        self.assertFalse(set(values.CARRIED_NARROW) & set(values.CARRIED_WIDE))
+        for kind, (bits, _) in self.INTEGERS.items():
+            self.assertEqual(kind in values.CARRIED_WIDE, bits == 64, kind)
+            for spelling in values.CONVERSIONS:
+                self.assertIsNotNone(values.carrier_of("const " + kind, 0, spelling), kind)
+        self.assertIsNone(values.carrier_of("float", 0, "&"))
+        self.assertIsNone(values.carrier_of("int", 0, ""))
+        self.assertIsNone(values.carrier_of("__m128i", 0, "@"))
+        self.assertIsNone(values.carrier_of("_MM_PERM_ENUM", 0, "@"))
+
+    def test_the_double_gives_every_value_back_by_truncation_and_no_other_way(self):
+        # The arithmetic of the "@" carrier, on the edges of every type: the
+        # value (a 64-bit one by its low half) with three quarters beside it
+        # is exact in a double, in the range of the type, and truncation is
+        # the only rounding that returns the value.
+        import math
+        for kind, (bits, signed) in self.INTEGERS.items():
+            low = -(1 << (bits - 1)) if signed else 0
+            high = (1 << (bits - 1)) - 1 if signed else (1 << bits) - 1
+            for value in {low, low + 1, -1 if signed else 0, 0, 1, high - 1, high}:
+                clamp = values.CARRIED_INTEGERS[kind]
+                if clamp == "(int)":
+                    value = (value + (1 << 31)) % (1 << 32) - (1 << 31)
+                elif clamp == "(unsigned)":
+                    value %= 1 << 32
+                else:
+                    self.assertEqual(clamp, "", kind)
+                    self.assertLessEqual(bits, 32, kind)
+                carried = float(value)
+                carried += -0.75 if carried < 0 else 0.75
+                self.assertEqual(abs(carried) - abs(value), 0.75, (kind, value))
+                self.assertEqual(math.trunc(carried), value, (kind, value))
+                self.assertTrue(low <= math.trunc(carried) <= high, (kind, value))
+                self.assertNotEqual(round(carried), value, (kind, value))
+                if value:
+                    self.assertNotEqual(math.floor(carried), math.ceil(carried))
+
+    def test_the_wider_integer_differs_from_the_value_only_above_its_width(self):
+        for kind, (bits, _) in self.INTEGERS.items():
+            if bits == 64:
+                continue
+            mask = (1 << bits) - 1
+            for value in (0, 1, mask >> 1, (mask >> 1) + 1, mask):
+                carried = (value | 0x5A5A5A5A5A5A5A5A << bits) & ((1 << 64) - 1)
+                self.assertEqual(carried & mask, value, kind)
+                self.assertNotEqual(carried, value, kind)
+                # Neither the sign extension nor the zero extension of the value.
+                self.assertNotIn(carried >> bits, (0, (1 << (64 - bits)) - 1), kind)
 
 
 class TheImmediates(unittest.TestCase):

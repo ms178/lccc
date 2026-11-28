@@ -206,7 +206,7 @@ impl Diagnostic {
 /// Constraint characters the x86 back ends actually classify: register, memory
 /// and symbolic classes on the left, immediate-only classes on the right.
 /// Anything else used to fall through `match { _ => {} }` into `GpReg`.
-const X86_CLASSES: &str = "abcdfglmopqrvxyUADQRSVYX";
+const X86_CLASSES: &str = "abcdfgklmopqrvxyUADQRSVYX";
 // `s` is GCC's "symbolic/string-literal immediate" class: it is an immediate
 // class for choosing an alternative, but unlike `i`/`n` it refuses a folded
 // integer (`"s"(5)` is `impossible constraint`, measured gcc 16.2).  It is
@@ -843,6 +843,99 @@ fn check_template(
     }
 }
 
+/// Is `name` something a clobber list of an x86 `asm` statement can name?
+///
+/// GCC refuses any other string ("unknown register name 'foo' in 'asm'");
+/// lccc took every string and ignored the ones it did not know, so a
+/// misspelt clobber (`"r14b"`, `"EBX"`, `"st(0)"`) silently protected
+/// nothing. The set is the union of what GCC 16.2 and Clang 23.1.5 take
+/// (measured, x86-64 and i686, every ISA enabled): a name either of them
+/// accepts may stand in a program that compiles today.
+///
+/// * `cc`, `memory`, `redzone` (GCC), and the status registers each of them
+///   knows by name: `flags`, `fpsr`, `fpcr`, `dirflag`, and GCC's `argp` and
+///   `frame`;
+/// * a hard register number (GCC; any number of up to three digits here);
+/// * one `%` or `#` in front of any of them (GCC strips one before it
+///   looks the name up, the special names included: `"%cc"`);
+/// * the legacy general registers in every width (`rax eax ax al ah`,
+///   `rsi esi si sil`), `r8`-`r31` plain and with Clang's `d`, `w`, `b`;
+/// * `st` and `st(1)`-`st(7)`; `mm0`-`mm7`; `xmm`, `ymm`, `zmm` 0-31;
+///   `k0`-`k7`; `tmm0`-`tmm7`; and Clang's `cr`, `dr`, `bnd` registers.
+///
+/// Whether the register exists for the function's target (`"xmm17"` without
+/// AVX-512, `"r8"` in 32-bit code) is not asked: GCC's answer depends on the
+/// function's own target attribute, and a name it refuses there Clang
+/// accepts.
+pub fn x86_clobber_name_is_known(name: &str) -> bool {
+    fn numbered(name: &str, prefix: &str, count: u32) -> bool {
+        name.strip_prefix(prefix).is_some_and(|digits| {
+            !digits.is_empty()
+                && digits.len() <= 2
+                && !(digits.len() == 2 && digits.starts_with('0'))
+                && digits.bytes().all(|b| b.is_ascii_digit())
+                && digits.parse::<u32>().is_ok_and(|n| n < count)
+        })
+    }
+    let name = name.strip_prefix(['%', '#']).unwrap_or(name);
+    if matches!(
+        name,
+        "cc" | "memory" | "redzone" | "flags" | "fpsr" | "fpcr" | "dirflag" | "argp" | "frame"
+    ) {
+        return true;
+    }
+    if !name.is_empty() && name.len() <= 3 && name.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    const LEGACY: &[&str] = &[
+        "rax", "eax", "ax", "al", "ah", "rbx", "ebx", "bx", "bl", "bh", "rcx", "ecx", "cx", "cl",
+        "ch", "rdx", "edx", "dx", "dl", "dh", "rsi", "esi", "si", "sil", "rdi", "edi", "di", "dil",
+        "rbp", "ebp", "bp", "bpl", "rsp", "esp", "sp", "spl", "st",
+    ];
+    if LEGACY.contains(&name) {
+        return true;
+    }
+    if let Some(rest) = name.strip_prefix('r') {
+        let digits = rest.trim_end_matches(['d', 'w', 'b']);
+        if rest.len() - digits.len() <= 1
+            && !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && !digits.starts_with('0')
+            && digits.parse::<u32>().is_ok_and(|n| (8..32).contains(&n))
+        {
+            return true;
+        }
+    }
+    if let Some(index) = name
+        .strip_prefix("st(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return matches!(index, "1" | "2" | "3" | "4" | "5" | "6" | "7");
+    }
+    numbered(name, "xmm", 32)
+        || numbered(name, "ymm", 32)
+        || numbered(name, "zmm", 32)
+        || numbered(name, "tmm", 8)
+        || numbered(name, "mm", 8)
+        || numbered(name, "k", 8)
+        || numbered(name, "cr", 16)
+        || numbered(name, "dr", 16)
+        || numbered(name, "bnd", 4)
+}
+
+/// The clobbers of an x86 statement that name nothing, each with GCC's
+/// message. Other targets have their own register files and are not judged.
+pub fn validate_clobbers(clobbers: &[String], target: AsmTarget) -> Vec<Diagnostic> {
+    if target != AsmTarget::X86 {
+        return Vec::new();
+    }
+    clobbers
+        .iter()
+        .filter(|name| !x86_clobber_name_is_known(name))
+        .map(|name| Diagnostic::error(format!("unknown register name '{name}' in 'asm'"), None))
+        .collect()
+}
+
 /// Validate an `asm` statement: `outputs` first, then `inputs`, exactly the
 /// order GCC numbers the operands in.
 pub fn validate(
@@ -992,6 +1085,63 @@ mod tests {
         p.iter().map(|d| d.message.as_str()).collect()
     }
 
+    /// Measured: GCC 16.2 and Clang 23.1.5, x86-64 and i686, every ISA on.
+    /// What either takes is known; what both refuse is not.
+    #[test]
+    fn clobber_names_are_the_union_of_gcc_and_clang() {
+        const BOTH: &[&str] = &[
+            "rax", "eax", "ax", "al", "ah", "rbx", "ebx", "bx", "bl", "bh", "rcx", "ecx", "cx",
+            "cl", "ch", "rdx", "edx", "dx", "dl", "dh", "rsi", "esi", "si", "rdi", "edi", "di",
+            "rbp", "ebp", "bp", "rsp", "esp", "sp", "r8", "r12", "r15", "r16", "r31", "st",
+            "st(7)", "xmm0", "xmm15", "xmm16", "xmm31", "ymm3", "ymm31", "zmm3", "zmm31", "mm0",
+            "mm7", "k0", "k7", "flags", "fpsr", "cc", "memory", "argp", "frame", "0", "1", "16",
+            "%rax", "#rax", "%st", "%xmm3", "%mm0", "%r8", "%k1", "%flags", "%fpsr", "%0",
+        ];
+        const GCC_ONLY: &[&str] = &[
+            "sil", "dil", "bpl", "spl", "st(1)", "redzone", "%cc", "%memory", "%redzone", "%st(1)",
+        ];
+        const CLANG_ONLY: &[&str] = &[
+            "r8d", "r8w", "r8b", "r12d", "r12w", "r12b", "r15d", "r15w", "r15b", "r16d", "tmm0",
+            "tmm7", "fpcr", "dirflag", "cr0", "dr0", "bnd0", "%r8d", "%dirflag", "76", "100",
+        ];
+        const NEITHER: &[&str] = &[
+            "r8l", "r12l", "r15l", "r32", "st(0)", "st(8)", "xmm32", "mm8", "k8", "eflags",
+            "rflags", "fpsw", "mxcsr", "rip", "eip", "ip", "cs", "ds", "es", "fs", "gs", "ss",
+            "RBX", "EBX", "Rax", "ST", "foo", "", "%%rax", "%%", "% rax", "{rax}", "ax ", " ax",
+            "st( 1)", "xmm", "r", "e",
+        ];
+        // Shapes none of the measured names has.
+        const MALFORMED: &[&str] = &[
+            "r08", "r8dd", "r8dw", "r7", "r7d", "xmm01", "xmm-1", "st()", "st(1", "k", "tmm8",
+            "bnd4", "%", "#", "1234",
+        ];
+        for known in BOTH.iter().chain(GCC_ONLY).chain(CLANG_ONLY) {
+            assert!(x86_clobber_name_is_known(known), "{known:?}");
+        }
+        for unknown in NEITHER.iter().chain(MALFORMED) {
+            assert!(!x86_clobber_name_is_known(unknown), "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_clobbers_are_refused_in_gccs_words_on_x86_only() {
+        let clobbers: Vec<String> = ["rax", "r14l", "cc", "EBX"].map(String::from).to_vec();
+        let problems = validate_clobbers(&clobbers, AsmTarget::X86);
+        assert_eq!(
+            messages(&problems),
+            [
+                "unknown register name 'r14l' in 'asm'",
+                "unknown register name 'EBX' in 'asm'"
+            ]
+        );
+        assert!(problems.iter().all(|p| p.is_error && p.operand.is_none()));
+        // `x29`, `a0`: other register files are not this function's to judge.
+        for target in [AsmTarget::Aarch64, AsmTarget::Other] {
+            let clobbers: Vec<String> = ["x29", "a0", "nonsense"].map(String::from).to_vec();
+            assert!(validate_clobbers(&clobbers, target).is_empty());
+        }
+    }
+
     #[test]
     fn equal_modifier_on_input_is_an_error() {
         let p = validate(
@@ -1029,7 +1179,7 @@ mod tests {
         // Every one of these is the `_ => {}` fallback in the x86 classifier.
         // `C` is NOT in the list: a `C`-prefixed pair is a class (measured --
         // gcc 16.2 accepts `"Ci"(7)`), so the letter alone is not evidence.
-        for letter in ["z", "j", "k", "h", "w", "P", "T", "W"] {
+        for letter in ["z", "j", "h", "w", "P", "T", "W"] {
             let p = validate(
                 "",
                 &[op("=r", Constness::Unknown)],
@@ -1038,6 +1188,24 @@ mod tests {
                 AsmTarget::X86,
             );
             assert_eq!(messages(&p), ["impossible constraint in 'asm'"], "{letter}");
+        }
+    }
+
+    /// `k` is the mask registers. It was in the list above until the
+    /// lowering learned to load one (`ir::lowering::x86_asm_registers`),
+    /// which is also where an operand of a type no mask register holds is
+    /// refused: the type is not known here.
+    #[test]
+    fn a_mask_register_is_a_class() {
+        for constraint in ["k", "Yk", "ki"] {
+            let inputs = [op(constraint, Constness::Unknown)];
+            let p = validate("", &[], &inputs, 0, AsmTarget::X86);
+            assert!(p.is_empty(), "{constraint}: {:?}", messages(&p));
+        }
+        for constraint in ["=k", "+k", "=&Yk"] {
+            let outputs = [op(constraint, Constness::Unknown)];
+            let p = validate("", &outputs, &[], 0, AsmTarget::X86);
+            assert!(p.is_empty(), "{constraint}: {:?}", messages(&p));
         }
     }
 

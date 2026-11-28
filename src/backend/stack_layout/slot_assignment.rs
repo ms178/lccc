@@ -444,6 +444,11 @@ pub(super) fn classify_instructions(
                 if func.ssp.stack_guard_alloca.is_some() {
                     continue;
                 }
+                // An object the back end keeps in a register has no memory
+                // and gets no slot.
+                if state.register_homed_allocas.contains(&dest.0) {
+                    continue;
+                }
                 if *semantic_volatile {
                     state.volatile_alloca_values.insert(dest.0);
                 }
@@ -719,6 +724,11 @@ fn classify_ssp_allocas(
                     continue;
                 };
                 if func.ssp.stack_guard_alloca == Some(*dest) {
+                    continue;
+                }
+                // See the same test in `classify_instructions`: no slot for
+                // an object in a register, with or without a canary.
+                if state.register_homed_allocas.contains(&dest.0) {
                     continue;
                 }
                 let is_buffer = !param_set.contains(&dest.0)

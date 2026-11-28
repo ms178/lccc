@@ -25,6 +25,8 @@ pub mod stack_protector; // -fstack-protector* IR instrumentation & -mstack-prot
 pub(crate) mod state; // CodegenState, StackSlot, SlotAddr
 pub(crate) mod traits; // ArchCodegen trait with default implementations
 pub(crate) mod x86_common; // Shared x86/i686 register names, condition codes, asm template parsing
+pub(crate) mod x86_late_text; // -mharden-sls=, -mcld, notrack jump tables: rules on the finished x86 text
+pub(crate) mod x86_zmm_homes; // 512-bit vector objects that live in zmm16..zmm31 instead of a stack slot
 pub mod zero_call_used_regs; // -fzero-call-used-regs=* post-peephole return-site zeroing
 
 // Register allocation and liveness analysis
@@ -79,6 +81,26 @@ pub(crate) struct McountInstrumentation {
     /// `-mnop-mcount`: emit a 5-byte NOP instead of a call. The location is
     /// still recorded in `__mcount_loc` when `record` is also set.
     pub nop: bool,
+    /// `-mfentry-name=NAME`: the function called in place of `__fentry__`.
+    /// Measured on GCC 16.2: `call NAME`, and only where `-mfentry` is in
+    /// force (`-pg -mno-fentry -mfentry-name=foo` still calls `mcount`).
+    pub fentry_name: Option<&'static str>,
+    /// `-mfentry-section=NAME`: the section of the `-mrecord-mcount`
+    /// records in place of `__mcount_loc`. Without `-mrecord-mcount` there
+    /// are no records and the name is not used (GCC 16.2, measured).
+    pub record_section: Option<&'static str>,
+}
+
+impl McountInstrumentation {
+    /// The function a `-mfentry` site calls.
+    pub(crate) fn fentry_symbol(&self) -> &'static str {
+        self.fentry_name.unwrap_or("__fentry__")
+    }
+
+    /// The section the call sites are recorded in.
+    pub(crate) fn record_section_name(&self) -> &'static str {
+        self.record_section.unwrap_or("__mcount_loc")
+    }
 }
 
 /// Invocation-local observations: later shipped IPA retries replace earlier
@@ -100,6 +122,14 @@ pub(crate) struct DebugHomeReport {
 
 pub(crate) type DebugHomes = std::sync::Arc<std::sync::Mutex<DebugHomeReport>>;
 
+/// What code generation has to refuse: errors only it can see, with the
+/// place GCC reports them at. The driver prints them and fails the
+/// compilation. An ordered set, because the x86-64 pipeline generates a
+/// function more than once (interprocedural register allocation retries)
+/// and every round finds the same error.
+pub(crate) type CodegenErrors =
+    std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<(u32, u32, u32, String)>>>;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DebugHome {
     pub base_register: u8,
@@ -110,6 +140,8 @@ pub(crate) struct DebugHome {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CodegenOptions {
     pub(crate) frame_report: Option<FrameReport>,
+    /// Where code generation reports what it refuses (`CodegenErrors`).
+    pub(crate) codegen_errors: Option<CodegenErrors>,
     pub(crate) debug_homes: Option<DebugHomes>,
     /// Invocation-owned RA/codegen policy, parsed once by the driver before
     /// any per-function backend work starts.
@@ -166,6 +198,12 @@ pub(crate) struct CodegenOptions {
     /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
     /// Required for Intel CET/IBT (Indirect Branch Tracking).
     pub(crate) cf_protection_branch: bool,
+    /// `-mharden-sls=`: an `int3` behind returns and indirect jumps
+    /// (`x86_late_text`).
+    pub(crate) harden_sls: x86_late_text::HardenSls,
+    /// `-mcld`: `cld` in front of every string instruction the compiler
+    /// writes (`x86_late_text`).
+    pub(crate) cld: bool,
     /// `-fstack-clash-protection`: probe every 4096-byte page of static and
     /// dynamic stack allocations so a frame cannot jump across a guard page.
     pub(crate) stack_clash_protection: bool,
@@ -567,6 +605,15 @@ fn x86_optimize(extra_args: &[String]) -> x86::assembler::Optimize {
 /// as costs no time, or -- optimizing for size -- as far as saves a byte.
 /// Not at all under `LCCC_NO_PEEPHOLE`, which is there to see the text as
 /// the code generator wrote it.
+/// The options that are rules about the finished x86 text.
+fn late_text_rules(opts: &CodegenOptions) -> x86_late_text::LateText {
+    x86_late_text::LateText {
+        sls: opts.harden_sls,
+        cld: opts.cld,
+        notrack_tables: opts.cf_protection_branch,
+    }
+}
+
 fn generated_optimize(opts: &CodegenOptions) -> x86::assembler::Optimize {
     use x86::assembler::Optimize;
     if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
@@ -872,6 +919,7 @@ impl Target {
                             cfi_synth::CfiArch::X86_64,
                         );
                         let asm = insert_fn_entry_locs(asm, &cg.state.fn_entry_locs);
+                        let asm = x86_late_text::apply(asm, late_text_rules(opts));
                         break x86::assembler::generated::rewrite(asm, generated_optimize(opts));
                     }
                     if opts.ra_config.debug_ra {
@@ -926,6 +974,7 @@ impl Target {
                     cfi_synth::CfiArch::I386,
                 );
                 let optimized = insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs);
+                let optimized = x86_late_text::apply(optimized, late_text_rules(opts));
                 if opts.code16gcc {
                     // 16-bit code, in which every size prefix is the other
                     // way round: as the code generator wrote it.

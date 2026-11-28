@@ -155,6 +155,14 @@ pub enum TokenKind {
     /// #pragma GCC visibility pop
     PragmaVisibilityPop,
 
+    /// `#pragma GCC target(...)`, emitted by the preprocessor as this token
+    /// and one string literal holding the pragma's strings, comma-joined.
+    PragmaOptionsTarget,
+    /// `#pragma GCC push_options`, `pop_options` and `reset_options`.
+    PragmaOptionsPush,
+    PragmaOptionsPop,
+    PragmaOptionsReset,
+
     // Punctuation
     LParen,    // (
     RParen,    // )
@@ -353,6 +361,10 @@ impl std::fmt::Display for TokenKind {
             TokenKind::PragmaVisibilityPush(_) | TokenKind::PragmaVisibilityPop => {
                 write!(f, "'#pragma GCC visibility'")
             }
+            TokenKind::PragmaOptionsTarget => write!(f, "'#pragma GCC target'"),
+            TokenKind::PragmaOptionsPush => write!(f, "'#pragma GCC push_options'"),
+            TokenKind::PragmaOptionsPop => write!(f, "'#pragma GCC pop_options'"),
+            TokenKind::PragmaOptionsReset => write!(f, "'#pragma GCC reset_options'"),
 
             // Punctuation - shown as quoted symbols
             TokenKind::LParen => write!(f, "'('"),

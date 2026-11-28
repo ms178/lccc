@@ -398,6 +398,32 @@ pub trait InlineAsmEmitter {
     /// Reset scratch register allocation state (called at start of each inline asm).
     fn reset_scratch_state(&mut self);
 
+    /// Called once for a statement, before any of it is classified or
+    /// staged. Returns the instruction that puts right what the statement
+    /// leaves wrong for the code after it, or `None` (the default) when it
+    /// leaves nothing.
+    ///
+    /// A backend may keep a value of its own in a register for the whole
+    /// function: i686 keeps the GOT pointer in `%ebx` under `-fPIC`. A
+    /// statement that names that register (`"b"`, a `cpuid`'s `"=b"`, a
+    /// clobber) overwrites it, and GCC's answer -- the pointer is a pseudo
+    /// register that simply lives elsewhere meanwhile -- is not available
+    /// to a backend that fixed its home. The instruction returned here is
+    /// emitted behind the output stores, on the path that falls out of the
+    /// statement and on every `asm goto` edge.
+    ///
+    /// It is asked this early because whether the edges of an `asm goto`
+    /// need blocks of their own depends on the answer; so the answer is a
+    /// function of the constraints and the clobbers alone.
+    fn begin_inline_asm(
+        &mut self,
+        _outputs: &[(String, Value, Option<String>)],
+        _inputs: &[(String, Operand, Option<String>)],
+        _clobbers: &[String],
+    ) -> Option<String> {
+        None
+    }
+
     /// Check whether a constant value fits the immediate constraint range for a given
     /// constraint string. Backends can override this to provide architecture-specific
     /// immediate ranges. The default implementation uses x86 semantics.
@@ -568,7 +594,8 @@ pub fn constraint_needs_address(constraint: &str, is_riscv: bool, is_arm: bool) 
 #[inline]
 pub fn normalize_inline_asm_reg_name(name: &str) -> &str {
     let trimmed = name.trim();
-    let no_percent = trimmed.trim_start_matches('%');
+    // `#` is GCC's other register prefix (`"#rax"` in a clobber list).
+    let no_percent = trimmed.trim_start_matches(['%', '#']);
     if let Some(inner) = no_percent
         .strip_prefix("~{")
         .and_then(|s| s.strip_suffix('}'))
@@ -877,9 +904,12 @@ pub fn emit_inline_asm_common_impl(
                 .asm_cc_branch_output_ptrs
                 .contains(&ptr.0)
     });
+    // The same holds for what the backend repairs behind the statement: a
+    // branch out of the template would leave without it.
+    let exit_repair = emitter.begin_inline_asm(outputs, inputs, clobbers);
     let mut emitted_goto_labels = goto_labels.to_vec();
     let mut asm_goto_trampolines = Vec::new();
-    if has_materialized_outputs && !goto_labels.is_empty() {
+    if (has_materialized_outputs || exit_repair.is_some()) && !goto_labels.is_empty() {
         emitted_goto_labels.clear();
         for (name, target) in goto_labels {
             let label = emitter.asm_state().fresh_synthetic_block_id();
@@ -1070,6 +1100,9 @@ pub fn emit_inline_asm_common_impl(
             emitter.store_output_from_reg(&operands[i], ptr, constraint, &all_output_regs);
         }
     }
+    if let Some(repair) = &exit_repair {
+        emitter.asm_state().emit_fmt(format_args!("    {repair}"));
+    }
     if !asm_goto_trampolines.is_empty() {
         let trampoline_outputs: Vec<_> = outputs
             .iter()
@@ -1083,6 +1116,7 @@ pub fn emit_inline_asm_common_impl(
                 label,
                 target,
                 outputs: trampoline_outputs.clone(),
+                exit_repair: exit_repair.clone(),
             }
         }));
     }
@@ -1932,7 +1966,7 @@ pub fn substitute_goto_labels(
 /// any of these forms, but the scratch register allocator uses 64-bit names.
 /// Returns `Some(canonical)` if the name is a recognized x86 register,
 /// `None` otherwise (non-x86 clobbers, "cc", "memory", etc.).
-fn x86_normalize_reg_to_64bit(name: &str) -> Option<Cow<'static, str>> {
+pub(crate) fn x86_normalize_reg_to_64bit(name: &str) -> Option<Cow<'static, str>> {
     // Map of all sub-register names to their 64-bit parent.
     // Legacy 8-bit: al/ah/bl/bh/cl/ch/dl/dh
     // Legacy 8-bit (REX): sil/dil/spl/bpl
@@ -1975,6 +2009,66 @@ fn x86_normalize_reg_to_64bit(name: &str) -> Option<Cow<'static, str>> {
                 None
             }
         }
+    }
+}
+
+/// The IA-32 general register a name designates, by its 32-bit name: `bl`,
+/// `bh`, `bx`, `ebx` and `rbx` are all `ebx`. `None` for anything else,
+/// including the registers IA-32 does not have.
+///
+/// GCC takes every one of these spellings in a clobber list, in 32-bit code
+/// too (`"rbx"` included: measured, GCC 16.2 `-m32`), and a backend that
+/// knows only some of them keeps a live value in a register the statement
+/// said it destroys. One table, so that the register allocator's exclusion,
+/// the prologue's save list and the scratch pool cannot disagree.
+pub(crate) fn x86_gpr32_of_name(name: &str) -> Option<&'static str> {
+    let canonical = x86_normalize_reg_to_64bit(normalize_inline_asm_reg_name(name))?;
+    match canonical.as_ref() {
+        "rax" => Some("eax"),
+        "rbx" => Some("ebx"),
+        "rcx" => Some("ecx"),
+        "rdx" => Some("edx"),
+        "rsi" => Some("esi"),
+        "rdi" => Some("edi"),
+        "rbp" => Some("ebp"),
+        "rsp" => Some("esp"),
+        _ => None,
+    }
+}
+
+/// Does the statement write the x86 frame pointer register: a clobber of it
+/// in any spelling (`"rbp"`, `"ebp"`, `"bp"`, `"bpl"`), or an operand that a
+/// register variable puts there (`{rbp}`)?
+///
+/// Such a function cannot address its frame through that register, and GCC
+/// says so where it has to keep one ("bp cannot be used in 'asm' here").
+pub(crate) fn x86_asm_takes_frame_pointer(
+    outputs: &[(String, Value, Option<String>)],
+    inputs: &[(String, Operand, Option<String>)],
+    clobbers: &[String],
+) -> bool {
+    let is_bp = |name: &str| x86_gpr32_of_name(name) == Some("ebp");
+    clobbers.iter().any(|clobber| is_bp(clobber))
+        || outputs
+            .iter()
+            .map(|(constraint, ..)| constraint)
+            .chain(inputs.iter().map(|(constraint, ..)| constraint))
+            .any(|constraint| {
+                let c = constraint.trim_start_matches(['=', '+', '&', '%']);
+                c.starts_with('{') && c.ends_with('}') && is_bp(c)
+            })
+}
+
+/// Split an operand's symbol (`sym`, `sym+8`, `sym-8`) into the symbol and
+/// its signed addend (`""`, `"+8"`, `"-8"`).
+pub(crate) fn split_symbol_addend(symbol: &str) -> (&str, &str) {
+    match symbol
+        .char_indices()
+        .skip(1)
+        .find(|&(_, ch)| ch == '+' || ch == '-')
+    {
+        Some((at, _)) => symbol.split_at(at),
+        None => (symbol, ""),
     }
 }
 
@@ -2148,6 +2242,7 @@ mod tests {
         assert_eq!(normalize_inline_asm_reg_name("%rcx"), "rcx");
         assert_eq!(normalize_inline_asm_reg_name("~{rcx}"), "rcx");
         assert_eq!(normalize_inline_asm_reg_name(" {r12} "), "r12");
+        assert_eq!(normalize_inline_asm_reg_name("#rax"), "rax");
     }
 
     #[test]
@@ -2270,6 +2365,103 @@ mod tests {
         assert_eq!(dest.imm_value, Some(7));
         assert_eq!(dest.imm_symbol.as_deref(), Some("sym"));
         assert_eq!(dest.seg_prefix, "%gs:");
+    }
+}
+
+#[cfg(test)]
+mod register_name_tests {
+    use super::*;
+
+    /// GCC 16.2 takes each of these in a clobber list, in 32-bit code too
+    /// (measured: `-m32` accepts `"rbx"` and `"sil"`), with or without `%`.
+    #[test]
+    fn every_spelling_of_a_general_register_is_that_register() {
+        for (register, spellings) in [
+            ("eax", &["al", "ah", "ax", "eax", "rax"][..]),
+            ("ebx", &["bl", "bh", "bx", "ebx", "rbx"]),
+            ("ecx", &["cl", "ch", "cx", "ecx", "rcx"]),
+            ("edx", &["dl", "dh", "dx", "edx", "rdx"]),
+            ("esi", &["sil", "si", "esi", "rsi"]),
+            ("edi", &["dil", "di", "edi", "rdi"]),
+            ("ebp", &["bpl", "bp", "ebp", "rbp"]),
+            ("esp", &["spl", "sp", "esp", "rsp"]),
+        ] {
+            for spelling in spellings {
+                for written in [
+                    spelling.to_string(),
+                    format!("%{spelling}"),
+                    format!("{{{spelling}}}"),
+                    format!(" {spelling} "),
+                ] {
+                    assert_eq!(x86_gpr32_of_name(&written), Some(register), "{written:?}");
+                }
+            }
+        }
+    }
+
+    /// What IA-32 does not have, what is no general register, and what is a
+    /// constraint letter and no name. Names are case sensitive, as in GCC
+    /// ("unknown register name 'EBX' in 'asm'").
+    #[test]
+    fn other_names_are_no_ia32_general_register() {
+        for name in [
+            "r8", "r12d", "r15b", "xmm0", "st", "st(1)", "mm2", "k1", "cc", "memory", "flags",
+            "EBX", "Ebx", "b", "S", "D", "a", "", "%", "{}", "ebxx", "eb",
+        ] {
+            assert_eq!(x86_gpr32_of_name(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_symbol_splits_at_its_addend() {
+        for (symbol, name, addend) in [
+            ("counter", "counter", ""),
+            ("counter+8", "counter", "+8"),
+            ("counter-12", "counter", "-12"),
+            ("_x.1+4", "_x.1", "+4"),
+            ("a+0", "a", "+0"),
+            ("", "", ""),
+            // The first character is the name's, whatever it is.
+            ("-x", "-x", ""),
+        ] {
+            assert_eq!(split_symbol_addend(symbol), (name, addend), "{symbol:?}");
+        }
+    }
+
+    #[test]
+    fn a_statement_takes_the_frame_pointer_by_clobber_or_register_variable() {
+        fn takes(outputs: &[&str], inputs: &[&str], clobbers: &[&str]) -> bool {
+            let outputs: Vec<_> = outputs
+                .iter()
+                .map(|c| (c.to_string(), Value(0), None))
+                .collect();
+            let inputs: Vec<_> = inputs
+                .iter()
+                .map(|c| {
+                    (
+                        c.to_string(),
+                        Operand::Const(crate::ir::reexports::IrConst::I64(0)),
+                        None,
+                    )
+                })
+                .collect();
+            let clobbers: Vec<String> = clobbers.iter().map(|c| c.to_string()).collect();
+            x86_asm_takes_frame_pointer(&outputs, &inputs, &clobbers)
+        }
+        for clobber in ["rbp", "ebp", "bp", "bpl", "%rbp", "%ebp"] {
+            assert!(takes(&[], &[], &[clobber]), "{clobber}");
+        }
+        assert!(takes(&["={rbp}"], &[], &[]));
+        assert!(takes(&[], &["{ebp}"], &[]));
+        assert!(takes(&["+{bp}"], &["r"], &["cc"]));
+        // Letters are classes, not names: `b` is %ebx and `p` an address.
+        assert!(!takes(&["=bp"], &["bp"], &[]));
+        assert!(!takes(
+            &["=r"],
+            &["b", "m"],
+            &["rbx", "cc", "memory", "rsp"]
+        ));
+        assert!(!takes(&[], &[], &[]));
     }
 }
 

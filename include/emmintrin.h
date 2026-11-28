@@ -416,15 +416,9 @@ _mm_cmplt_epi8(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_cmplt_epi32(__m128i __a, __m128i __b)
 {
-    /* Returns 0xFFFFFFFF for lanes where a < b (signed), 0 otherwise.
-     * Equivalent to _mm_cmpgt_epi32(b, a). */
-    int *__pa = (int *)&__a;
-    int *__pb = (int *)&__b;
-    __m128i __r;
-    int *__pr = (int *)&__r;
-    for (int __i = 0; __i < 4; __i++)
-        __pr[__i] = __pa[__i] < __pb[__i] ? -1 : 0;
-    return __r;
+    /* Returns 0xFFFFFFFF for lanes where a < b (signed), 0 otherwise:
+     * PCMPGTD with the operands exchanged, as the 8- and 16-bit forms. */
+    return ((__m128i)(__builtin_ia32_pcmpgtd128(__b, __a)));
 }
 
 /* _mm_mul_su32: PMULUDQ on the 64-bit MMX register (GCC 16.2 places it

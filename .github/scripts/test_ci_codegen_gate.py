@@ -148,6 +148,30 @@ class InstructionCountTests(unittest.TestCase):
         )
         self.assertEqual(gate.function_body_metrics(asm)["insns"], 1)
 
+    def test_a_function_is_counted_across_a_data_island(self):
+        # A switch's table is emitted where it is used: the function leaves
+        # the text section and comes back.  The count used to stop at the
+        # table, so it read 2 here, and 4 once the layout moved `.L1` in
+        # front of it.
+        head = "\tcmpl $3, %edi\n\tjmp *.Ljt(,%rdi,8)\n"
+        island = '.section .rodata\n.Ljt:\n\t.quad .L1\n.section .text,"ax",@progbits\n'
+        tail = ".L1:\n\tmovl $1, %eax\n\tret\n"
+        whole = ".type f, @function\nf:\n" + head + island + tail + ".size f, .-f\n"
+        moved = ".type f, @function\nf:\n" + tail + head + island + ".size f, .-f\n"
+        self.assertEqual(gate.function_body_metrics(whole)["insns"], 4)
+        self.assertEqual(gate.function_body_metrics(moved)["insns"], 4)
+        # The island's own lines are no instructions, whatever they look like.
+        data = '.section .rodata\n\tmovl $7, %eax\n.text\n'
+        with_data = ".type f, @function\nf:\n" + head + data + tail + ".size f, .-f\n"
+        self.assertEqual(gate.function_body_metrics(with_data)["insns"], 4)
+        # A cold part of the function is code; what follows `.size` is not
+        # the function's, and the next function starts in code again.
+        cold = '.section .text.unlikely,"ax",@progbits\n\tcall abort\n'
+        after = '.section .rodata\n.LC0:\n\t.string "x"\n\tret\n'
+        nxt = ".type g, @function\ng:\n\tret\n.size g, .-g\n"
+        split = ".type f, @function\nf:\n" + head + cold + ".size f, .-f\n" + after + nxt
+        self.assertEqual(gate.function_body_metrics(split)["insns"], 4)
+
     def test_column_zero_vector_and_push_metrics(self):
         asm = func_asm(
             "pushq %rbx\n"

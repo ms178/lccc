@@ -9,8 +9,10 @@
 
 use super::aggregate_abi::AggregateReturn;
 use super::lower::Lowerer;
+use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType, IrType, target_int_ir_type};
-use crate::frontend::parser::ast::Expr;
+use crate::frontend::parser::ast::{Expr, ParamDecl};
+use crate::frontend::sema::builtins;
 use crate::ir::reexports::{CallInfo, Instruction, IrBinOp, IrConst, Operand, Terminator, Value};
 
 impl Lowerer {
@@ -168,15 +170,8 @@ impl Lowerer {
         // But dereferencing a pointer-to-function-pointer is a real load:
         // (*fpp)() where fpp is int (**)(int,int) must load the function pointer.
         // Only strip a Deref if the inner expression is itself a function pointer
-        // or function designator (checked via is_function_pointer_deref).
-        let mut stripped_func = func;
-        while let Expr::Deref(inner, _) = stripped_func {
-            if self.is_function_pointer_deref(inner) {
-                stripped_func = inner;
-            } else {
-                break;
-            }
-        }
+        // or function designator (`strip_designator_derefs`).
+        let mut stripped_func = self.strip_designator_derefs(func);
 
         // Strip AddressOf wrapping a function name: (&func)(args) => func(args).
         // In C, taking the address of a function and calling through it is equivalent
@@ -217,6 +212,90 @@ impl Lowerer {
         if let Some(folded) = self.try_fold_builtin_or_attr_call(stripped_func, args) {
             return folded;
         }
+        self.lower_call_of(effective_func, args)
+    }
+
+    /// A call of a library builtin (`__builtin_sqrt(n)`,
+    /// `__builtin___memcpy_chk(d, s, n, size)`): a call of the library
+    /// function `library_name` by GCC's prototype of the builtin, as if the
+    /// unit had declared
+    ///
+    /// ```c
+    /// double __builtin_sqrt(double) __asm__("sqrt");
+    /// ```
+    ///
+    /// The builtin carries that prototype whether or not a header declared
+    /// `sqrt`, and whatever a header declared it as. So the call is the
+    /// ordinary call of a declared function, under the builtin's own name:
+    /// every argument is converted as if by assignment to its parameter
+    /// (an `int` to `double`, a `double` length to `size_t`, a real value to
+    /// a complex one), the tail of a variadic builtin is promoted, a complex
+    /// or `_Float128` value travels by the target's convention, and a
+    /// `noreturn` builtin ends the path.
+    ///
+    /// The arm that used to emit these calls did its own conversions, from
+    /// two hand-written lists (the `size_t` parameters of some functions,
+    /// the result types of others) and only between integers. With
+    /// `<math.h>` and `<string.h>` included or not, measured against GCC
+    /// 16.2:
+    ///
+    ///   `__builtin_sqrt(n)`, `int n = 16`      NaN: the `int` went out in
+    ///                                          %edi and `sqrt` read %xmm0
+    ///   `__builtin_pow(2, 10)`                 1
+    ///   `__builtin_ldexp(3, 2.9)`              23.2: the exponent's bits
+    ///   `__builtin_memset(p, 'x', 3.9)`        nothing set, or a fault
+    ///   `__builtin_strchr(s, 98.9)`            not found
+    ///
+    /// A second list of conversions is a second chance to forget one.
+    pub(super) fn lower_library_builtin_call(
+        &mut self,
+        builtin: &str,
+        library_name: &'static str,
+        prototype: &builtins::LibcPrototype,
+        args: &[Expr],
+        span: Span,
+    ) -> Operand {
+        self.declare_library_builtin(builtin, library_name, prototype);
+        let callee = Expr::Identifier(builtin.to_string(), span);
+        self.lower_call_of(&callee, args)
+    }
+
+    /// Record the library builtin `builtin` once, as its declaration would
+    /// have: the signature of its prototype, the library function its call
+    /// is, and whether a call of it returns.
+    fn declare_library_builtin(
+        &mut self,
+        builtin: &str,
+        library_name: &'static str,
+        prototype: &builtins::LibcPrototype,
+    ) {
+        if self.library_builtins.contains_key(builtin) {
+            return;
+        }
+        self.library_builtins
+            .insert(builtin.to_string(), library_name);
+        let result = Self::ctype_to_type_spec(&prototype.result.ctype());
+        let params: Vec<ParamDecl> = prototype
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let va_list = self.types.typedefs.get("__builtin_va_list");
+                let ctype = parameter.parameter_ctype(va_list);
+                Self::unnamed_param_decl(Self::ctype_to_type_spec(&ctype))
+            })
+            .collect();
+        let sig = self.build_function_sig(builtin, &result, 0, &params, prototype.variadic, false);
+        self.func_meta.sigs.insert(builtin.to_string(), sig);
+        if prototype.noreturn {
+            self.noreturn_functions.insert(builtin.to_string());
+        }
+    }
+
+    /// The call of `stripped_func`, a callee that is not lowered as a
+    /// builtin: a declared or undeclared function, a function pointer, or a
+    /// library builtin under its own name (`lower_library_builtin_call`).
+    fn lower_call_of(&mut self, stripped_func: &Expr, args: &[Expr]) -> Operand {
+        let effective_func = stripped_func;
 
         // Clang's i686 integer ext-vectors use the GP return words stored in
         // the padded IR carrier; retain the CType to unpack those words after
@@ -1565,6 +1644,18 @@ impl Lowerer {
                         } else if !arg_ct.is_complex() {
                             val = self.real_to_complex(val, &arg_ct, &pctypes[i]);
                         }
+                        // The argument is the address of a complex object
+                        // now, whatever the expression was. Left as the
+                        // expression's type, the address of the converted
+                        // value was itself converted "to the parameter":
+                        // for `f(n)` with `double f(double _Complex)` and an
+                        // `int n`, sign-extended from its low 32 bits
+                        // (`cltq`), and the call read through what was left
+                        // of it. Every integer narrower than a pointer did
+                        // that (`char`, `_Bool`, `unsigned`; `long long`
+                        // too on i686): `cacos(2)` with `<complex.h>` was a
+                        // segmentation fault.
+                        arg_ty = IrType::Ptr;
                     } else if i < pctypes.len() && !pctypes[i].is_complex() {
                         let arg_ct = self.expr_ctype(a);
                         if arg_ct.is_complex() {
@@ -2157,6 +2248,9 @@ impl Lowerer {
                     let is_const = self.const_functions.contains(name.as_str());
                     let (call_ret_is_f128_sse, call_ret_is_vector128) =
                         Self::vector_return_flags(&ret_abi, sig);
+                    // Spelled `__builtin_<name>`: the library function by
+                    // definition, whatever the unit defines under that name.
+                    let assume_library = self.library_builtins.contains_key(name.as_str());
                     self.emit(Instruction::Call {
                         func: call_name,
                         info: CallInfo {
@@ -2178,7 +2272,7 @@ impl Lowerer {
                             is_pure,
                             is_const,
                             memory: Default::default(),
-                            assume_library: false,
+                            assume_library,
                             ret_eightbyte_classes: ret_abi.classes.clone(),
                             ret_is_f128_sse: call_ret_is_f128_sse,
                             ret_is_vector128: call_ret_is_vector128,
@@ -2334,9 +2428,16 @@ impl Lowerer {
     }
 
     /// Load a function pointer from a local or global variable.
+    ///
+    /// A volatile pointer is read as one: `int (*volatile f)(int)` and
+    /// `static void *(*const volatile wipe)(void *, int, size_t) = memset;`
+    /// are how a program asks for a call the compiler cannot see through,
+    /// and the read was an ordinary load that the initializer's store was
+    /// forwarded to: with `static int h(int a) { return a + 1; }`, `int
+    /// (*volatile f)(int) = h; return f(1);` was `movl $2, %eax`.
     fn load_func_ptr_variable(&mut self, name: &str) -> Value {
-        let base_addr = if let Some(info) = self.func_mut().locals.get(name).cloned() {
-            if let Some(ref global_name) = info.static_global_name {
+        let (base_addr, volatile) = if let Some(info) = self.func_mut().locals.get(name).cloned() {
+            let addr = if let Some(ref global_name) = info.static_global_name {
                 let addr = self.fresh_value();
                 self.emit(Instruction::GlobalAddr {
                     dest: addr,
@@ -2345,19 +2446,24 @@ impl Lowerer {
                 addr
             } else {
                 info.alloca
-            }
+            };
+            (addr, info.object_volatile)
         } else {
             // Global function pointer
+            let volatile = self
+                .globals
+                .get(name)
+                .is_some_and(|global| global.object_volatile);
             let addr = self.fresh_value();
             self.emit(Instruction::GlobalAddr {
                 dest: addr,
                 name: name.to_string(),
             });
-            addr
+            (addr, volatile)
         };
         let ptr_val = self.fresh_value();
         self.emit(Instruction::Load {
-            volatile: false,
+            volatile,
             dest: ptr_val,
             ptr: base_addr,
             ty: IrType::Ptr,

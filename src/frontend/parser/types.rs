@@ -250,12 +250,13 @@ impl Parser {
                 }
                 // _Atomic as type specifier: _Atomic(type-name)
                 // C11 §6.7.2.4: _Atomic(T) is a type specifier equivalent to T
-                // with atomic qualification. Since we don't track atomic-ness,
-                // we just parse and return the inner type.
+                // with atomic qualification. The specifier is the inner
+                // type; the qualification travels in the flag.
                 TokenKind::Atomic => {
                     self.advance();
-                    // Atomic-ness is not tracked in types; the flag records the
-                    // object qualifier (`DeclAttributes::object_atomic`).
+                    // `CType` has no atomic variant; the flag is the record
+                    // (`DeclAttributes::base_atomic` and `object_atomic`),
+                    // which sema writes into the qualifier bits of the type.
                     self.attrs.set_atomic(true);
                     // What is tracked is how the object is accessed, and an
                     // atomic object is accessed as a volatile one is: where
@@ -279,11 +280,36 @@ impl Parser {
                         let enclosing_address_space =
                             std::mem::take(&mut self.attrs.parsing_address_space);
                         let inner = self.parse_type_specifier();
+                        let inner_base_const = self.attrs.parsing_const();
                         self.attrs.set_const(saved_const);
                         if let Some(inner_type) = inner {
-                            let result = self.parse_abstract_declarator_suffix(inner_type);
+                            let (result, pointer_quals) =
+                                self.parse_abstract_declarator_suffix_quals(inner_type);
                             self.attrs.parsing_address_space = enclosing_address_space;
                             self.expect_closing(&TokenKind::RParen, open);
+                            // `_Atomic(T *)` is an atomic POINTER: the
+                            // qualifier belongs to the type the parentheses
+                            // name, where `_Atomic T *` qualifies `T`. A bare
+                            // `Pointer` specifier cannot say which was
+                            // written -- a member's `_Atomic char *p` is
+                            // folded into the same shape -- so the named type
+                            // is kept as the unit `typeof(T *)` is: whatever
+                            // qualifies the specifier then qualifies the
+                            // pointer, by the rule every `typeof` and
+                            // pointer typedef already follows. (`unqual`
+                            // drops nothing here: the type name of an atomic
+                            // specifier may not be qualified, C11 6.7.2.4p3.)
+                            if matches!(result, TypeSpecifier::Pointer(..)) {
+                                return Some(TypeSpecifier::TypeofType(
+                                    Box::new(result),
+                                    TypeofTypeQualifiers {
+                                        base_const: inner_base_const,
+                                        base_volatile: false,
+                                        pointer_quals,
+                                        unqual: true,
+                                    },
+                                ));
+                            }
                             return Some(result);
                         }
                         // Fallback: if we can't parse a type, emit error and skip
@@ -508,35 +534,7 @@ impl Parser {
                 {
                     if !any_base_specifier {
                         let name = name.clone();
-                        // A typedef carrying a named space qualifies its uses
-                        // as if `__seg_gs` were written there (C: the qualifier
-                        // of `typedef int __seg_gs T` is part of T). An explicit
-                        // keyword qualifier on the same declaration wins.
-                        if self.attrs.parsing_address_space == AddressSpace::Default {
-                            if let Some(&space) = self.typedef_object_spaces.get(&name) {
-                                self.attrs.parsing_address_space = space;
-                            }
-                        }
-                        // A typedef name is a synonym for its declarator text
-                        // (C 6.7.8), so its qualifiers apply to the use. The base
-                        // qualifier (`typedef volatile int *VPI`: the pointee) is
-                        // the specifier's; the object qualifier (`typedef int
-                        // *volatile VIP`) belongs to the declared object and is
-                        // applied by the declarator.
-                        self.attrs.set_typedef_use(true);
-                        if self.typedef_base_volatile.contains(&name) {
-                            self.attrs.set_volatile(true);
-                            self.attrs.volatile_from_stars = false;
-                        }
-                        // `atomic_int x;` is `_Atomic int x;`.
-                        if self.typedef_base_atomic.contains(&name) {
-                            self.attrs.set_atomic(true);
-                        }
-                        self.attrs.set_typedef_object_volatile(
-                            self.typedef_object_volatile.contains(&name),
-                        );
-                        self.attrs
-                            .set_typedef_object_atomic(self.typedef_object_atomic.contains(&name));
+                        self.apply_typedef_qualifiers(&name);
                         flags.typedef_name = Some(name);
                         self.advance();
                         any_base_specifier = true;
@@ -1370,6 +1368,48 @@ impl Parser {
         TypeSpecifier::Typeof(Box::new(expr), unqual)
     }
 
+    /// What the typedef `name` says of the object declared through it, taken
+    /// into the specifiers that name it: its named address space, its base
+    /// qualifiers and its object qualifiers.
+    fn apply_typedef_qualifiers(&mut self, name: &str) {
+        // A typedef carrying a named space qualifies its uses as if
+        // `__seg_gs` were written there (C: the qualifier of `typedef int
+        // __seg_gs T` is part of T). An explicit keyword qualifier on the
+        // same declaration wins.
+        if self.attrs.parsing_address_space == AddressSpace::Default {
+            if let Some(&space) = self.typedef_object_spaces.get(name) {
+                self.attrs.parsing_address_space = space;
+            }
+        }
+        // A typedef name is a synonym for its declarator text (C 6.7.8), so
+        // its qualifiers apply to the use. The base qualifier (`typedef
+        // volatile int *VPI`: the pointee) is the specifier's; the object
+        // qualifier (`typedef int *volatile VIP`) belongs to the declared
+        // object and is applied by the declarator.
+        self.attrs.set_typedef_use(true);
+        // A `volatile` written before the name qualifies the type the name
+        // stands for, whole (C11 6.7.3p9): with `typedef int (*fn_t)(int);`,
+        // `volatile fn_t f` is `int (*volatile f)(int)`, an object
+        // qualifier.  Read here, before the typedef's base brings the same
+        // flag for what is the pointee's (`VPI p` declares a plain pointer);
+        // one written behind the name is read where it is consumed
+        // (`consume_qualifier_after_base`, `consume_post_type_qualifiers`).
+        let written_volatile = self.attrs.parsing_volatile() && !self.attrs.volatile_from_stars;
+        if self.typedef_base_volatile.contains(name) {
+            self.attrs.set_volatile(true);
+            self.attrs.volatile_from_stars = false;
+        }
+        // `atomic_int x;` is `_Atomic int x;`.
+        if self.typedef_base_atomic.contains(name) {
+            self.attrs.set_atomic(true);
+        }
+        self.attrs.set_typedef_object_volatile(
+            written_volatile || self.typedef_object_volatile.contains(name),
+        );
+        self.attrs
+            .set_typedef_object_atomic(self.typedef_object_atomic.contains(name));
+    }
+
     /// Consume trailing qualifiers and _Complex that may follow a resolved base type.
     /// C allows "int static x;" and "double _Complex".
     /// A `const`, `constexpr`, `volatile` or `restrict` after a base type
@@ -1381,6 +1421,12 @@ impl Parser {
             TokenKind::Volatile => {
                 self.attrs.set_volatile(true);
                 self.attrs.volatile_from_stars = false;
+                // Behind a typedef name it qualifies the named type, as
+                // before it (`fn_t volatile f`; see the typedef name's arm
+                // of `parse_type_specifier`).
+                if self.attrs.parsing_typedef_use() {
+                    self.attrs.mark_typedef_object_volatile();
+                }
             }
             TokenKind::Restrict => self.attrs.set_restrict(true),
             TokenKind::Constexpr => {
@@ -1510,6 +1556,15 @@ impl Parser {
             // diagnostic is the TU verdict).  Merged with the body-end
             // condition: each unwinding level closes its body exactly as
             // the recursive formulation did (one expect_closing per level).
+            // A pragma between two members, or after the last, is performed
+            // where it stands. The record takes the `#pragma pack` in force
+            // at its closing brace (`record_finish`), for all its members,
+            // which is GCC's rule: `struct { char c;` / `#pragma pack(push,
+            // 1)` / `int i; };` is five bytes. Until here the member loop
+            // skipped the marker as an unknown token, so that record was
+            // eight bytes -- not GCC's layout -- and a `push` in a body was
+            // never seen by the `pop` after it.
+            self.take_pragma_markers();
             if self.nesting_budget_diagnosed
                 || matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof)
             {
@@ -2835,6 +2890,35 @@ mod atomic_provenance_tests {
     }
 
     #[test]
+    fn an_atomic_specifier_naming_a_pointer_is_kept_as_one_type() {
+        // `_Atomic(char *) p` is an atomic pointer; `_Atomic char *p` is a
+        // pointer to an atomic `char`. A member's declarator is folded into
+        // its specifier, so the two would be the same `Pointer(Char)` there:
+        // the specifier form is the unit `typeof_unqual(char *)` is.
+        let (_, decls) = parse(
+            "struct s { _Atomic(char *) unit; _Atomic char *pointee; _Atomic(int) scalar; }; \
+             _Atomic(char *) g_unit; _Atomic char *g_pointee;",
+        );
+        let TypeSpecifier::Struct(_, Some(fields), ..) = &decls[0].type_spec else {
+            panic!("expected a struct definition, got {:?}", decls[0].type_spec);
+        };
+        assert!(
+            matches!(&fields[0].type_spec, TypeSpecifier::TypeofType(inner, quals)
+                if matches!(**inner, TypeSpecifier::Pointer(..)) && quals.unqual),
+            "{:?}",
+            fields[0].type_spec
+        );
+        assert!(!matches!(
+            fields[1].type_spec,
+            TypeSpecifier::TypeofType(..)
+        ));
+        assert!(matches!(fields[2].type_spec, TypeSpecifier::Int));
+        assert!(fields.iter().all(|f| f.base_atomic));
+        assert!(matches!(decls[1].type_spec, TypeSpecifier::TypeofType(..)));
+        assert!(matches!(decls[2].type_spec, TypeSpecifier::Char));
+    }
+
+    #[test]
     fn a_stars_own_atomic_writes_no_volatile() {
         let (_, decls) = parse("int *_Atomic ap; int *volatile vp; int *_Atomic *pap;");
         let star = |name: &str, level: usize| {
@@ -2850,8 +2934,19 @@ mod atomic_provenance_tests {
         };
         // The pointer object is accessed as a volatile one ...
         assert_eq!(flags(&decls, "ap"), (false, false, true, true));
-        // ... and its star records no qualifier, where a written one does.
+        // ... and its star records no `volatile`, where a written one does:
+        // what it records is the `_Atomic` itself.
         assert_eq!(star("ap", 0) & CVR_VOLATILE, 0);
+        assert_eq!(
+            star("ap", 0) & crate::frontend::parser::ast::CVR_ATOMIC,
+            crate::frontend::parser::ast::CVR_ATOMIC
+        );
+        assert_eq!(star("vp", 0) & crate::frontend::parser::ast::CVR_ATOMIC, 0);
+        assert_eq!(
+            star("pap", 0) & crate::frontend::parser::ast::CVR_ATOMIC,
+            crate::frontend::parser::ast::CVR_ATOMIC
+        );
+        assert_eq!(star("pap", 1) & crate::frontend::parser::ast::CVR_ATOMIC, 0);
         assert_eq!(star("vp", 0) & CVR_VOLATILE, CVR_VOLATILE);
         assert_eq!(star("pap", 0) & CVR_VOLATILE, 0);
         assert_eq!(flags(&decls, "pap"), (false, false, false, false));

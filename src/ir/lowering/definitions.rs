@@ -314,6 +314,10 @@ pub(super) struct LValue {
     /// Reverse scalar_storage_order handling for a member lvalue: the value
     /// must be byte-fixed-up on every load/store (SsoMode::None otherwise).
     pub sso: SsoMode,
+    /// The object is `_Atomic`: a load, a store and an update of it are
+    /// atomic operations (see `atomic_access`). Set by `lower_lvalue` alone,
+    /// from sema's verdict on the expression.
+    pub atomic: bool,
 }
 
 impl LValue {
@@ -322,6 +326,7 @@ impl LValue {
             kind: LValueKind::Variable(v),
             volatile,
             sso: SsoMode::None,
+            atomic: false,
         }
     }
     pub(super) fn address(v: Value, seg: AddressSpace, volatile: bool) -> Self {
@@ -329,6 +334,7 @@ impl LValue {
             kind: LValueKind::Address(v, seg),
             volatile,
             sso: SsoMode::None,
+            atomic: false,
         }
     }
 }
@@ -678,6 +684,22 @@ impl LocalInfo {
             base_type_volatile: da.base_type_volatile,
             object_volatile: da.object_volatile,
             fptr_sig: None,
+        }
+    }
+}
+
+impl DeclAnalysis {
+    /// Whether the declared object is itself volatile: for a pointer the
+    /// qualifier of the pointer object (`T *volatile p`, `int (*volatile
+    /// f)(int)`, `volatile fn_t f`), which the pointee's qualifier in
+    /// `base_type_volatile` (`volatile T *p`) says nothing of; for anything
+    /// else `base_type_volatile`.  It decides the slot (a volatile object
+    /// is never promoted to a register) and the store its initializer is.
+    pub(super) fn object_is_volatile(&self) -> bool {
+        if self.is_pointer {
+            self.object_volatile
+        } else {
+            self.base_type_volatile
         }
     }
 }

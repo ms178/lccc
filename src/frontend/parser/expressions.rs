@@ -343,6 +343,10 @@ impl Parser {
                 // record.
                 TokenKind::Atomic if depth == 0 && before_first_star => {
                     volatile_before_star = true;
+                    // `_Atomic T` and `_Atomic(T)` alike: the base type is
+                    // atomic. (The specifier form's own parentheses are a
+                    // nested depth, so nothing inside them is read here.)
+                    q.base_cvr |= crate::frontend::parser::ast::CVR_ATOMIC;
                 }
                 TokenKind::Identifier(name)
                     if depth == 0
@@ -1403,13 +1407,21 @@ impl Parser {
             if matches!(self.peek(), TokenKind::RParen) {
                 break;
             }
-            let (type_spec, is_const) = if matches!(self.peek(), TokenKind::Default) {
+            let (type_spec, is_const, quals) = if matches!(self.peek(), TokenKind::Default) {
                 self.advance();
-                (None, false)
+                (None, false, CastQualifiers::default())
             } else {
-                match self.parse_generic_type_name() {
-                    Some((ts, is_const)) => (Some(ts), is_const),
-                    None => (None, false),
+                let start = self.pos;
+                match self.parse_generic_type_name_quals() {
+                    Some((ts, is_const, levels)) => {
+                        // The record a cast's type name gets: the base
+                        // type's qualifiers from the tokens, each star's
+                        // from the declarator (`parse_cast_expr_inner`).
+                        let mut quals = self.type_name_qualifiers_in_range(start, self.pos);
+                        quals.set_star_chain(&ts, &levels);
+                        (Some(ts), is_const, quals)
+                    }
+                    None => (None, false, CastQualifiers::default()),
                 }
             };
             self.expect_context(&TokenKind::Colon, "in '_Generic' association");
@@ -1418,6 +1430,7 @@ impl Parser {
                 type_spec,
                 expr,
                 is_const,
+                quals,
             });
             if !self.consume_if(&TokenKind::Comma) {
                 break;
@@ -1432,6 +1445,13 @@ impl Parser {
     /// pointer such as `const int *`), which `GenericAssociation::is_const`
     /// records because `CType` carries no qualifiers.
     fn parse_generic_type_name(&mut self) -> Option<(TypeSpecifier, bool)> {
+        self.parse_generic_type_name_quals()
+            .map(|(ts, base_const, _)| (ts, base_const))
+    }
+
+    /// [`Self::parse_generic_type_name`], also returning each pointer
+    /// level's own qualifiers (`parse_nested_type_name_with_quals`' record).
+    fn parse_generic_type_name_quals(&mut self) -> Option<(TypeSpecifier, bool, Vec<u8>)> {
         // Reset parsing_const so a `const` in this type name is detected.
         let saved_const = self.attrs.parsing_const();
         self.attrs.set_const(false);
@@ -1445,7 +1465,8 @@ impl Parser {
             // `const` seen before the pointer declarators qualifies the base
             // type: for `const int *`, the pointee.
             let base_const = self.attrs.parsing_const();
-            (self.parse_abstract_declarator_suffix(ts), base_const)
+            let (ts, levels) = self.parse_abstract_declarator_suffix_quals(ts);
+            (ts, base_const, levels)
         });
         self.attrs.parsing_address_space = enclosing_address_space;
         self.attrs.set_const(saved_const);

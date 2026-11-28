@@ -17,7 +17,7 @@ static int eq128(_Float128 a, _Float128 b) {
 int main(void) {
     _Float128 inf = __builtin_huge_valf128();
     _Float128 ninf = __builtin_inff128();
-    _Float128 n = __builtin_nanf128();
+    _Float128 n = __builtin_nanf128("");
     unsigned long long il, ih, nl, nh;
     memcpy(&il, &inf, 8); memcpy(&ih, (char *)&inf + 8, 8);
     memcpy(&nl, &n, 8); memcpy(&nh, (char *)&n + 8, 8);

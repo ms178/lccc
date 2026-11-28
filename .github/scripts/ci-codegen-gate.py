@@ -87,6 +87,60 @@ through `%rax` instead of clobbering its dead source. Static size is the
 wrong metric for a hot-path/cold-path split, same charter as the stencil5
 and chacha20 notes above.
 
+Baseline notes (2026-11-25): `--update-baseline` for three changes to the
+register allocator that go together: a value that is dead while a loop
+runs is no span of that loop (`LiveRange::alive_within`); the recurrence
+floor does not take a value that a copy carries round a loop
+(`carried_round_loop`); a temporary in a phi's register may take the
+register the back-edge source leaves (`rehome_phi_blockers`). Two
+workloads re-pin: zstd_count 118→121 insns / 5→6 pushes, sqlite_varint
+262→263 insns / 7→6 pushes. (zlib_ng_adler32 is recorded at the 209 insns /
+43 moves it already had; these changes do not touch it.)
+zstd_count is the trade the 2026-11-17 note asks for, at par: the limit of
+the eight-byte compare loop is in a register now (`cmpq 0(%rsp), %r9` →
+`cmpq %rsi, %r9`), and what `main` keeps in the frame instead is the masked
+offset of the query, written once and read once a query; the register is a
+sixth callee-saved one, hence the push. Cachegrind: 99,860,199 →
+101,957,365 instructions (+2.10 %: one a query, the offset's four-byte slot
+does not fold into the 64-bit `xor` that reads it), 9,604,917 → 9,604,886
+data references. Wall clock against the old allocation, interleaved runs,
+median / minimum of four sittings of 201 or 301 rounds: 0.9951 / 0.9853,
+1.0010 / 0.9913, 1.0032 / 0.9998, 1.0065 / 1.0108. The first of the three
+changes alone is what must not land: the floor then gives the match
+pointer the register of `state = state * 1664525 + 1013904223`, the slot
+sits between one query and the next, and three sittings read 1.0393 to
+1.0624 / 1.0717 to 1.0737.
+sqlite_varint: 354,875,458 → 354,059,864 instructions (−0.23 %), wall clock
+1.0039 / 0.9982. The other programs of tests/benchmark/programs that these
+changes touch, one sitting of 41 or 201 rounds each: glibc_dl_hash 0.9491 /
+0.9595, linux_rbtree 0.9710 / 0.9816, zlib_ng_huffman_heap 0.9858 / 0.9819,
+gzip_longest_match 1.0016 / 0.9941, expat_utf8_content 1.0081 / 0.9990,
+linux_xxhash64 1.0009 / 1.0058, lz4_compress 1.0024 / 1.0074,
+csv_field_sum 1.0014 / 1.0075. Over the 87 programs there that compile
+alone: 15,972 → 15,943 instructions, 424 → 420 pushes, 1,017 → 1,006 stack
+operands, 1,552 → 1,541 register moves.
+
+Baseline notes (2026-11-26): `--update-baseline` for a change to the metric
+and a change to the compiler.
+The metric: a function body is read to its `.size`, across a data island
+(`function_body_metrics`). It used to end at the first `.section`, which cut
+`main` of sqlite_varint -- the one workload with an island, the table of its
+dispatch -- off at 263 of its 369 instructions, and made the number depend on
+which blocks the layout puts in front of the table: the change below moves
+the shared epilogue there, and the old count read 273 for a unit that had
+become one instruction shorter. Read whole, sqlite_varint was 369 insns / 10
+stack operands / 48 moves; no other workload has an island and none of their
+numbers moves with the metric.
+The compiler: the branch on a merge that one way in brings a constant to is
+left by if-conversion and threaded behind the optimizer's rounds
+(`jump_thread::thread_decided_and_fold`). Three workloads re-pin:
+expat_xml_scan 206→203 insns, sqlite_varint 369→368, safe_count_guards
+226→229 insns / 55→56 moves (`main` of clz_safe_guards.c: the guard of a
+shift count was two conditional moves over the shift and is a branch round
+it). Cachegrind, as the benchmark harness builds them: expat_xml_scan
+1,529,625 → 1,428,038 instructions (−6.64 %; GCC 16.2: 1,460,771),
+sqlite_varint 785,589 → 785,588.
+
 Usage:
     python3 ci-codegen-gate.py --lccc target/fastbuild/lccc
     python3 ci-codegen-gate.py --lccc ... --update-baseline
@@ -202,12 +256,22 @@ def score_chunk(lines: list, m: dict) -> None:
 
 
 def function_body_metrics(asm: str) -> dict:
-    """Aggregate metrics over function bodies only (between .type @function
-    and the next .type/.size/.section). Bodies are scored per-function so
-    the rbp-as-GPR proof stays function-local."""
+    """Aggregate metrics over function bodies only: from `.type @function`
+    to the function's `.size` (or the next `.type @function`), less what
+    lies in a section that holds no code. Bodies are scored per-function so
+    the rbp-as-GPR proof stays function-local.
+
+    A function may leave the text section and come back: a switch's table or
+    a vector constant is emitted where it is used, as `.section .rodata ...
+    .section .text`. The island is skipped and the count goes on behind it.
+    (It used to stop at the first `.section`, so a function with an island
+    was counted up to the island only, and the number moved with whichever
+    blocks the layout put in front of it: see the 2026-11-26 baseline note.)
+    """
     m = {"insns": 0, "stackmem": 0, "pushes": 0, "moves": 0, "ymm": 0, "fma": 0}
     chunk: list = []
     in_func = False
+    in_code = True
 
     def flush():
         if chunk:
@@ -219,12 +283,18 @@ def function_body_metrics(asm: str) -> dict:
         if s.startswith(".type") and "@function" in s:
             flush()
             in_func = True
+            in_code = True
             continue
-        if s == ".size" or (s.startswith(".section") and in_func):
+        if s.startswith(".size"):
             flush()
             in_func = False
             continue
-        if not in_func:
+        if s.startswith(".section") or s in (".text", ".data", ".bss"):
+            in_code = s == ".text" or s.split(None, 1)[1:2] == [".text"] or (
+                s.startswith(".section") and s.split()[1].split(",")[0].startswith(".text")
+            )
+            continue
+        if not in_func or not in_code:
             continue
         chunk.append(line)
     flush()

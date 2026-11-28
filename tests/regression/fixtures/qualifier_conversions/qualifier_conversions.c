@@ -316,11 +316,12 @@ ret_ci (*ret_alias_const(void))[2] { return ret_g2; }
 volatile int (*ret_arr_vol(void))[2] { return ret_g2; } /* expect: warning discarded-array-qualifiers */
 const int (*const *ret_arr_star(void))[2] { static const int (*const p)[2] = ret_g2; return &p; }
 
-/* `_Atomic` is not one of these qualifiers. An atomic object is one other
- * threads read and write while this one runs, so LCCC accesses it the way
- * it accesses a volatile one, and that is all the two share: the program
- * wrote no `volatile`, and a pointer to an atomic object converts to
- * `void *`, and to a pointer to the same atomic type under another name,
+/* `_Atomic` is not one of these qualifiers: nothing is "discarded" when a
+ * pointer to an atomic object becomes a `void *`. An atomic object is one
+ * other threads read and write while this one runs, so LCCC accesses it
+ * the way it accesses a volatile one, and that is all the two share: the
+ * program wrote no `volatile`, and a pointer to an atomic object converts
+ * to `void *`, and to a pointer to the same atomic type under another name,
  * without a word. The spellings are the ones the access rule has to follow
  * (the qualifier, `_Atomic(T)`, a typedef name and a typedef of one, a
  * member, a parameter, a star's own `_Atomic`); a `volatile` that was
@@ -382,4 +383,68 @@ void at_conversions(_Atomic int *pd, at_int *pn, volatile int *pv, at_alias *pc,
     (void)a11; (void)a12; (void)a13; (void)a14; (void)a15; (void)a16;
     (void)b1; (void)b2; (void)b3; (void)b4;
     (void)v1; (void)v2; (void)v3; (void)v4; (void)v5; (void)v6;
+}
+
+/* What `_Atomic` is instead is part of the type: `_Atomic int` and `int`
+ * are not compatible (C11 6.2.5p27; their size and alignment may differ),
+ * so a pointer to one converts to a pointer to the other in neither
+ * direction, under every spelling above. LCCC accepted all of these: the
+ * type had no record of `_Atomic`, and `int *p = &counter;` handed the
+ * counter to code that updates it without a lock prefix. */
+void at_take_plain(int *);
+void at_take_long(long *);
+void at_take_atomic(_Atomic int *);
+int *at_ret_plain(void) { return &at_obj; } /* expect: error incompatible-pointer-types */
+_Atomic int *at_ret_atomic(int *p) { return p; } /* expect: error incompatible-pointer-types */
+void at_incompatible(_Atomic int *pd, int *pi, struct at_rec *r, int c) {
+    int *x1 = &at_obj; /* expect: error incompatible-pointer-types */
+    int *x2 = pd; /* expect: error incompatible-pointer-types */
+    _Atomic int *x3 = pi; /* expect: error incompatible-pointer-types */
+    _Atomic int *x4 = &r->plain; /* expect: error incompatible-pointer-types */
+    int *x5 = &r->direct; /* expect: error incompatible-pointer-types */
+    int *x6 = &at_s.direct; /* expect: error incompatible-pointer-types */
+    volatile int *x7 = &at_obj; /* expect: error incompatible-pointer-types */
+    int **x8 = &at_star; /* expect: error incompatible-pointer-types */
+    void **x9 = &at_ptr; /* expect: error incompatible-pointer-types */
+    long *x10 = (c, &at_obj); /* expect: error incompatible-pointer-types */
+    const int *x11 = &at_obj; /* expect: error incompatible-pointer-types */
+    at_take_plain(&at_obj); /* expect: error incompatible-pointer-types */
+    at_take_plain(&r->direct); /* expect: error incompatible-pointer-types */
+    /* (An argument's diagnostic names no type, so these are the typedef
+     * spellings: GCC prints `'_Atomic at_int *' {aka '_Atomic int *'}`
+     * where a type is named, a notation LCCC does not write.) */
+    at_take_plain(&r->named); /* expect: error incompatible-pointer-types */
+    at_take_plain(at_arr); /* expect: error incompatible-pointer-types */
+    at_take_plain(&at_named); /* expect: error incompatible-pointer-types */
+    at_take_plain(&at_chained); /* expect: error incompatible-pointer-types */
+    at_take_long(&r->wide); /* expect: error incompatible-pointer-types */
+    at_take_atomic(pi); /* expect: error incompatible-pointer-types */
+    at_take_atomic(&r->plain); /* expect: error incompatible-pointer-types */
+    pi = pd; /* expect: error incompatible-pointer-types */
+    pd = pi; /* expect: error incompatible-pointer-types */
+    (void)(pi == pd); /* expect: warning compare-distinct-pointer-types */
+    (void)(c ? pi : pd); /* expect: error incompatible-pointer-types */
+    /* A cast converts; `void *` goes both ways; the same atomic type under
+     * any name is the same type; and a qualifier written beside `_Atomic`
+     * is kept or discarded by its own rule. */
+    int *y1 = (int *)&at_obj;
+    _Atomic int *y2 = (void *)pi;
+    void *y3 = pd;
+    _Atomic int *y4 = y3;
+    const _Atomic int *y5 = pd;
+    _Atomic int *y6 = y5; /* expect: warning discarded-qualifiers */
+    at_int *const y7 = &r->direct;
+    int *_Atomic *y8 = &at_star;
+    _Atomic(void *) *y9 = &at_ptr;
+    at_take_atomic(&at_arr[2]);
+    at_take_atomic(at_arr);
+    at_take_atomic(&r->named);
+    at_take_atomic(c ? pd : &at_obj);
+    (void)(pd == &at_named);
+    /* A member of a structure is atomic by its own declaration only. */
+    int *y10 = &at_s.plain;
+    volatile int *y11 = &r->vol;
+    (void)x1; (void)x2; (void)x3; (void)x4; (void)x5; (void)x6; (void)x7; (void)x8; (void)x9;
+    (void)x10; (void)x11;
+    (void)y1; (void)y2; (void)y4; (void)y6; (void)y7; (void)y8; (void)y9; (void)y10; (void)y11;
 }

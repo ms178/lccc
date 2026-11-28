@@ -3058,13 +3058,27 @@ pub fn emit_data_sections(
         || !module.char16_string_literals.is_empty()
     {
         out.emit(".section .rodata");
+        // A literal under a real symbol name (the profile writer's paths and
+        // format strings, `__lccc_pgo_*`) is an object of the symbol table
+        // and is typed and sized like one. The literals of the program are
+        // `.L` labels, which never reach it. Without this, an instrumented
+        // object carried a few dozen untyped, zero-sized symbols.
+        let annotate = |out: &mut AsmOutput, label: &str, bytes: usize| {
+            if !label.starts_with(".L") {
+                out.emit_fmt(format_args!(".type {}, @object", label));
+                out.emit_fmt(format_args!(".size {}, {}", label, bytes));
+            }
+        };
         for (label, value) in &module.string_literals {
+            // One byte a `char` (see `emit_string_bytes`) and the NUL.
+            annotate(out, label, value.chars().count() + 1);
             out.emit_fmt(format_args!("{}:", label));
             emit_string_bytes(out, value);
         }
         // Wide string literals (L"..."): each char is a 4-byte wchar_t value
         for (label, chars) in &module.wide_string_literals {
             out.emit_fmt(format_args!(".align {}", ptr_dir.align_arg(4)));
+            annotate(out, label, chars.len() * 4);
             out.emit_fmt(format_args!("{}:", label));
             for &ch in chars {
                 out.emit_fmt(format_args!("  .long {}", ch));
@@ -3073,6 +3087,7 @@ pub fn emit_data_sections(
         // char16_t string literals (u"..."): each char is a 2-byte char16_t value
         for (label, chars) in &module.char16_string_literals {
             out.emit_fmt(format_args!(".align {}", ptr_dir.align_arg(2)));
+            annotate(out, label, chars.len() * 2);
             out.emit_fmt(format_args!("{}:", label));
             for &ch in chars {
                 out.emit_fmt(format_args!("  .short {}", ch));

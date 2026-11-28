@@ -7,6 +7,7 @@ mod init_cursor;
 pub(crate) mod intrinsic_arity;
 pub(crate) mod label_check;
 pub(crate) mod libc_builtin_arity;
+pub(crate) mod libc_builtin_types;
 mod operand_constraints;
 pub(crate) mod static_init;
 pub(crate) mod stdbit;
@@ -17,5 +18,6 @@ pub(crate) mod void_declarators;
 
 pub(crate) use analysis::{ExprTypeMap, FunctionInfo, SemanticAnalyzer};
 pub(crate) use const_eval::ConstMap;
+pub(crate) use operand_constraints::{integer_operands_only, invalid_binary_operands};
 
 mod function_pointer_cast;

@@ -3,6 +3,8 @@
 //! Many C programs use GCC builtins (e.g., __builtin_abort, __builtin_memcpy).
 //! We map these to their standard library equivalents so the linker can resolve them.
 
+use super::libc_builtin_types::libc_builtin_names;
+pub(crate) use super::libc_builtin_types::{LibcPrototype, LibcType};
 use crate::common::fx_hash::FxHashMap;
 use crate::common::types::{CType, PtrQuals};
 use std::sync::LazyLock;
@@ -90,10 +92,6 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert(
         "__builtin_cexpi",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::Cexpi),
-    );
-    m.insert(
-        "__builtin_cpow",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::Cpow),
     );
 
     // Math functions
@@ -400,84 +398,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::ClassifyType),
     );
 
-    // Fortification builtins: __builtin___*_chk variants used by glibc's _FORTIFY_SOURCE.
-    // These forward all arguments to the glibc __*_chk runtime function.
-    m.insert(
-        "__builtin___memcpy_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___memmove_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___memset_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___strcpy_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___strncpy_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___strcat_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___strncat_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___sprintf_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___snprintf_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___vsprintf_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___vsnprintf_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___printf_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___fprintf_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___vprintf_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___vfprintf_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___dprintf_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___mempcpy_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___stpcpy_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
-    m.insert(
-        "__builtin___stpncpy_chk",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
-    );
+    // The object-size checking twins (`__builtin___memcpy_chk`, glibc's
+    // _FORTIFY_SOURCE) are library builtins like any other: the table of
+    // prototypes below registers them, each a call of the library's
+    // `__memcpy_chk` by GCC's prototype of the builtin.
     m.insert(
         "__builtin_va_arg_pack",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::VaArgPack),
@@ -3953,6 +3877,15 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::SpeculationSafeValue),
     );
 
+    // Every library builtin GCC has a prototype for and nothing above gave a
+    // lowering of its own: a call of the library function. Before the table
+    // the names had to be written out one by one, and each one nobody had
+    // written was an undeclared function (`__builtin_tan`, `__builtin_atan2`,
+    // `__builtin_strnlen`, `__builtin_isdigit`: 234 of them).
+    for name in libc_builtin_names() {
+        m.entry(name).or_insert_with(|| BuiltinInfo::library(name));
+    }
+
     m
 });
 
@@ -4050,12 +3983,6 @@ pub enum BuiltinIntrinsic {
     /// sin/cos calls, and constructed in LCCC's pointer-backed complex form so
     /// no target's complex-return ABI is involved.
     Cexpi,
-    /// GCC `__builtin_cpow(x, y)` -> `_Complex double` via libm `cpow`.
-    /// Complex values are pointer-backed in LCCC while libm uses the target's
-    /// complex ABI, so this intrinsic decomposes both operands into F64
-    /// scalars and handles x86-64's xmm0/xmm1 return and i686's hidden sret
-    /// separately.
-    Cpow,
     /// GCC 16.2 type-generic bit builtins (`__builtin_{clzg,ctzg,popcountg,parityg,ffsg,clrsbg}`)
     Gcc16GenericBit,
     /// GCC / Clang unsigned carry/borrow chain builtins (`__builtin_{addc,subc}{b,s,,l,ll}`)
@@ -4518,8 +4445,6 @@ pub enum BuiltinIntrinsic {
     X86Phaddd256,
     X86Pabsd256,
     X86Pmuludq256,
-    /// __builtin___*_chk: fortification builtins that forward to unchecked libc equivalents
-    FortifyChk,
     /// __builtin_va_arg_pack(): used in always_inline fortification wrappers, returns 0
     VaArgPack,
     /// __builtin_thread_pointer(): returns the thread pointer (TLS base address)
@@ -4531,6 +4456,13 @@ impl BuiltinInfo {
         Self {
             kind: BuiltinKind::LibcAlias(libc_name.to_string()),
         }
+    }
+
+    /// The library builtin `name` of the prototype table: the library
+    /// function is the name without the prefix (`__builtin___memcpy_chk` is
+    /// `__memcpy_chk`).
+    fn library(name: &str) -> Self {
+        Self::simple(name.strip_prefix(LIBRARY_BUILTIN_PREFIX).unwrap_or(name))
     }
 
     fn identity() -> Self {
@@ -4755,175 +4687,414 @@ pub fn normalize_atomic_size_suffix(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Return types of the GCC compatibility builtins added for the GCC 17-git
-/// C-torture compile leg.  Both `ExprTypeChecker::builtin_return_ctype` and
-/// the IR lowerer's `get_c2y_builtin_ctype` call this function, so the C-level
+/// The 128-bit stems of the VNNI dot products the compiler lowers by name
+/// (`_mm_<stem>`, and `_mm256_<stem>` at 256 bits): AVX512-VNNI's four,
+/// AVX-VNNI's `_avx` spellings of them, and the INT8 and INT16 families.
+const X86_DOT_PRODUCT_STEMS: [&str; 24] = [
+    "dpbssd_epi32",
+    "dpbssds_epi32",
+    "dpbsud_epi32",
+    "dpbsuds_epi32",
+    "dpbusd_avx_epi32",
+    "dpbusd_epi32",
+    "dpbusds_avx_epi32",
+    "dpbusds_epi32",
+    "dpbuud_epi32",
+    "dpbuuds_epi32",
+    "dpwssd_avx_epi32",
+    "dpwssd_epi32",
+    "dpwssds_avx_epi32",
+    "dpwssds_epi32",
+    "dpwsud_avx_epi32",
+    "dpwsuds_avx_epi32",
+    "dpwusd_avx_epi32",
+    "dpwusd_epi32",
+    "dpwusds_avx_epi32",
+    "dpwusds_epi32",
+    "dpwuud_avx_epi32",
+    "dpwuud_epi32",
+    "dpwuuds_avx_epi32",
+    "dpwuuds_epi32",
+];
+
+/// lccc's own 128-bit vector builtins under `__builtin_ia32_` names that the
+/// table generated from GCC's `i386-builtin.def` has no row for (GCC spells
+/// most of them otherwise: its `pand` at 256 bits is
+/// `__builtin_ia32_andsi256`). A call of one is the vector.
+const X86_PRIVATE_VECTOR_BUILTINS_128: [&str; 11] = [
+    "__builtin_ia32_extract128i256",
+    "__builtin_ia32_extracti128",
+    "__builtin_ia32_gf2p8affineinvqb",
+    "__builtin_ia32_gf2p8affineqb",
+    "__builtin_ia32_gf2p8mulb",
+    "__builtin_ia32_set1_epi32",
+    "__builtin_ia32_set1_epi8",
+    "__builtin_ia32_vpdpbusd128",
+    "__builtin_ia32_vpdpbusds128",
+    "__builtin_ia32_vpdpwssd128",
+    "__builtin_ia32_vpdpwssds128",
+];
+
+/// The 256-bit ones.
+const X86_PRIVATE_VECTOR_BUILTINS_256: [&str; 12] = [
+    "__builtin_ia32_insert128i256",
+    "__builtin_ia32_pand256",
+    "__builtin_ia32_vbroadcasti128",
+    "__builtin_ia32_vpbroadcastb256",
+    "__builtin_ia32_vpbroadcastd256",
+    "__builtin_ia32_vpbroadcastq256",
+    "__builtin_ia32_vpbroadcastw256",
+    "__builtin_ia32_vpdpbusd256",
+    "__builtin_ia32_vpdpbusds256",
+    "__builtin_ia32_vpdpwssd256",
+    "__builtin_ia32_vpdpwssds256",
+    "__builtin_ia32_vzextsi128_si256",
+];
+
+/// lccc's own vector builtins whose call is the ADDRESS of the result: the
+/// headers write `__CCC_M128I_FROM_BUILTIN(call)`, which is
+/// `*(__m128i *)(call)`. That convention is older than the typed one above
+/// and these are the names that still have it.
+const X86_PRIVATE_POINTER_BUILTINS: [&str; 14] = [
+    "__builtin_ia32_aesdec256",
+    "__builtin_ia32_aesdeclast256",
+    "__builtin_ia32_aesenc256",
+    "__builtin_ia32_aesenclast256",
+    "__builtin_ia32_cvtsi32si128",
+    "__builtin_ia32_loadldi128",
+    "__builtin_ia32_pinsrb128",
+    "__builtin_ia32_pinsrd128",
+    "__builtin_ia32_pinsrq128",
+    "__builtin_ia32_pinsrw128",
+    "__builtin_ia32_pshufd128",
+    "__builtin_ia32_pshufhw128",
+    "__builtin_ia32_pshuflw128",
+    "__builtin_ia32_vpclmulqdq256",
+];
+
+/// The type of a call of an x86 vector builtin that nothing else types.
+///
+/// A call is typed by the declaration in scope, and most public names have
+/// one: `_mm_add_epi8` is an inline function of a header. A GNU builtin is
+/// typed by the table generated from GCC's own (`x86_builtin_types`). Two
+/// kinds of name fall between:
+///
+/// * a public name the compiler lowers itself and no lccc header declares:
+///   the wrapper was a scalar loop and was taken out when the name became
+///   the instruction (`_mm_sll_epi16`), or the family never had a header
+///   (VNNI, GFNI);
+/// * a builtin of lccc's own under a `__builtin_ia32_` name the generated
+///   table does not have (`__builtin_ia32_pand256`,
+///   `__builtin_ia32_pshufd128`).
+///
+/// Without a row here such a call is the implicit `int` -- and its value is
+/// the address of a 16- or 32-byte result. Stored into an `__m128i` variable
+/// that happens to work, and so did every test. Returned, passed on or
+/// measured, it is wrong code:
+///
+/// ```c
+/// __m128i f(__m128i a, __m128i n) { return _mm_sll_epi16(a, n); }
+/// ```
+///
+/// returned the address of the shifted vector, and `sizeof` of the call was 8.
+///
+/// A row is one of two types, by what the name's callers do with the call.
+/// Where the call is the vector, it is `__m128i` or `__m256i` by the width:
+/// the header type of the public names, and what lccc's headers convert the
+/// private ones from (every one is an integer vector). Where the header
+/// dereferences the call (`X86_PRIVATE_POINTER_BUILTINS`), it is `void *`,
+/// which is what that convention always meant and the `int` only resembled.
+///
+/// A row that is missing, or of the wrong kind, is no longer wrong code: the
+/// lowering refuses a vector builtin whose call is neither typed at the width
+/// it yields nor a pointer (`mistyped_x86_vector_call`), and a header that
+/// no longer compiles is what the intrinsic census counts. The gate
+/// `scripts/x86_intrinsic_types.py` holds every intrinsic lccc has to the
+/// type GCC 16.2's headers give it.
+pub fn x86_vector_builtin_ctype(name: &str) -> Option<CType> {
+    if X86_PRIVATE_POINTER_BUILTINS.contains(&name) {
+        return Some(CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC));
+    }
+    let bytes = if X86_PRIVATE_VECTOR_BUILTINS_128.contains(&name) {
+        16
+    } else if X86_PRIVATE_VECTOR_BUILTINS_256.contains(&name) {
+        32
+    } else if let Some(stem) = name.strip_prefix("_mm256_") {
+        (X86_DOT_PRODUCT_STEMS.contains(&stem)
+            || matches!(stem, "cmpgt_epi8" | "bslli_epi128" | "bsrli_epi128"))
+        .then_some(32)?
+    } else {
+        let stem = name.strip_prefix("_mm_")?;
+        (X86_DOT_PRODUCT_STEMS.contains(&stem)
+            || matches!(
+                stem,
+                "sll_epi16"
+                    | "sll_epi32"
+                    | "sll_epi64"
+                    | "srl_epi16"
+                    | "srl_epi32"
+                    | "srl_epi64"
+                    | "sra_epi16"
+                    | "sra_epi32"
+                    | "avg_epu16"
+                    | "mul_epi32"
+                    | "gf2p8mul_epi8"
+                    | "gf2p8affine_epi64_epi8"
+                    | "gf2p8affineinv_epi64_epi8"
+            ))
+        .then_some(16)?
+    };
+    Some(CType::Vector(Box::new(CType::LongLong), bytes))
+}
+
+/// Every name the builtin table knows: for the tests that hold another table
+/// to it.
+#[cfg(test)]
+pub(crate) fn registered_builtin_names() -> impl Iterator<Item = &'static str> {
+    BUILTIN_MAP.keys().copied()
+}
+
+/// The type of a call of a builtin that is a function of the C library or
+/// one of the GCC compatibility builtins added for the GCC 17-git C-torture
+/// compile leg. Both `ExprTypeChecker::builtin_return_ctype` and the IR
+/// lowerer's `get_c2y_builtin_ctype` call this function, so the C-level
 /// type and the IR-level type can never drift apart (a drift here would make
 /// `sizeof(__builtin_memcmp_eq(...))` disagree with the emitted register
 /// width, i.e. a silent miscompile).
+///
+/// A library builtin has the result of GCC's prototype
+/// (`libc_builtin_prototype`): `__builtin_strlen` is a `size_t`,
+/// `__builtin_strchr` a `char *`. The rows written out here are the names
+/// that table cannot have: the library functions under their own names, and
+/// builtins GCC gives no type as a value.
 pub fn gcc_compat_builtin_ctype(name: &str) -> Option<CType> {
     use crate::common::types::{CType, PtrQuals};
+    if let Some(prototype) = libc_builtin_prototype(name) {
+        return Some(prototype.result.ctype());
+    }
     let void_ptr = || CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
     let char_ptr = || CType::Pointer(Box::new(CType::Char), PtrQuals::GENERIC);
     match name {
-        "bcmp"
-        | "__builtin_bcmp"
-        | "__builtin_memcmp_eq"
-        | "__builtin_ilogb"
-        | "__builtin_strncasecmp" => Some(CType::Int),
-        "__builtin_bzero" | "__builtin_bcopy" | "__builtin_stack_restore" => Some(CType::Void),
-        "strdup" | "strndup" | "__builtin_strdup" | "__builtin_strndup" => Some(char_ptr()),
+        "bcmp" | "__builtin_memcmp_eq" => Some(CType::Int),
+        "__builtin_stack_restore" => Some(CType::Void),
+        "strdup" | "strndup" => Some(char_ptr()),
         "__builtin_stack_save" => Some(void_ptr()),
-        "__builtin_modff" => Some(CType::Float),
-        "__builtin_modf" => Some(CType::Double),
-        "__builtin_ldexp" | "__builtin_scalbn" | "__builtin_frexp" => Some(CType::Double),
-        // The single-precision spellings are NOT optional: without a row here
-        // `builtin_return_ctype` falls through to "undeclared", sema keeps the
-        // implicit-`int` return, and `__builtin_ldexpf(1.5f, 3)` produced
-        // 1.09471e+09 -- the xmm0 low half reinterpreted as an `int` and then
-        // converted back to float.  The `l` spellings had rows already, which
-        // is exactly why only the `f` ones were broken.
-        "__builtin_ldexpf" | "__builtin_scalbnf" | "__builtin_frexpf" => Some(CType::Float),
-        "__builtin_cexpi" | "__builtin_cpow" => Some(CType::ComplexDouble),
+        "__builtin_cexpi" => Some(CType::ComplexDouble),
         _ => None,
     }
 }
 
-/// Parameter types of the libc functions that `BuiltinKind::LibcAlias` maps to,
-/// for the families whose signature contains a **`size_t`** (or another
-/// parameter wider than `int`).
+/// The spelling every library builtin starts with.
+const LIBRARY_BUILTIN_PREFIX: &str = "__builtin_";
+
+/// GCC's prototype of the library builtin spelled `name`
+/// (`__builtin_strchr`: `char *(const char *, int)`), whatever lowers it.
 ///
-/// # Why this table exists
-///
-/// A `__builtin_memcmp(p, q, n)` call is legal in a translation unit that never
-/// declares `memcmp`, so the lowering cannot rely on a user prototype to supply
-/// the parameter conversions. Without them the `int`-typed length expression
-/// `i + 1` was handed to the callee as a raw 32-bit value in a `size_t` slot:
-///
-///   * at `-O0` the value lives in a 4-byte stack slot, and the 8-byte argument
-///     load pulled the adjacent slot in as the high half — `%rdx` became
-///     `0x1_00000007` and `memcmp` ran off the end of both buffers
-///     (gcc.c-torture/execute/`pr59229.c`);
-///   * a *negative* `int` length was zero-extended where C requires the
-///     `int -> size_t` conversion to sign-extend first.
-///
-/// # Scope
-///
-/// Only the entries whose parameters are genuinely wider than `int` are listed;
-/// families where every parameter is `int`/`double`/pointer need no conversion
-/// and are deliberately absent so the table stays reviewable. `Ptr` entries are
-/// placeholders that keep the positional index aligned — the lowering skips
-/// pointer slots (a pointer argument is never arithmetically converted).
-///
-/// `size_t` / `ssize_t` are pointer-width, so the table is target-dependent and
-/// must be queried, not cached.
-pub fn libc_alias_param_types(libc_name: &str) -> Option<Vec<crate::common::types::IrType>> {
-    use crate::common::types::{IrType, target_ptr_size};
-    // size_t: unsigned, pointer-width (LP64 -> U64, ILP32 -> U32).
-    let size_t = if target_ptr_size() == 8 {
-        IrType::U64
-    } else {
-        IrType::U32
-    };
-    let p = IrType::Ptr;
-    let i32t = IrType::I32;
-    let out: Vec<IrType> = match libc_name {
-        // void *memcpy(void *, const void *, size_t)
-        "memcpy" | "mempcpy" | "memmove" => vec![p, p, size_t],
-        // void *memset(void *, int, size_t)
-        "memset" => vec![p, i32t, size_t],
-        // int memcmp(const void *, const void *, size_t)
-        "memcmp" | "bcmp" => vec![p, p, size_t],
-        // void bzero(void *, size_t); char *strndup(const char *, size_t).
-        // `bzero(a, 65536 * 4)` and `strndup(s, (size_t)-1)` both pass an
-        // int/long in a size_t slot: without this conversion the upper half of
-        // %rdx is garbage on LP64 (the pr59229.c defect class).
-        "bzero" => vec![p, size_t],
-        // void bcopy(const void *, void *, size_t)
-        "bcopy" => vec![p, p, size_t],
-        "strndup" => vec![p, size_t],
-        // void *memchr(const void *, int, size_t)
-        "memchr" | "rawmemchr" | "memrchr" => vec![p, i32t, size_t],
-        // char *strncpy/strncat(char *, const char *, size_t)
-        "strncpy" | "strncat" | "stpncpy" => vec![p, p, size_t],
-        // int strncmp(const char *, const char *, size_t)
-        "strncmp" | "strncasecmp" => vec![p, p, size_t],
-        // size_t strnlen(const char *, size_t)
-        "strnlen" => vec![p, size_t],
-        // void *__builtin___memcpy_chk(void *, const void *, size_t, size_t)
-        "__memcpy_chk" | "__mempcpy_chk" | "__memmove_chk" => vec![p, p, size_t, size_t],
-        "__memset_chk" => vec![p, i32t, size_t, size_t],
-        "__strncpy_chk" | "__strncat_chk" | "__stpncpy_chk" => vec![p, p, size_t, size_t],
-        "__strcpy_chk" | "__strcat_chk" | "__stpcpy_chk" => vec![p, p, size_t],
-        _ => return None,
-    };
-    Some(out)
+/// A builtin carries its prototype: `__builtin_sqrt(n)` converts an `int` to
+/// `double` whether or not `<math.h>` was included, and
+/// `__builtin_strlen(s)` is a `size_t`. The table is measured from GCC
+/// (`scripts/gen_libc_builtin_types.py`), so a builtin cannot be registered
+/// without its types: three hand-written lists used to say what they could
+/// (the results of some, the `size_t` parameters of others), and every row
+/// one of them lacked was a miscompiled call.
+pub(crate) fn libc_builtin_prototype(name: &str) -> Option<&'static LibcPrototype> {
+    if !name.starts_with(LIBRARY_BUILTIN_PREFIX) {
+        return None;
+    }
+    super::libc_builtin_types::libc_builtin_prototype(name)
+}
+
+/// The library function and the prototype of a builtin that is lowered as a
+/// call of that function (`__builtin_strchr`: `strchr`); `None` for a
+/// builtin with a lowering of its own (`__builtin_alloca`) and for
+/// everything that is no library builtin.
+pub(crate) fn library_alias(name: &str) -> Option<(&'static str, &'static LibcPrototype)> {
+    let prototype = libc_builtin_prototype(name)?;
+    match &BUILTIN_MAP.get(name)?.kind {
+        BuiltinKind::LibcAlias(libc_name) => Some((libc_name.as_str(), prototype)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
-mod libc_alias_param_type_tests {
-    use super::libc_alias_param_types;
-    use crate::common::types::{IrType, target_ptr_size};
+mod library_builtin_tests {
+    use super::{
+        BUILTIN_MAP, BuiltinKind, LibcType, libc_builtin_names, libc_builtin_prototype,
+        library_alias,
+    };
 
-    fn size_t() -> IrType {
-        if target_ptr_size() == 8 {
-            IrType::U64
-        } else {
-            IrType::U32
+    /// No alias without a prototype: the call would have no types.
+    #[test]
+    fn every_library_alias_has_a_prototype() {
+        let mut aliases = 0;
+        for (name, info) in BUILTIN_MAP.iter() {
+            if matches!(info.kind, BuiltinKind::LibcAlias(_)) {
+                aliases += 1;
+                assert!(
+                    libc_builtin_prototype(name).is_some(),
+                    "{name} is a library alias GCC's table has no prototype for; \
+                     add the candidate to scripts/gen_libc_builtin_types.py"
+                );
+            }
+        }
+        assert!(aliases > 380, "{aliases} library aliases");
+    }
+
+    /// Every builtin of the table is one lccc knows.
+    #[test]
+    fn every_prototype_is_registered() {
+        let mut previous = "";
+        for name in libc_builtin_names() {
+            assert!(
+                previous < name,
+                "{previous} before {name}: the search needs the order"
+            );
+            previous = name;
+            assert!(BUILTIN_MAP.contains_key(name), "{name} is not registered");
         }
     }
 
     #[test]
-    fn size_taking_families_are_covered() {
-        // The regression that motivated the table.
-        assert_eq!(
-            libc_alias_param_types("memcmp"),
-            Some(vec![IrType::Ptr, IrType::Ptr, size_t()])
-        );
-        // memset's second parameter is `int`, NOT the char being stored.
-        assert_eq!(
-            libc_alias_param_types("memset"),
-            Some(vec![IrType::Ptr, IrType::I32, size_t()])
-        );
-        assert_eq!(
-            libc_alias_param_types("memcpy"),
-            Some(vec![IrType::Ptr, IrType::Ptr, size_t()])
-        );
-        assert_eq!(
-            libc_alias_param_types("strncmp"),
-            Some(vec![IrType::Ptr, IrType::Ptr, size_t()])
-        );
-        assert_eq!(
-            libc_alias_param_types("strnlen"),
-            Some(vec![IrType::Ptr, size_t()])
-        );
-        // Both _chk length parameters are size_t.
-        assert_eq!(
-            libc_alias_param_types("__memcpy_chk"),
-            Some(vec![IrType::Ptr, IrType::Ptr, size_t(), size_t()])
-        );
-    }
-
-    #[test]
-    fn size_t_is_unsigned_so_int_lengths_sign_extend_then_widen() {
-        // A signed source converted to an UNSIGNED wider type must go through
-        // a sign extension (C11 6.3.1.3): `(size_t)(int)-1 == SIZE_MAX`. The
-        // table must therefore say `U64`, not `I64`; the cast emitter keys the
-        // extension off the SOURCE signedness.
-        let st = size_t();
-        assert!(!st.is_signed(), "size_t must be unsigned");
-        assert_eq!(st.size(), target_ptr_size(), "size_t must be pointer-width");
-    }
-
-    #[test]
-    fn families_without_wide_parameters_are_absent() {
-        // Everything here is int/double/pointer only: no conversion needed,
-        // and listing them would be unreviewable noise.
-        for n in [
-            "strlen", "strcmp", "strcpy", "abs", "sqrt", "abort", "printf",
+    fn the_library_function_is_the_name_without_the_prefix() {
+        for (builtin, function) in [
+            ("__builtin_tan", "tan"),
+            ("__builtin_strnlen", "strnlen"),
+            ("__builtin___memcpy_chk", "__memcpy_chk"),
+            ("__builtin___dprintf_chk", "__dprintf_chk"),
+            ("__builtin_memcpy", "memcpy"),
+            // Written out by name: the soft-float routines of libgcc.
+            ("__builtin_fabsf128", "__fabstf2"),
         ] {
-            assert_eq!(libc_alias_param_types(n), None, "{n} must not be listed");
+            assert_eq!(
+                library_alias(builtin).map(|a| a.0),
+                Some(function),
+                "{builtin}"
+            );
         }
+        // Typed by the table, lowered by lccc itself.
+        for builtin in [
+            "__builtin_alloca",
+            "__builtin_creal",
+            "__builtin_ffs",
+            "__builtin_nan",
+        ] {
+            assert!(libc_builtin_prototype(builtin).is_some(), "{builtin}");
+            assert!(library_alias(builtin).is_none(), "{builtin}");
+        }
+        for other in [
+            "strlen",
+            "__builtin_popcount",
+            "__builtin_expect",
+            "_mm_add_ps",
+            "",
+        ] {
+            assert!(libc_builtin_prototype(other).is_none(), "{other}");
+        }
+    }
+
+    /// GCC's verdict on a call with the wrong number of arguments is
+    /// measured on its own (`scripts/check_libc_builtin_arity.py`: the
+    /// diagnostics of calls with 0 to 10 arguments), and says what the
+    /// prototypes say: two measurements, one answer.
+    #[test]
+    fn the_arity_table_agrees_with_the_prototypes() {
+        use crate::frontend::sema::libc_builtin_arity::libc_builtin_arity;
+        let mut measured = 0;
+        for name in libc_builtin_names() {
+            let prototype = libc_builtin_prototype(name).expect(name);
+            if let Some(arity) = libc_builtin_arity(name) {
+                measured += 1;
+                assert_eq!(
+                    (arity.min_args, arity.variadic),
+                    (prototype.parameters.len(), prototype.variadic),
+                    "{name}"
+                );
+            }
+        }
+        // All but lccc's own two (`__builtin_dprintf` and its checked twin).
+        assert!(measured + 2 >= libc_builtin_names().count(), "{measured}");
+    }
+
+    /// `const` on what a parameter points to is GCC's: an argument is
+    /// judged against it.
+    #[test]
+    fn pointer_parameters_carry_their_qualifier() {
+        use crate::common::types::{CType, PtrQuals};
+        let cvr = |ty: LibcType| match ty.ctype() {
+            CType::Pointer(_, quals) => quals.cvr(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(cvr(LibcType::CharPtr), Some(0));
+        assert_eq!(cvr(LibcType::ConstCharPtr), Some(PtrQuals::CONST));
+        assert_eq!(cvr(LibcType::VoidPtr), Some(0));
+        assert_eq!(cvr(LibcType::ConstVoidPtr), Some(PtrQuals::CONST));
+        assert_eq!(cvr(LibcType::CharPtrConstPtr), Some(PtrQuals::CONST));
+        // A `va_list` parameter is the target's: an array is adjusted to a
+        // pointer to its element, anything else is passed as it is.
+        let tag = CType::Int;
+        let array = CType::Array(Box::new(tag.clone()), Some(1));
+        assert_eq!(
+            LibcType::VaList.parameter_ctype(Some(&array)),
+            CType::Pointer(Box::new(tag), PtrQuals::GENERIC)
+        );
+        let pointer = CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
+        assert_eq!(LibcType::VaList.parameter_ctype(Some(&pointer)), pointer);
+        assert_eq!(LibcType::Int.parameter_ctype(Some(&array)), CType::Int);
+    }
+
+    /// The rows the defects were: measured from GCC 16.2.
+    #[test]
+    fn prototypes_are_gcc_s() {
+        use LibcType::*;
+        let row = |name: &str| {
+            let p = libc_builtin_prototype(name).unwrap_or_else(|| panic!("{name}"));
+            (p.result, p.parameters.to_vec(), p.variadic, p.noreturn)
+        };
+        assert_eq!(row("__builtin_sqrt"), (Double, vec![Double], false, false));
+        assert_eq!(
+            row("__builtin_ldexpf"),
+            (Float, vec![Float, Int], false, false)
+        );
+        assert_eq!(
+            row("__builtin_strlen"),
+            (Size, vec![ConstCharPtr], false, false)
+        );
+        assert_eq!(
+            row("__builtin_strchr"),
+            (CharPtr, vec![ConstCharPtr, Int], false, false)
+        );
+        assert_eq!(
+            row("__builtin_memset"),
+            (VoidPtr, vec![VoidPtr, Int, Size], false, false)
+        );
+        assert_eq!(
+            row("__builtin_printf"),
+            (Int, vec![ConstCharPtr], true, false)
+        );
+        assert_eq!(
+            row("__builtin___snprintf_chk"),
+            (
+                Int,
+                vec![CharPtr, Size, Int, Size, ConstCharPtr],
+                true,
+                false
+            )
+        );
+        assert_eq!(
+            row("__builtin_vsnprintf"),
+            (Int, vec![CharPtr, Size, ConstCharPtr, VaList], false, false)
+        );
+        assert_eq!(row("__builtin_abort"), (Void, vec![], false, true));
+        assert_eq!(row("__builtin_exit"), (Void, vec![Int], false, true));
+        assert_eq!(
+            row("__builtin_cabs"),
+            (Double, vec![ComplexDouble], false, false)
+        );
+        assert_eq!(row("__builtin_lround"), (Long, vec![Double], false, false));
+        assert_eq!(
+            row("__builtin_imaxabs"),
+            (IntMax, vec![IntMax], false, false)
+        );
     }
 }
 
@@ -4969,7 +5140,6 @@ mod gcc17_torture_builtin_tests {
             "__builtin_stack_save",
             "__builtin_stack_restore",
             "__builtin_cexpi",
-            "__builtin_cpow",
         ] {
             assert!(
                 matches!(
@@ -4985,6 +5155,7 @@ mod gcc17_torture_builtin_tests {
             "__builtin_modff",
             "__builtin_strncasecmp",
             "__builtin_bcopy",
+            "__builtin_cpow",
         ] {
             assert!(
                 matches!(
@@ -5023,29 +5194,214 @@ mod gcc17_torture_builtin_tests {
             Some(CType::Void)
         );
         assert_eq!(gcc_compat_builtin_ctype("strlen"), None);
+        // The rows a hand-written list lacked, each one a miscompiled call:
+        // the result was an `int`.
+        let char_ptr = CType::Pointer(
+            Box::new(CType::Char),
+            crate::common::types::PtrQuals::GENERIC,
+        );
+        for name in [
+            "__builtin_strchr",
+            "__builtin_strrchr",
+            "__builtin_strstr",
+            "__builtin_strpbrk",
+            "__builtin_strcpy",
+            "__builtin_strncpy",
+            "__builtin_strcat",
+            "__builtin_stpcpy",
+        ] {
+            assert_eq!(
+                gcc_compat_builtin_ctype(name).as_ref(),
+                Some(&char_ptr),
+                "{name}"
+            );
+        }
+        let size = if crate::common::types::target_is_32bit() {
+            CType::UInt
+        } else {
+            CType::ULong
+        };
+        for name in ["__builtin_strlen", "__builtin_strspn", "__builtin_strcspn"] {
+            assert_eq!(
+                gcc_compat_builtin_ctype(name).as_ref(),
+                Some(&size),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_ldexpf"),
+            Some(CType::Float)
+        );
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_tan"),
+            Some(CType::Double)
+        );
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_lround"),
+            Some(CType::Long)
+        );
+        assert_eq!(
+            gcc_compat_builtin_ctype("__builtin_cexp"),
+            Some(CType::ComplexDouble)
+        );
+    }
+}
+
+#[cfg(test)]
+mod x86_vector_builtin_type_tests {
+    use super::{
+        BuiltinKind, X86_DOT_PRODUCT_STEMS, X86_PRIVATE_POINTER_BUILTINS,
+        X86_PRIVATE_VECTOR_BUILTINS_128, X86_PRIVATE_VECTOR_BUILTINS_256, registered_builtin_names,
+        resolve_builtin, x86_vector_builtin_ctype,
+    };
+    use crate::common::types::{CType, PtrQuals};
+
+    fn vector(bytes: usize) -> Option<CType> {
+        Some(CType::Vector(Box::new(CType::LongLong), bytes))
+    }
+
+    /// The names a program writes: `__m128i` at 128 bits, `__m256i` at 256.
+    #[test]
+    fn public_names_without_a_header_have_the_header_type() {
+        for name in [
+            "_mm_sll_epi16",
+            "_mm_sll_epi32",
+            "_mm_sll_epi64",
+            "_mm_srl_epi16",
+            "_mm_srl_epi32",
+            "_mm_srl_epi64",
+            "_mm_sra_epi16",
+            "_mm_sra_epi32",
+            "_mm_avg_epu16",
+            "_mm_mul_epi32",
+            "_mm_gf2p8mul_epi8",
+            "_mm_gf2p8affine_epi64_epi8",
+            "_mm_gf2p8affineinv_epi64_epi8",
+        ] {
+            assert_eq!(x86_vector_builtin_ctype(name), vector(16), "{name}");
+        }
+        for name in [
+            "_mm256_cmpgt_epi8",
+            "_mm256_bslli_epi128",
+            "_mm256_bsrli_epi128",
+        ] {
+            assert_eq!(x86_vector_builtin_ctype(name), vector(32), "{name}");
+        }
+        for stem in X86_DOT_PRODUCT_STEMS {
+            assert_eq!(
+                x86_vector_builtin_ctype(&format!("_mm_{stem}")),
+                vector(16),
+                "{stem}"
+            );
+            assert_eq!(
+                x86_vector_builtin_ctype(&format!("_mm256_{stem}")),
+                vector(32),
+                "{stem}"
+            );
+        }
+    }
+
+    /// A stem is listed for its own width only, and a name a header or the
+    /// generated table types is not listed here: one owner per name.
+    #[test]
+    fn the_table_answers_only_for_its_own_names() {
+        for name in [
+            // The other width of a listed stem.
+            "_mm256_sll_epi16",
+            "_mm256_avg_epu16",
+            "_mm_cmpgt_epi8",
+            "_mm_bslli_epi128",
+            // Declared by a header.
+            "_mm_add_epi8",
+            "_mm256_add_epi8",
+            // Typed by GCC's own table.
+            "__builtin_ia32_paddb128",
+            "__builtin_ia32_psllw128",
+            // A scalar result.
+            "__builtin_ia32_pextrq128",
+            // Not x86 vector builtins at all.
+            "_mm512_dpbusd_epi32",
+            "_mm_",
+            "__builtin_popcount",
+            "",
+        ] {
+            assert_eq!(x86_vector_builtin_ctype(name), None, "{name}");
+        }
     }
 
     #[test]
-    fn wide_parameters_are_converted() {
-        use super::libc_alias_param_types;
-        use crate::common::types::{IrType, target_ptr_size};
-        let st = if target_ptr_size() == 8 {
-            IrType::U64
-        } else {
-            IrType::U32
-        };
-        assert_eq!(libc_alias_param_types("bzero"), Some(vec![IrType::Ptr, st]));
-        assert_eq!(
-            libc_alias_param_types("strndup"),
-            Some(vec![IrType::Ptr, st])
-        );
-        assert_eq!(
-            libc_alias_param_types("bcopy"),
-            Some(vec![IrType::Ptr, IrType::Ptr, st])
-        );
-        assert_eq!(
-            libc_alias_param_types("bcmp"),
-            Some(vec![IrType::Ptr, IrType::Ptr, st])
-        );
+    fn private_names_are_typed_by_their_width() {
+        for name in X86_PRIVATE_VECTOR_BUILTINS_128 {
+            assert_eq!(x86_vector_builtin_ctype(name), vector(16), "{name}");
+        }
+        for name in X86_PRIVATE_VECTOR_BUILTINS_256 {
+            assert_eq!(x86_vector_builtin_ctype(name), vector(32), "{name}");
+        }
+    }
+
+    /// The names a header dereferences are pointers, and in no other list:
+    /// `*(__m128i *)(call)` of a call typed as the vector reads eight bytes
+    /// of the vector as an address.
+    #[test]
+    fn dereferenced_names_are_pointers() {
+        for name in X86_PRIVATE_POINTER_BUILTINS {
+            assert_eq!(
+                x86_vector_builtin_ctype(name),
+                Some(CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC)),
+                "{name}"
+            );
+            assert!(!X86_PRIVATE_VECTOR_BUILTINS_128.contains(&name), "{name}");
+            assert!(!X86_PRIVATE_VECTOR_BUILTINS_256.contains(&name), "{name}");
+        }
+    }
+
+    /// A row for a name the compiler does not lower is a typo: every row
+    /// names a registered intrinsic.
+    #[test]
+    fn every_row_names_a_registered_intrinsic() {
+        let mut rows: Vec<String> = X86_PRIVATE_VECTOR_BUILTINS_128
+            .iter()
+            .chain(&X86_PRIVATE_VECTOR_BUILTINS_256)
+            .chain(&X86_PRIVATE_POINTER_BUILTINS)
+            .map(|name| (*name).to_string())
+            .collect();
+        for stem in X86_DOT_PRODUCT_STEMS {
+            rows.push(format!("_mm_{stem}"));
+            rows.push(format!("_mm256_{stem}"));
+        }
+        for name in &rows {
+            assert!(
+                matches!(
+                    resolve_builtin(name).map(|info| &info.kind),
+                    Some(BuiltinKind::Intrinsic(_))
+                ),
+                "{name} is not a registered intrinsic"
+            );
+        }
+        // And the sorted lists hold no name twice.
+        for list in [
+            &X86_PRIVATE_VECTOR_BUILTINS_128[..],
+            &X86_PRIVATE_VECTOR_BUILTINS_256[..],
+            &X86_PRIVATE_POINTER_BUILTINS[..],
+            &X86_DOT_PRODUCT_STEMS[..],
+        ] {
+            assert!(list.windows(2).all(|pair| pair[0] < pair[1]), "{list:?}");
+        }
+    }
+
+    /// Every row is needed: a registered name the table lists is one the
+    /// generated GNU table does not type (a name with two owners would hide
+    /// a disagreement between them).
+    #[test]
+    fn no_row_shadows_the_generated_table() {
+        for name in registered_builtin_names() {
+            if x86_vector_builtin_ctype(name).is_some() {
+                assert_eq!(
+                    crate::common::x86_builtin_types::result_type(name),
+                    None,
+                    "{name} is typed twice"
+                );
+            }
+        }
     }
 }

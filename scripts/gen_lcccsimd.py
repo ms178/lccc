@@ -12,12 +12,51 @@ IR operand.
 
 Regenerate: python3 scripts/gen_lcccsimd.py
 """
+import subprocess
 import sys
 import re
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent
-OUT = REPO / "include" / "lcccsimd.h"
+HEADER = REPO / "include" / "lcccsimd.h"
+OUT = HEADER
+
+# Tables recorded from the header.  Each has a gate of its own in another
+# lane, so a regenerated header that leaves one of them as it was passes
+# `--check` here and fails there: the 288 named mask compares did exactly
+# that to the first two, on one push.  `--check` therefore answers for the
+# header and for what is recorded from it.  The two checks it runs need no
+# compiler; the third table needs lccc and GCC 16.2 and is only named.
+#
+# (table, its check or None, the command that records it again)
+DEPENDENTS = (
+    ("engineering/isa/sse-avx-public-api.json",
+     ("scripts/audit_sse_avx_public_api.py", "--check"),
+     "python3 scripts/audit_sse_avx_public_api.py --write"),
+    ("tests/simd/isa_permissions_gcc16.json",
+     ("tests/simd/check_isa_permissions.py",),
+     'python3 tests/simd/gen_isa_permissions.py --headers "$(gcc-16 -print-file-name=include)"'),
+    ("tests/x86-intrinsics/expected.txt",
+     None,
+     "python3 scripts/x86_intrinsic_census.py --update --lccc target/fastbuild/lccc --gcc gcc-16"),
+)
+
+
+def failing_dependents():
+    """The recorded tables whose check fails, each with the check's last lines."""
+    failing = []
+    for table, check, record in DEPENDENTS:
+        if check is None:
+            continue
+        run = subprocess.run(
+            [sys.executable, str(REPO / check[0]), *check[1:]],
+            cwd=REPO, capture_output=True, text=True, check=False,
+        )
+        if run.returncode != 0:
+            tail = (run.stdout + run.stderr).strip().splitlines()[-6:]
+            failing.append((table, record, tail))
+    return failing
+
 
 # `--check` regenerates into memory and fails when the committed header differs
 # from what this script produces.  The header is machine output -- a hand edit
@@ -172,6 +211,11 @@ CMP_MASK = [
     ("cmp_epu64_mask", "vpcmpuq128", "__mmask8", True),
     ("cmpeq_epi64_mask", "vpcmpq128", "__mmask8", False),
     ("cmp_epi64_mask", "vpcmpq128", "__mmask8", True),
+]
+# `_MM_CMPINT_*` of the predicates GCC names.  3 (false) and 7 (true) have
+# no name of their own; `_mm*_cmp_ep*_mask` takes them as a number.
+CMP_PREDICATES = [
+    ("cmpeq", 0), ("cmplt", 1), ("cmple", 2), ("cmpneq", 4), ("cmpge", 5), ("cmpgt", 6),
 ]
 MZ_LOAD = [
     ("maskz_loadu_epi8", "vmovdqu8_maskz_load512", "__m512i", "__mmask64", "M512I"),
@@ -513,6 +557,17 @@ w("#define __CCC_M512I_FROM_BUILTIN(e) (*(__m512i *)(e))")
 w("#define __CCC_M512_FROM_BUILTIN(e)  (*(__m512 *)(e))")
 w("#define __CCC_M512D_FROM_BUILTIN(e) (*(__m512d *)(e))")
 w("")
+w("/* A mask argument of a macro, as the mask parameter of GCC's function takes")
+w(" * it. A floating value is converted to the mask type: a macro has no")
+w(" * parameter to do that, and `(k) & compare(...)` with a `double` k is no")
+w(" * expression at all. An integer is left as it is written: the compare it is")
+w(" * ANDed with has no bit above the mask's width, so the AND is the")
+w(" * conversion, and a cast in front of it would cost a second truncation of a")
+w(" * mask kept in a wider object. The selection is made when the macro is")
+w(" * compiled, and the argument is evaluated once. */")
+w("#define __CCC_MASK_ARG(T, k) \\")
+w("    _Generic((k), float: (T)(k), double: (T)(k), long double: (T)(k), default: (k))")
+w("")
 
 ALWAYS = "__attribute__((__always_inline__, __artificial__))"
 
@@ -651,6 +706,32 @@ for name, mn, mty, has_imm in CMP_MASK:
     if has_imm:
         macro(f"{pfx}{name}(__a, __b, __imm)",
               f"({mty})__lccc_simd512_i_{mn}(__imm, __a, __b)")
+        # The predicates that have a name, and the forms that take a mask.
+        # `vpcmp` has one instruction per element type and takes the
+        # predicate as an immediate, so every name below is the builtin of
+        # this row with a number in front.  A `_mask_` form computes the
+        # compare in the lanes its mask selects and 0 in the others, which
+        # is the AND of the two masks.  lccc keeps a mask in a general
+        # register, so the AND is an `and` there; GCC moves the mask into a
+        # `k` register and compares under it (`vpcmpd ..., %k0{%k1}`).
+        element = name[len("cmp_"):-len("_mask")]
+        for predicate, imm in CMP_PREDICATES:
+            if predicate != "cmpeq":  # `cmpeq` is a row of its own above
+                macro(f"{pfx}{predicate}_{element}_mask(__a, __b)",
+                      f"({mty})__lccc_simd512_i_{mn}({imm}, __a, __b)")
+            macro(f"{pfx}mask_{predicate}_{element}_mask(__k, __a, __b)",
+                  f"({mty})(__CCC_MASK_ARG({mty}, __k) & "
+                  f"__lccc_simd512_i_{mn}({imm}, __a, __b))")
+        # The mask goes through `__CCC_MASK_ARG`: `(__k) &` took whatever
+        # was written, and a `double` there was no operand of `&` at all
+        # (and the compiler stopped with an internal error where it should
+        # have said so). A plain cast to the mask type would be right too
+        # and is not free: in a function that keeps one mask in a wider
+        # object and uses it at several widths, it is a `movzwl` per call
+        # (66 instructions in tests/regression/avx512_mask_compare_names.c).
+        macro(f"{pfx}mask_cmp_{element}_mask(__k, __a, __b, __imm)",
+              f"({mty})(__CCC_MASK_ARG({mty}, __k) & "
+              f"__lccc_simd512_i_{mn}(__imm, __a, __b))")
     else:
         macro(f"{pfx}{name}(__a, __b)",
               f"({mty})__lccc_simd512_i_{mn}(0, __a, __b)")
@@ -983,6 +1064,24 @@ if _CHECK_ONLY:
         )
         sys.exit(1)
     print(f"gen_lcccsimd: {OUT} matches the generator ({len(L)} lines)")
+    # Only the repository's own header has recorded tables; `--out` compares
+    # a header written somewhere else.
+    if OUT == HEADER:
+        failing = failing_dependents()
+        for table, record, tail in failing:
+            print(f"gen_lcccsimd: {table} is recorded from the header and fails its check:", file=sys.stderr)
+            for line in tail:
+                print(f"    {line}", file=sys.stderr)
+            print(f"  if the header is what changed, record it again and review the diff:\n    {record}",
+                  file=sys.stderr)
+        if failing:
+            sys.exit(1)
+        checked = sum(1 for _, check, _ in DEPENDENTS if check is not None)
+        print(f"gen_lcccsimd: the {checked} tables recorded from it that need no compiler agree with it")
 else:
     OUT.write_text(generated)
     print(f"wrote {OUT} ({len(L)} lines)")
+    if OUT == HEADER:
+        print("recorded from this header; record them again and review each diff:")
+        for table, _, record in DEPENDENTS:
+            print(f"  {table}\n    {record}")

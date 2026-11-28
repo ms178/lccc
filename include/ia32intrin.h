@@ -156,6 +156,83 @@ __popcntq(unsigned long long __a)
 }
 #endif
 
+/* CRC-32C (the Castagnoli polynomial) accumulated over one more byte, word,
+ * doubleword or quadword: the CRC32 instruction of SSE4.2, under the names
+ * of GCC's ia32intrin.h (`_mm_crc32_u8` ... are the SSE4.2 names). */
+static __inline__ unsigned int __attribute__((__always_inline__, target("sse4.2")))
+__crc32b(unsigned int __C, unsigned char __V)
+{
+    return __builtin_ia32_crc32qi(__C, __V);
+}
+
+static __inline__ unsigned int __attribute__((__always_inline__, target("sse4.2")))
+__crc32w(unsigned int __C, unsigned short __V)
+{
+    return __builtin_ia32_crc32hi(__C, __V);
+}
+
+static __inline__ unsigned int __attribute__((__always_inline__, target("sse4.2")))
+__crc32d(unsigned int __C, unsigned int __V)
+{
+    return __builtin_ia32_crc32si(__C, __V);
+}
+
+#ifdef __x86_64__
+static __inline__ unsigned long long __attribute__((__always_inline__, target("sse4.2")))
+__crc32q(unsigned long long __C, unsigned long long __V)
+{
+    return __builtin_ia32_crc32di(__C, __V);
+}
+#endif
+
+/* Performance-monitoring counter __S (#GP unless the system allows it). */
+static __inline__ unsigned long long __attribute__((__always_inline__))
+__rdpmc(int __S)
+{
+    unsigned int __lo, __hi;
+    __asm__ __volatile__("rdpmc" : "=a"(__lo), "=d"(__hi) : "c"(__S));
+    return ((unsigned long long)__hi << 32) | __lo;
+}
+
+/* The flags register, read and written through the stack, which is the only
+ * way the instruction set offers. On x86-64 the 128 bytes below the stack
+ * pointer may hold a leaf function's locals (the ABI's red zone), so the
+ * push happens below them; LEA moves the stack pointer without touching the
+ * flags that are being read or were just written. */
+#ifdef __x86_64__
+static __inline__ unsigned long long __attribute__((__always_inline__))
+__readeflags(void)
+{
+    unsigned long long __flags;
+    __asm__ __volatile__("leaq -128(%%rsp), %%rsp\n\tpushfq\n\tpopq %0\n\tleaq 128(%%rsp), %%rsp"
+                         : "=r"(__flags));
+    return __flags;
+}
+
+static __inline__ void __attribute__((__always_inline__))
+__writeeflags(unsigned long long __X)
+{
+    __asm__ __volatile__("leaq -128(%%rsp), %%rsp\n\tpushq %0\n\tpopfq\n\tleaq 128(%%rsp), %%rsp"
+                         :
+                         : "r"(__X)
+                         : "cc");
+}
+#else
+static __inline__ unsigned int __attribute__((__always_inline__))
+__readeflags(void)
+{
+    unsigned int __flags;
+    __asm__ __volatile__("pushfl\n\tpopl %0" : "=r"(__flags));
+    return __flags;
+}
+
+static __inline__ void __attribute__((__always_inline__))
+__writeeflags(unsigned int __X)
+{
+    __asm__ __volatile__("pushl %0\n\tpopfl" : : "r"(__X) : "cc");
+}
+#endif
+
 /* GCC/ICC ia32 aliases. */
 #define _bit_scan_forward(a) __bsfd(a)
 #define _bit_scan_reverse(a) __bsrd(a)

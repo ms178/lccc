@@ -89,7 +89,14 @@ gen_caller() {  # gen_caller <align> <prefix-ints> -> caller .c on stdout
     cat <<CEOF
 typedef struct { __attribute__((aligned($align))) char p[$((align - 8))]; } A;
 $(decl_callee "$align" "$nints")
-void _start(void) {
+/* The process starts with %esp on a 16-byte boundary; a C function is
+   entered four bytes below one, behind its return address. Entering a C
+   function *as* _start therefore breaks the alignment it is compiled for,
+   and GCC's own caller of the aligned(16) case faulted on a movaps to its
+   over-aligned local (GCC 12 and 16.2 alike; the all-GCC combination failed
+   this gate). The entry point is this call. */
+__asm__(".text\n.globl _start\n_start:\n    call c_start\n    hlt\n");
+void c_start(void) {
     A s;
     unsigned *w = (unsigned *)s.p;
     for (int i = 0; i < $(($align / 4 - 2)); i++)

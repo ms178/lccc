@@ -1433,6 +1433,27 @@ fn update_facts(t: &str, facts: &mut ExtFacts<'_>) {
         }
         return;
     }
+    // A mask register read into a general register. `kmovb`, `kmovw` and
+    // `kmovd` take a 32-bit register and zero-extend the 8, 16 or 32 bits
+    // they move into it, so the value fits that width (`kmovw %k1, %eax;
+    // movzwl %ax, %eax`, which the code generator writes for every
+    // `__mmask16` it compares into, is one instruction). `kmovq %k, %r64`
+    // moves all 64 and proves nothing; a mask register or memory as the
+    // destination writes no general register. Both are left to the rules
+    // below.
+    if let Some(width) = match op {
+        "kmovb" => Some(8),
+        "kmovw" => Some(16),
+        "kmovd" => Some(32),
+        _ => None,
+    } && let Some((src, dst)) = split_two_operands(t)
+        && src.starts_with("%k")
+        && let Some(df) = family_of_reg(dst)
+        && reg32_name(df).is_some_and(|name| dst.strip_prefix('%') == Some(name))
+    {
+        facts.set_zero_extended(df, width, ext16_enabled());
+        return;
+    }
     // Bit counts at 32/64-bit width write the whole destination with a value
     // in 0..=64. POPCNT/LZCNT/TZCNT are defined for every input. BSF/BSR
     // leave the destination UNCHANGED for a zero source (AMD; Intel SDM
@@ -2446,6 +2467,43 @@ mod tests {
         assert!(!out.contains("movzbl"), "asm was:\n{out}");
         assert!(!out.contains("movsbq"), "asm was:\n{out}");
         assert!(!out.contains("movslq"), "asm was:\n{out}");
+    }
+
+    /// A mask read into a 32-bit register is zero-extended from the width
+    /// of the `kmov`: a re-extension from that width or a wider one is a
+    /// no-operation, one from a narrower width is not.
+    #[test]
+    fn a_mask_in_a_gpr_is_zero_extended_from_its_width() {
+        // Removed: the extension is no narrower than what was moved.
+        for asm in [
+            "    kmovw %k1, %eax\n    movzwl %ax, %eax\n",
+            "    kmovb %k1, %eax\n    movzbl %al, %eax\n",
+            "    kmovb %k1, %eax\n    movzwl %ax, %eax\n",
+            "    kmovd %k2, %r8d\n    movl %r8d, %r8d\n",
+            "    kmovw %k1, %ecx\n    movl %ecx, %ecx\n",
+        ] {
+            let out = run(&format!("foo:\n{asm}    ret\n"));
+            let ext = asm.lines().last().unwrap();
+            assert!(!out.contains(ext), "{ext} kept; asm was:\n{out}");
+        }
+        // Kept: sixteen mask bits are not eight, 32 are not sixteen, 64
+        // prove nothing, and a move INTO a mask register, a store and a
+        // load establish nothing about the general register they name.
+        for asm in [
+            "    kmovw %k1, %eax\n    movzbl %al, %eax\n",
+            "    kmovd %k1, %eax\n    movzwl %ax, %eax\n",
+            "    kmovq %k1, %rax\n    movl %eax, %eax\n",
+            "    kmovq %k1, %rax\n    movzwl %ax, %eax\n",
+            "    movq (%rdi), %rax\n    kmovw %eax, %k1\n    movzwl %ax, %eax\n",
+            "    movq (%rdi), %rax\n    kmovw %k1, (%rax)\n    movzwl %ax, %eax\n",
+            "    movq (%rdi), %rax\n    kmovw (%rax), %k1\n    movzwl %ax, %eax\n",
+            // A fact of the register in front of the move does not survive it.
+            "    movzbl (%rdi), %eax\n    kmovw %k1, %eax\n    movzbl %al, %eax\n",
+        ] {
+            let out = run_maybe(&format!("foo:\n{asm}    ret\n"));
+            let ext = asm.lines().last().unwrap();
+            assert!(out.contains(ext), "{ext} deleted; asm was:\n{out}");
+        }
     }
 
     #[test]

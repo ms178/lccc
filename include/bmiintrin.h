@@ -31,6 +31,18 @@ __andn_u32(unsigned int __x, unsigned int __y)
     return ~__x & __y;
 }
 
+static __inline__ unsigned int __attribute__((__always_inline__))
+_andn_u32(unsigned int __x, unsigned int __y)
+{
+    return __andn_u32(__x, __y);
+}
+
+static __inline__ unsigned short __attribute__((__always_inline__))
+_tzcnt_u16(unsigned short __x)
+{
+    return __tzcnt_u16(__x);
+}
+
 /* BEXTR: start = control[7:0], length = control[15:8]. A start of 32 or
  * more yields 0; a length of 32 or more keeps every bit above start. */
 static __inline__ unsigned int __attribute__((__always_inline__))
@@ -103,6 +115,12 @@ static __inline__ unsigned long long __attribute__((__always_inline__))
 __andn_u64(unsigned long long __x, unsigned long long __y)
 {
     return ~__x & __y;
+}
+
+static __inline__ unsigned long long __attribute__((__always_inline__))
+_andn_u64(unsigned long long __x, unsigned long long __y)
+{
+    return __andn_u64(__x, __y);
 }
 
 static __inline__ unsigned long long __attribute__((__always_inline__))

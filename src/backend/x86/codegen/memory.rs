@@ -843,6 +843,33 @@ impl X86Codegen {
                         }
                     }
                 }
+
+                // Val in a register, ptr a slot of this frame: one
+                // instruction.  An ordinary store of this shape is the typed
+                // path's (`isel`: `Mov` into a `StackSlot`); what arrives
+                // here is a volatile one, which is emitted in place between
+                // its markers (`try_lower_machinst`) and went through the
+                // accumulator -- `movq %rdi, %rax; movq %rax, 0(%rsp)` for
+                // `volatile long r; r = a;`.  A slot whose displacement
+                // needs `%rcx` to be formed keeps the default path.  No
+                // register is written, so what the cache knows of the
+                // accumulator stands.
+                if let Some(vr) = v_reg
+                    && !is_xmm_reg(vr)
+                    && let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                        self.state.resolve_slot_addr(ptr.0)
+                    && self.state.out.slot_disp_encodable(slot.0)
+                {
+                    let out = &mut self.state.out;
+                    out.write_str("    ");
+                    out.write_str(Self::mov_store_for_type(ty));
+                    out.write_str(" %");
+                    out.write_str(typed_phys_reg_name(vr, ty));
+                    out.write_str(", ");
+                    out.write_slot_operand(slot.0);
+                    out.newline();
+                    return;
+                }
             }
         }
 

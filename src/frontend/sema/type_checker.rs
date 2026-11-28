@@ -151,14 +151,19 @@ impl<'a> ExprTypeChecker<'a> {
     pub(crate) fn lvalue_object_cvr(&self, expr: &Expr) -> Option<u8> {
         match expr {
             Expr::Identifier(name, _) => self.symbols.object_cvr(name),
+            // `_Atomic` is the one qualifier a member does not take from
+            // its containing object: a member of an atomic structure is not
+            // itself an atomic object (accessing one is undefined, C11
+            // 6.5.2.3p5), and typing `&s.m` as a pointer to atomic would
+            // refuse the conversions GCC accepts for it.
             Expr::MemberAccess(base, field, _) => {
-                let outer = self.lvalue_object_cvr(base)?;
+                let outer = self.lvalue_object_cvr(base)? & !PtrQuals::ATOMIC;
                 let record = self.infer_expr_ctype(base)?;
                 Some(outer | self.member_own_cvr(&record, field)?)
             }
             Expr::PointerMemberAccess(base, field, _) => {
                 let (record, outer) = self.designated_pointee(base)?;
-                Some(outer | self.member_own_cvr(&record, field)?)
+                Some((outer & !PtrQuals::ATOMIC) | self.member_own_cvr(&record, field)?)
             }
             Expr::Deref(inner, _) => self.designated_pointee(inner).map(|(_, cvr)| cvr),
             Expr::ArraySubscript(lhs, rhs, _) => {
@@ -749,9 +754,25 @@ impl<'a> ExprTypeChecker<'a> {
 
     /// Infer the return CType of a function call.
     fn infer_call_return_ctype(&self, func: &Expr) -> Option<CType> {
-        // Strip Deref layers (dereferencing function pointers is a no-op in C)
+        // Strip the Deref layers that designate the function again
+        // (`(*f)(x)`, `(**f)(x)` of a function or a pointer to one).  A
+        // `*pp` of a pointer to a function pointer is a load: what is
+        // called is what it loads, and it is typed below like any other
+        // expression.  Taken off too, it typed `(**ppp)(x)` of a `double
+        // (***ppp)(double)` by `ppp`, and the call was refused: "returning
+        // 'double (**)(double)' from a function with return type 'double'".
+        // An operand whose type is not known (a builtin's name) is
+        // stripped, as before.
         let mut stripped = func;
         while let Expr::Deref(inner, _) = stripped {
+            let designates_function = match self.infer_expr_ctype(inner) {
+                Some(CType::Function(_)) | None => true,
+                Some(CType::Pointer(pointee, _)) => matches!(*pointee, CType::Function(_)),
+                Some(_) => false,
+            };
+            if !designates_function {
+                break;
+            }
             stripped = inner;
         }
 
@@ -935,11 +956,12 @@ impl<'a> ExprTypeChecker<'a> {
     ) -> Option<usize> {
         // An expression operand undergoes lvalue conversion; a type operand
         // (C2y) none. Constness follows the rule lowering shares.
+        // (`infer_value_ctype`: an array operand decays to a pointer to its
+        // element with the array object's qualifiers, which an association
+        // such as `_Atomic int *` or `const char *` is selected by.)
         let controlling_ct = match controlling {
             Expr::TypeOperand(ts, ..) => Some(self.resolve_type_spec(ts)),
-            _ => self
-                .infer_expr_ctype(controlling)
-                .map(|ct| ct.decayed_value_ctype()),
+            _ => self.infer_value_ctype(controlling),
         };
         let (ctrl_const, compare_const) =
             qualifiers::controlling_const(controlling, associations, self);
@@ -948,7 +970,12 @@ impl<'a> ExprTypeChecker<'a> {
             match &assoc.type_spec {
                 None => default_index = Some(index),
                 Some(type_spec) => {
-                    let assoc_ct = self.resolve_type_spec(type_spec);
+                    // With the type name's own qualifiers recorded on each
+                    // pointer level, as a cast's are: `volatile int *` and
+                    // `_Atomic int *` are not `int *`, and
+                    // `generic_association_matches` compares the records
+                    // level by level where both sides have one.
+                    let assoc_ct = self.cast_ctype(type_spec, &assoc.quals);
                     if controlling_ct
                         .as_ref()
                         .is_some_and(|ct| ct.generic_association_matches(&assoc_ct))
@@ -975,10 +1002,17 @@ impl<'a> ExprTypeChecker<'a> {
             while let TypeSpecifier::Pointer(inner, _) = leaf {
                 leaf = inner;
             }
-            let base =
-                crate::common::type_builder::specifier_cvr_with(leaf, quals.base_cvr, &|n| {
+            let base = match leaf {
+                // `typeof(lvalue)` is the lvalue's type with the object's
+                // own qualifiers (`__typeof__(counter) *` points at an
+                // atomic `counter`'s type); of anything else, unknown.
+                TypeSpecifier::Typeof(operand, false) => self
+                    .lvalue_object_cvr(operand)
+                    .map(|own| own | quals.base_cvr),
+                _ => crate::common::type_builder::specifier_cvr_with(leaf, quals.base_cvr, &|n| {
                     self.types.typedef_top_cvr(n)
-                });
+                }),
+            };
             crate::common::type_builder::record_pointer_quals(&mut ty, base, &levels);
         }
         ty
@@ -1518,6 +1552,9 @@ impl<'a> ExprTypeChecker<'a> {
         if let Some(op) = crate::common::avx_widen::AvxWiden::raw_builtin(name) {
             return Some(CType::Vector(Box::new(op.result_element()), 32));
         }
+        if let Some(ct) = crate::frontend::sema::builtins::x86_vector_builtin_ctype(name) {
+            return Some(ct);
+        }
         if let Some(ct) = crate::frontend::sema::builtins::gcc_compat_builtin_ctype(name) {
             return Some(ct);
         }
@@ -1530,59 +1567,11 @@ impl<'a> ExprTypeChecker<'a> {
                 Some(CType::ULongLong)
             }
             // Float-returning builtins
-            "__builtin_inf"
-            | "__builtin_huge_val"
-            | "__builtin_nan"
-            | "__builtin_nans"
-            | "__builtin_fma"
-            | "__builtin_trunc"
-            | "__builtin_rint"
-            | "__builtin_nearbyint"
-            | "__builtin_roundeven"
-            | "__builtin_fabs"
-            | "__builtin_sqrt"
-            | "__builtin_sin"
-            | "__builtin_cos"
-            | "__builtin_log"
-            | "__builtin_log2"
-            | "__builtin_exp"
-            | "__builtin_pow"
-            | "__builtin_floor"
-            | "__builtin_ceil"
-            | "__builtin_round"
-            | "__builtin_fmin"
-            | "__builtin_fmax"
-            | "__builtin_copysign"
-            | "__builtin_nextafter" => Some(CType::Double),
+            "__builtin_inf" | "__builtin_huge_val" | "__builtin_nans" => Some(CType::Double),
 
-            "__builtin_inff"
-            | "__builtin_huge_valf"
-            | "__builtin_nanf"
-            | "__builtin_nansf"
-            | "__builtin_fmaf"
-            | "__builtin_truncf"
-            | "__builtin_rintf"
-            | "__builtin_nearbyintf"
-            | "__builtin_roundevenf"
-            | "__builtin_fabsf"
-            | "__builtin_sqrtf"
-            | "__builtin_sinf"
-            | "__builtin_cosf"
-            | "__builtin_logf"
-            | "__builtin_expf"
-            | "__builtin_powf"
-            | "__builtin_floorf"
-            | "__builtin_ceilf"
-            | "__builtin_roundf"
-            | "__builtin_copysignf"
-            | "__builtin_nextafterf" => Some(CType::Float),
+            "__builtin_inff" | "__builtin_huge_valf" | "__builtin_nansf" => Some(CType::Float),
 
-            "__builtin_infl"
-            | "__builtin_huge_vall"
-            | "__builtin_nanl"
-            | "__builtin_nansl"
-            | "__builtin_fabsl"
-            | "__builtin_nextafterl" => Some(CType::LongDouble),
+            "__builtin_infl" | "__builtin_huge_vall" | "__builtin_nansl" => Some(CType::LongDouble),
 
             // _Float16 & __bf16 builtins (GCC 16.2 / C23 TS 18661-3).
             "__builtin_inff16"
@@ -1608,16 +1597,10 @@ impl<'a> ExprTypeChecker<'a> {
             // _Float128 builtins (sema/builtins.rs): binary128 results.
             "__builtin_inff128"
             | "__builtin_huge_valf128"
-            | "__builtin_nanf128"
             | "__builtin_nansf128"
-            | "__builtin_copysignf128"
-            | "__builtin_fabsf128"
             | "__builtin_infq"
             | "__builtin_huge_valq"
-            | "__builtin_nanq"
-            | "__builtin_nansq"
-            | "__builtin_copysignq"
-            | "__builtin_fabsq" => Some(CType::Float128),
+            | "__builtin_nansq" => Some(CType::Float128),
 
             // Integer-returning builtins
             "__builtin_fpclassify"
@@ -1658,9 +1641,6 @@ impl<'a> ExprTypeChecker<'a> {
             | "__builtin_parity"
             | "__builtin_parityl"
             | "__builtin_parityll"
-            | "__builtin_ffs"
-            | "__builtin_ffsl"
-            | "__builtin_ffsll"
             | "__builtin_types_compatible_p"
             | "__builtin_classify_type"
             | "__builtin_constant_p"
@@ -1674,23 +1654,17 @@ impl<'a> ExprTypeChecker<'a> {
             "__builtin_expect" | "__builtin_expect_with_probability" => Some(CType::Long),
 
             // Complex component extraction
-            "creal" | "__builtin_creal" | "cimag" | "__builtin_cimag" => Some(CType::Double),
-            "crealf" | "__builtin_crealf" | "cimagf" | "__builtin_cimagf" => Some(CType::Float),
-            "creall" | "__builtin_creall" | "cimagl" | "__builtin_cimagl" => {
-                Some(CType::LongDouble)
-            }
-            "cabs" | "__builtin_cabs" => Some(CType::Double),
-            "cabsf" | "__builtin_cabsf" => Some(CType::Float),
-            "cabsl" | "__builtin_cabsl" => Some(CType::LongDouble),
-            "carg" | "__builtin_carg" => Some(CType::Double),
-            "cargf" | "__builtin_cargf" => Some(CType::Float),
+            "creal" | "cimag" => Some(CType::Double),
+            "crealf" | "cimagf" => Some(CType::Float),
+            "creall" | "cimagl" => Some(CType::LongDouble),
+            "cabs" => Some(CType::Double),
+            "cabsf" => Some(CType::Float),
+            "cabsl" => Some(CType::LongDouble),
+            "carg" => Some(CType::Double),
+            "cargf" => Some(CType::Float),
 
             // Memory/string builtins returning pointers
-            "__builtin_memcpy"
-            | "__builtin_memmove"
-            | "__builtin_memset"
-            | "__builtin_alloca"
-            | "__builtin_alloca_with_align"
+            "__builtin_alloca_with_align"
             | "alloca"
             | "__builtin_frame_address"
             | "__builtin_return_address"
@@ -1705,13 +1679,10 @@ impl<'a> ExprTypeChecker<'a> {
             | "__builtin_va_start"
             | "__builtin_va_end"
             | "__builtin_va_copy"
-            | "__builtin_abort"
-            | "__builtin_exit"
             | "__builtin_trap"
             | "__builtin_unreachable"
             | "__builtin_prefetch"
             | "__builtin_ia32_prefetch"
-            | "__builtin___clear_cache"
             | "__builtin_cpu_init" => Some(CType::Void),
 
             // CPU feature detection

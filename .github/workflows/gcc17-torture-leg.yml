@@ -68,8 +68,12 @@ jobs:
       GCC_TORTURE_GCC_VERSION: '16.2'
       # Preserve runner exit-1 reports for the separate per-case ratchet below;
       # exit 2 remains fatal. A whole-corpus job passes only if the validated
-      # report matches the checked-in identity and every prior outcome. Filtered
-      # dispatches are explicitly advisory and do not run that ratchet.
+      # report matches the checked-in identity of what ran and every prior
+      # outcome. Where it ran -- the kernel and the build of the runner image,
+      # which one label is served with in several variants at once -- is
+      # reported and does not refuse (HOST-IDENTITY-2026-11-26.md beside the
+      # baselines). Filtered dispatches are explicitly advisory and do not run
+      # that ratchet.
       GCC_TORTURE_ADVISORY_FAILURES: '1'
       GCC_TORTURE_FLAGS: ${{ inputs.flags }}
       GCC_TORTURE_FILTER: ${{ inputs.filter }}

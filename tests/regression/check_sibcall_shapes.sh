@@ -669,6 +669,79 @@ if "$gcc" --version 2>/dev/null | grep -c "16\.2" >/dev/null; then
 fi
 echo "PASS: branch-arm sibling calls (shapes, refusals, alignment, runtime parity: $ref)"
 
+# --- Sibling calls through a pointer that is loaded --------------------------
+# `icall` above jumps through a parameter, which is in a register when the
+# function begins.  A target that is LOADED -- a member, a table entry, a
+# global -- has a home in the frame, and the code generator parks it there
+# before it moves it to %r10.  Nothing reads the home: the store and the frame
+# around it are dead.  Both stayed, because the two passes that would take
+# them (the never-read stores of `dead_code`, the dead leaf frame of
+# `frame_compact`) read `jmpq *%r10` as a jump they could not follow:
+#
+#     subq $8, %rsp
+#     movq (%rdi), %r10
+#     movq %r10, 0(%rsp)
+#     movl $1, %edi
+#     addq $8, %rsp
+#     jmpq *%r10
+#
+# GCC 16.2: `movq (%rdi), %rax; movl $1, %edi; jmp *%rax`.  The marker the
+# code generator publishes behind a sibling call's jump says what it is, and
+# each function below is now its load, its argument and its jump, with no
+# mention of %rsp.  The kill switch brings back a call that returns, and the
+# values are the same either way.
+cat > "$tmp/loaded.c" <<'C'
+struct ops { int (*fn)(int); };
+int through_member(struct ops *o) { return o->fn(1); }
+int through_table(int (**tab)(int), int i) { return tab[i](3); }
+extern int (*gfp)(int);
+int through_global(void) { return gfp(4); }
+C
+"$CCC" -O2 -S "$tmp/loaded.c" -o "$tmp/loaded.s"
+CCC_NO_SIBCALL=1 "$CCC" -O2 -S "$tmp/loaded.c" -o "$tmp/loaded_ctl.s"
+for spec in 'through_member 3' 'through_table 4' 'through_global 3'; do
+    set -- $spec
+    b=$(body "$tmp/loaded.s" "$1")
+    has "$b" '^[[:space:]]*jmpq\? \*' || { echo "$1: no jump through the loaded target:" >&2; echo "$b" >&2; exit 1; }
+    lacks "$b" '^[[:space:]]*call' || { echo "$1: tail still calls" >&2; exit 1; }
+    lacks "$b" '^[[:space:]]*ret$' || { echo "$1: tail still returns" >&2; exit 1; }
+    lacks "$b" '%rsp' || { echo "$1: a frame, or the target parked in one, around a sibling call:" >&2; echo "$b" >&2; exit 1; }
+    n=$(insns "$b" | grep -c .)
+    [ "$n" -le "$2" ] || { echo "$1: $n instructions, at most $2 expected:" >&2; echo "$b" >&2; exit 1; }
+    c=$(body "$tmp/loaded_ctl.s" "$1")
+    has "$c" '^[[:space:]]*call' || { echo "$1 (control): kill switch lost the call" >&2; exit 1; }
+    has "$c" '^[[:space:]]*ret$' || { echo "$1 (control): kill switch lost the return" >&2; exit 1; }
+done
+cat > "$tmp/loaded_rt.c" <<'C'
+#include <stdio.h>
+struct ops { int (*fn)(int); };
+__attribute__((noinline)) int through_member(struct ops *o) { return o->fn(1); }
+__attribute__((noinline)) int through_table(int (**tab)(int), int i) { return tab[i](3); }
+int (*gfp)(int);
+__attribute__((noinline)) int through_global(void) { return gfp(4); }
+static int twice(int x) { return 2 * x; }
+static int plus7(int x) { return x + 7; }
+int main(void) {
+    struct ops o = { twice };
+    int (*tab[2])(int) = { twice, plus7 };
+    gfp = plus7;
+    int a = through_member(&o), b = through_table(tab, 1), c = through_global();
+    o.fn = plus7;
+    gfp = twice;
+    printf("%d %d %d %d %d %d\n", a, b, c, through_member(&o), through_table(tab, 0), through_global());
+    return 0;
+}
+C
+for sib in on off; do
+    for opt in -O1 -O2 -O3 -Os; do
+        if [ "$sib" = on ]; then "$CCC" $opt "$tmp/loaded_rt.c" -o "$tmp/loaded_rt"
+        else CCC_NO_SIBCALL=1 "$CCC" $opt "$tmp/loaded_rt.c" -o "$tmp/loaded_rt"; fi
+        out=$("$tmp/loaded_rt")
+        [ "$out" = "2 10 11 8 6 8" ] || { echo "loaded targets $opt sibcalls=$sib: '$out'" >&2; exit 1; }
+    done
+done
+echo "PASS: sibling calls through a loaded target keep neither the target nor a frame"
+
 # The shared driver computes hints on every target.  i686 implements no
 # conversion and must not grow a silent partial tail-call path: its code is
 # identical with and without the kill switch.  AArch64 and RISC-V convert

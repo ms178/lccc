@@ -73,21 +73,32 @@ else
 fi
 
 # --- 2. detector self-test -------------------------------------------------
-# A volatile operand legitimately keeps the legacy address form (the register
-# path refuses volatile objects), so its emitted body MUST still show the
-# over-aligned frame idiom.  That makes the detector below non-vacuous: it is
-# run against text that really carries the shape it forbids.
+# The detector is run against text that really carries the shape it forbids:
+# a 256-bit object whose address leaves the function. The callee may read it
+# with an aligned load, so its 32-byte alignment is observable and every
+# compiler has to produce it (GCC 16.2 realigns the frame once, lccc masks
+# the address where it takes it); the idiom cannot be optimized out of this
+# body the way it was out of the previous one.
+#
+# (The previous body was `_mm256_fmadd_ps(*p, b, a)` through a volatile
+# pointer. Its homes are reached by unaligned-safe accesses only, and once
+# the FMA3 operands had their rows in `pointer_vector_arg_width` the homes
+# lost their alignment, the idiom went, and this self-test failed on better
+# code. A self-test must pin what has to stay, not what happens to.)
 cat > "$WORK/legacy.c" <<'EOF'
 #include <immintrin.h>
-__m256 legacy_probe(__m256 a, __m256 b, volatile __m256 *p) {
-    return _mm256_fmadd_ps(*p, b, a);
+void legacy_sink(__m256 *);
+__m256 legacy_probe(__m256 a, __m256 b) {
+    __m256 t = _mm256_fmadd_ps(a, b, a);
+    legacy_sink(&t);
+    return t;
 }
 EOF
 "$CC" -O2 -w -mavx2 -mfma -S "$WORK/legacy.c" -o "$WORK/legacy.s" 2>/dev/null \
     || { echo "FAIL: cannot emit the detector self-test" >&2; exit 1; }
 legacy_body=$(awk '/^legacy_probe:/{on=1;next} on&&/^[[:space:]]*\.size/{exit} on' "$WORK/legacy.s")
 if grep -qE 'andq[[:space:]]+\$-32' <<<"$legacy_body"; then
-    echo "  ok  detector self-test: the legacy address form is recognised"
+    echo "  ok  detector self-test: an escaping 32-byte home is recognised"
 else
     echo "FAIL: the detector self-test emitted no over-aligned frame idiom," >&2
     echo "      so the homing assertions below could not fail.  Body:" >&2

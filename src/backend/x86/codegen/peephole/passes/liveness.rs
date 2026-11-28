@@ -1041,6 +1041,10 @@ fn mnemonic_is_known(t: &str) -> bool {
         "vzeroupper",
         "vzeroall",
         "xgetbv",
+        // `kmov{b,w,d,q}`: every operand is explicit, and the only general
+        // register a form can write is its last operand (`is_read_modify_write`
+        // says it is written and not read).
+        "kmov",
     ];
     KNOWN.iter().any(|k| t.starts_with(k))
         // The central implicit-operand oracle doubles as a knowledge base:
@@ -1986,6 +1990,12 @@ impl FileLiveness {
         //     jmpq *%rdx
         // with the table emitted INLINE as an interleaved .rodata island:
         //     .LjtN: .long .LBBa - .LjtN   (× k entries)
+        // and, where the code will not move (-fno-pic, the kernel code
+        // model, an executable linked by the same invocation), to
+        //     jmpq *.LjtN(,%rax,8)
+        // over
+        //     .LjtN: .quad .LBBa           (× k entries)
+        // (`absolute_table_targets`).
         // A `jmpq *` is generically unresolvable, and ONE such line marks
         // the whole function unanalysable — silently disabling every
         // liveness-gated transform in it. The sqlite_varint / glibc_memcmp
@@ -2379,12 +2389,13 @@ impl FileLiveness {
 
     /// Resolve the codegen's jump-table dispatch sites to their static
     /// successor sets. Returns a slot per line (`None` = not a resolved
-    /// table dispatch). See the call site for the shape being matched:
+    /// table dispatch). See the call site for the shapes being matched:
     /// `leaq .LjtN(%rip), %rB; movslq (%rB,%rA,4), %rT; addq %rB, %rT;
     /// jmpq *%rT` with the table `.LjtN: .long target - .LjtN …` emitted
-    /// inline. The match is deliberately exact: a computed goto or a tail
-    /// call sharing a register with a nearby leaq must NOT be mistaken
-    /// for a table (that would invent CFG edges).
+    /// inline, and the one instruction of a position-fixed build
+    /// ([`Self::absolute_table_targets`]). The match is deliberately exact:
+    /// a computed goto or a tail call sharing a register with a nearby
+    /// leaq must NOT be mistaken for a table (that would invent CFG edges).
     fn resolve_jump_tables(
         store: &LineStore,
         infos: &[LineInfo],
@@ -2414,6 +2425,10 @@ impl FileLiveness {
                 continue;
             }
             let t = infos[n].trimmed(store.get(n));
+            if let Some(targets) = Self::absolute_table_targets(store, infos, t, &resolve, end) {
+                out[n - start] = Some(targets);
+                continue;
+            }
             // `jmpq *%rT` — take the target register. The thunk-extern
             // retpoline form `jmp __x86_indirect_thunk_rT` dispatches
             // through the same %rT (read by the thunk symbol): the
@@ -2529,6 +2544,53 @@ impl FileLiveness {
             out[n - start] = Some(targets);
         }
         out
+    }
+
+    /// The targets of `jmpq *.Ljt_N(,%rA,8)`, the dispatch through an
+    /// absolute table.
+    ///
+    /// `emit_switch_jump_table` writes this form wherever the code will not
+    /// move: under `-fno-pic`, under the kernel code model, and when the
+    /// driver knows the link to be a position-fixed executable -- which is
+    /// what `lccc file.c -o prog` is, and so what a benchmark is built as.
+    /// One instruction dispatches, and the table is a run of `.quad label`
+    /// directly under its `.Ljt_` label, inside the function.  Unresolved,
+    /// it made every such function unanalysable, exactly as the
+    /// position-independent form once did: `main` of `sqlite_varint.c` kept
+    /// five dead register moves in the two loops round its `switch`.
+    ///
+    /// Exact, like the form above: the name is the code generator's (a table
+    /// a program writes for a computed goto has another, lives in a data
+    /// section and is read into a register first), the operand has no base
+    /// and one index scaled by a pointer, the label is one of this function,
+    /// and every entry down to the first line that is no `.quad` names a
+    /// label of this function.
+    fn absolute_table_targets(
+        store: &LineStore,
+        infos: &[LineInfo],
+        dispatch: &str,
+        resolve: &dyn Fn(&str) -> Option<usize>,
+        end: usize,
+    ) -> Option<Vec<usize>> {
+        let (table, operand) = dispatch.strip_prefix("jmpq *")?.split_once('(')?;
+        if !table.starts_with(".Ljt_") {
+            return None;
+        }
+        let index = operand.strip_prefix(",%")?.strip_suffix(",8)")?;
+        if index.is_empty() || !index.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return None;
+        }
+        let mut targets = Vec::new();
+        for k in resolve(table)? + 1..end {
+            if infos[k].is_nop() {
+                continue;
+            }
+            let Some(entry) = infos[k].trimmed(store.get(k)).strip_prefix(".quad ") else {
+                break;
+            };
+            targets.push(resolve(entry.trim_ascii())?);
+        }
+        (!targets.is_empty()).then_some(targets)
     }
 
     /// The effect of line `n`, with its successor lines appended to `edges`
@@ -3209,6 +3271,11 @@ mod tests {
             "cvttsd2si %xmm0, %rax",
             "vcvttss2si %xmm1, %eax",
             "vcvtsd2si %xmm2, %rcx",
+            // Mask register -> GPR.
+            "kmovb %k1, %eax",
+            "kmovw %k1, %eax",
+            "kmovd %k2, %r8d",
+            "kmovq %k3, %rax",
         ];
         for line in dest_only {
             assert!(
@@ -3290,6 +3357,63 @@ mod tests {
             .find(|&n| store.get(n).trim_ascii() == "movq %rdx, %rax")
             .expect("fixture has the copy");
         assert_eq!(lv.live_after(copy, 0), Some(false));
+    }
+
+    /// The `kmov` behind an AVX-512 compare writes its general register and
+    /// reads none: what the register held in front of the compare (here the
+    /// copy of a pointer the load went through) is dead behind its last
+    /// read. The other direction reads the general register and writes none.
+    #[test]
+    fn a_mask_moved_to_a_gpr_kills_it_and_a_gpr_moved_to_a_mask_reads_it() {
+        let (store, _infos, lv) = build(concat!(
+            ".text\nf:\n.cfi_startproc\n",
+            "    movq %rdx, %rax\n",
+            "    vmovdqu64 (%rax), %zmm1\n",
+            "    vpcmpd $1, %zmm1, %zmm0, %k1\n",
+            "    kmovw %k1, %eax\n",
+            "    andq %rax, %rdi\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        let line = |text: &str| {
+            (0..store.len())
+                .find(|&n| store.get(n).trim_ascii() == text)
+                .expect("the fixture has the line")
+        };
+        // Dead behind the load: the next thing that happens to %rax is a write.
+        assert_eq!(
+            lv.live_after(line("vmovdqu64 (%rax), %zmm1"), 0),
+            Some(false)
+        );
+        // Alive between the copy and the load, and behind the `kmovw`.
+        assert_eq!(lv.live_after(line("movq %rdx, %rax"), 0), Some(true));
+        assert_eq!(lv.live_after(line("kmovw %k1, %eax"), 0), Some(true));
+
+        let (store, _infos, lv) = build(concat!(
+            ".text\ng:\n.cfi_startproc\n",
+            "    movl %edi, %eax\n",
+            "    kmovw %eax, %k1\n",
+            "    kmovw %k1, (%rsi)\n",
+            "    kmovq (%rcx), %k2\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        let line = |text: &str| {
+            (0..store.len())
+                .find(|&n| store.get(n).trim_ascii() == text)
+                .expect("the fixture has the line")
+        };
+        // `kmovw %eax, %k1` reads %rax; the store and the load read their
+        // address registers and write no general register. (The load goes
+        // through %rcx: a `ret` without the return markers reads %rdx.)
+        assert_eq!(lv.live_after(line("movl %edi, %eax"), 0), Some(true));
+        assert_eq!(lv.live_after(line("kmovw %eax, %k1"), 0), Some(false));
+        assert_eq!(lv.live_after(line("kmovw %eax, %k1"), 6), Some(true));
+        assert_eq!(lv.live_after(line("kmovw %k1, (%rsi)"), 6), Some(false));
+        assert_eq!(lv.live_after(line("kmovw %k1, (%rsi)"), 1), Some(true));
+        assert_eq!(lv.live_after(line("kmovq (%rcx), %k2"), 1), Some(false));
     }
 
     fn build(asm: &str) -> (LineStore, Vec<LineInfo>, FileLiveness) {
@@ -4001,6 +4125,247 @@ mod tests {
             Some(true),
             "the thunk reads %rdx: the staging write stays live"
         );
+    }
+
+    /// A `switch` of a position-fixed build: one instruction dispatches
+    /// through a table of `.quad` labels.  `table` is the lines of the table
+    /// under its label; `dispatch` the dispatching instruction.
+    fn absolute_switch(dispatch: &str, table: &str) -> String {
+        format!(
+            concat!(
+                "foo:\n",
+                ".cfi_startproc\n",
+                "    movl %edi, %eax\n",
+                "    movl %esi, %r8d\n",
+                "    movl %edx, %r9d\n",
+                "    movl %ecx, %r11d\n",
+                "    cmpl $2, %eax\n",
+                "    jae .LBB2\n",
+                "    {dispatch}\n",
+                ".section .rodata\n",
+                ".align 8\n",
+                ".Ljt_0:\n",
+                "{table}",
+                ".section .text,\"ax\",@progbits\n",
+                ".LBB0:\n",
+                "    movl %r8d, %eax\n",
+                "    ret\n",
+                ".LBB1:\n",
+                "    movl %r9d, %eax\n",
+                "    ret\n",
+                ".LBB2:\n",
+                "    xorl %eax, %eax\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            ),
+            dispatch = dispatch,
+            table = table,
+        )
+    }
+
+    const TWO_ARMS: &str = "    .quad .LBB0\n    .quad .LBB1\n";
+
+    /// The dispatch of a position-fixed build resolves to its table's
+    /// labels: the function is analysable, what an arm reads is live at the
+    /// dispatch, what no arm reads is dead there, and the index is read by
+    /// the dispatch itself.
+    #[test]
+    fn absolute_switch_dispatch_is_analysable() {
+        let asm = absolute_switch("jmpq *.Ljt_0(,%rax,8)", TWO_ARMS);
+        let (store, _infos, lv) = build(&asm);
+        let dispatch = line_of(&store, "jmpq *.Ljt_0");
+        let range_test = line_of(&store, "cmpl $2, %eax");
+        // %r8 is read by the first arm and %r9 by the second: both live.
+        assert_eq!(lv.live_after(dispatch, 8), Some(true));
+        assert_eq!(lv.live_after(dispatch, 9), Some(true));
+        // %r11 is read by no arm and not by the default: a dead write.
+        assert_eq!(
+            lv.live_after(line_of(&store, "movl %ecx, %r11d"), 11),
+            Some(false)
+        );
+        assert_eq!(lv.live_after(dispatch, 11), Some(false));
+        // The index is read by the dispatch, and by nothing behind it: every
+        // arm overwrites %rax.
+        assert_eq!(lv.live_after(range_test, 0), Some(true));
+        assert_eq!(lv.live_after(dispatch, 0), Some(false));
+        // The default is reached by the range test, not by the table: what
+        // only the first arm reads is dead on that edge's far side.
+        assert_eq!(
+            lv.live_after(line_of(&store, "xorl %eax, %eax"), 8),
+            Some(false)
+        );
+    }
+
+    /// One arm reads a register the others do not: the table decides whether
+    /// it is live at the dispatch, entry by entry.
+    #[test]
+    fn absolute_switch_liveness_follows_the_table_entries() {
+        let only_first = absolute_switch(
+            "jmpq *.Ljt_0(,%rax,8)",
+            "    .quad .LBB0\n    .quad .LBB0\n",
+        );
+        let (store, _infos, lv) = build(&only_first);
+        let dispatch = line_of(&store, "jmpq *.Ljt_0");
+        assert_eq!(lv.live_after(dispatch, 8), Some(true));
+        assert_eq!(
+            lv.live_after(dispatch, 9),
+            Some(false),
+            "no entry names .LBB1"
+        );
+        assert_eq!(
+            lv.live_after(line_of(&store, "movl %edx, %r9d"), 9),
+            Some(false)
+        );
+
+        let through_default = absolute_switch(
+            "jmpq *.Ljt_0(,%rax,8)",
+            "    .quad .LBB1\n    .quad .LBB2\n",
+        );
+        let (store, _infos, lv) = build(&through_default);
+        let dispatch = line_of(&store, "jmpq *.Ljt_0");
+        assert_eq!(
+            lv.live_after(dispatch, 8),
+            Some(false),
+            "no entry names .LBB0"
+        );
+        assert_eq!(lv.live_after(dispatch, 9), Some(true));
+    }
+
+    /// Any index register, and the extended ones, are read through the
+    /// operand.
+    #[test]
+    fn absolute_switch_reads_its_index_register() {
+        for (reg, fam) in [("rcx", 1u8), ("rdx", 2), ("r10", 10), ("r15", 15)] {
+            let asm = absolute_switch(&format!("jmpq *.Ljt_0(,%{reg},8)"), TWO_ARMS);
+            let (store, _infos, lv) = build(&asm);
+            let range_test = line_of(&store, "cmpl $2, %eax");
+            assert_eq!(lv.live_after(range_test, fam), Some(true), "{reg}");
+            assert_eq!(
+                lv.live_after(line_of(&store, "jmpq *.Ljt_0"), 8),
+                Some(true),
+                "{reg}"
+            );
+        }
+    }
+
+    /// Anything but the code generator's own table leaves the jump what it
+    /// was, an unknown transfer, and the function unanalysable: a table of
+    /// another name, another operand, an entry that names no label of the
+    /// function, no entry at all, a table that is not in the function.
+    #[test]
+    fn only_the_code_generators_absolute_table_is_resolved() {
+        let unresolved = |dispatch: &str, table: &str, what: &str| {
+            let asm = absolute_switch(dispatch, table);
+            let (store, _infos, lv) = build(&asm);
+            let probe = line_of(&store, "movl %ecx, %r11d");
+            assert_eq!(lv.live_after(probe, 11), None, "{what}");
+        };
+        let ours = "jmpq *.Ljt_0(,%rax,8)";
+        // The dispatch.
+        unresolved("jmpq *.Ljt_0(%rbx,%rax,8)", TWO_ARMS, "a base register");
+        unresolved("jmpq *.Ljt_0(,%rax,4)", TWO_ARMS, "four bytes a slot");
+        unresolved("jmpq *.Ljt_0(,%rax,1)", TWO_ARMS, "one byte a slot");
+        unresolved("jmpq *.Ljt_0(,%rax)", TWO_ARMS, "no scale");
+        unresolved("jmpq *.Ljt_0(%rip)", TWO_ARMS, "no index");
+        unresolved("jmpq *.Ljt_0", TWO_ARMS, "no operand");
+        unresolved(
+            "jmpq *.Ljt_0(,%rax,8)+8",
+            TWO_ARMS,
+            "something behind the operand",
+        );
+        unresolved(
+            "jmpq *8+.Ljt_0(,%rax,8)",
+            TWO_ARMS,
+            "an offset into the table",
+        );
+        unresolved("jmpq *.Ljt_0(,%ra x,8)", TWO_ARMS, "no register name");
+        unresolved("jmpq *.Ljt_0(,%,8)", TWO_ARMS, "an empty register name");
+        unresolved(
+            "jmpq *.Ljt_9(,%rax,8)",
+            TWO_ARMS,
+            "a table that is not here",
+        );
+        unresolved("jmpq *table(,%rax,8)", TWO_ARMS, "a table of another name");
+        unresolved("jmpq *%rax", TWO_ARMS, "a register");
+        // The table.
+        unresolved(ours, "", "no entry");
+        unresolved(
+            ours,
+            "    .long .LBB0\n    .long .LBB1\n",
+            "entries of four bytes",
+        );
+        unresolved(
+            ours,
+            "    .quad .LBB0\n    .quad elsewhere\n",
+            "a label of another function",
+        );
+        unresolved(ours, "    .quad .LBB0\n    .quad 0\n", "a number");
+        unresolved(ours, "    .quad .LBB0 + 4\n", "a label and an offset");
+        unresolved(ours, "    .quad .LBB0 - .Ljt_0\n", "a difference");
+        // A table of the function under a name that is not the code
+        // generator's: the same lines, the label spelled otherwise.
+        for name in [".Ltable", ".LBB9", "table", ".Ljt"] {
+            let asm = absolute_switch(ours, TWO_ARMS).replace(".Ljt_0", name);
+            let (store, _infos, lv) = build(&asm);
+            let probe = line_of(&store, "movl %ecx, %r11d");
+            assert_eq!(lv.live_after(probe, 11), None, "{name}");
+        }
+    }
+
+    /// The table is the run of `.quad` under its label and ends with it: a
+    /// label named by data behind the run is no successor.
+    #[test]
+    fn an_absolute_table_ends_at_the_first_line_that_is_no_entry() {
+        let asm = absolute_switch(
+            "jmpq *.Ljt_0(,%rax,8)",
+            "    .quad .LBB0\n    .quad .LBB0\n.align 8\n    .quad .LBB1\n",
+        );
+        let (store, _infos, lv) = build(&asm);
+        let dispatch = line_of(&store, "jmpq *.Ljt_0");
+        assert_eq!(lv.live_after(dispatch, 8), Some(true));
+        assert_eq!(lv.live_after(dispatch, 9), Some(false), "behind the run");
+    }
+
+    /// The two forms of one `switch` agree line for line on what is live
+    /// where the arms and the instructions ahead of the dispatch are.
+    #[test]
+    fn the_absolute_and_the_relative_dispatch_agree() {
+        let absolute = absolute_switch("jmpq *.Ljt_0(,%rax,8)", TWO_ARMS);
+        let relative = absolute
+            .replace(
+                "    jmpq *.Ljt_0(,%rax,8)\n",
+                concat!(
+                    "    leaq .Ljt_0(%rip), %rcx\n",
+                    "    movslq (%rcx,%rax,4), %rdx\n",
+                    "    addq %rcx, %rdx\n",
+                    "    jmpq *%rdx\n",
+                ),
+            )
+            .replace("    .quad .LBB0\n", "    .long .LBB0 - .Ljt_0\n")
+            .replace("    .quad .LBB1\n", "    .long .LBB1 - .Ljt_0\n");
+        assert_ne!(absolute, relative);
+        let (abs_store, _a, abs_lv) = build(&absolute);
+        let (rel_store, _r, rel_lv) = build(&relative);
+        for probe in [
+            "movl %esi, %r8d",
+            "movl %ecx, %r11d",
+            "cmpl $2, %eax",
+            "movl %r8d, %eax",
+            "movl %r9d, %eax",
+            "xorl %eax, %eax",
+        ] {
+            let (a, r) = (line_of(&abs_store, probe), line_of(&rel_store, probe));
+            // %rcx and %rdx stage the relative dispatch and are dead in both
+            // ahead of it; compare what the function computes with.
+            for fam in [0u8, 8, 9, 11] {
+                assert_eq!(
+                    abs_lv.live_after(a, fam),
+                    rel_lv.live_after(r, fam),
+                    "`{probe}`, register {fam}"
+                );
+                assert!(abs_lv.live_after(a, fam).is_some(), "`{probe}`");
+            }
+        }
     }
 
     #[test]

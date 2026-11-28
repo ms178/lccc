@@ -123,6 +123,13 @@ if [ -f "$CORPUS" ]; then
 fi
 
 # --- 2. counts, with an isolated disable control ---------------------------
+# A temporary that is stored and read straight back has two ways out. The IR
+# pass (`vecstorefwd`) deletes both accesses and the slot. Without it the
+# slot survives into the assembly, and the peephole's store forwarding serves
+# the reload from the register that wrote the slot: at 16 bytes always, at 32
+# bytes since a 32-byte store has a mapping. For one reader either stage alone
+# reaches the budget, so the control that has to cost something is BOTH off;
+# for two readers only the IR pass has the shape, and that row is held to it.
 body() {   # body <asm> <name>: instructions from the label to `.size`.
     awk -v F="$2:" '$0==F{on=1;next} on&&/^[[:space:]]*\.size/{exit} on' "$1" \
         | grep -cE '^[[:space:]]+[a-z]'
@@ -132,10 +139,14 @@ body() {   # body <asm> <name>: instructions from the label to `.size`.
     || { echo "FAIL: cannot emit assembly" >&2; exit 1; }
 CCC_DISABLE_PASSES=vecstorefwd "$LCCC" -O2 -w -mavx2 -S "$FIXTURE" -o "$WORK/off.s" 2>/dev/null \
     || { echo "FAIL: cannot emit the counterfactual assembly" >&2; exit 1; }
+# `store_fwd` is the forwarder's turn in phase 2 and `phase2b` its second one.
+CCC_DISABLE_PASSES=vecstorefwd CCC_PEEPHOLE_SKIP=store_fwd,phase2b \
+    "$LCCC" -O2 -w -mavx2 -S "$FIXTURE" -o "$WORK/none.s" 2>/dev/null \
+    || { echo "FAIL: cannot emit the assembly without store forwarding" >&2; exit 1; }
 
 fail=0
 # check_budget <name> <budget>: the body must fit the budget and be non-empty.
-# Used where the disabled pass is no longer a distinct counterfactual.
+# Used where no forwarding stage is a distinct counterfactual any more.
 check_budget() {
     local name=$1 budget=$2 on
     on=$(body "$WORK/on.s" "$name")
@@ -147,58 +158,67 @@ check_budget() {
         echo "FAIL: $name costs $on instructions (budget $budget)" >&2
         fail=1; return
     fi
-    echo "  ok  $name costs $on instruction(s) (budget $budget; register-homed, pass-off $(body "$WORK/off.s" "$name"))"
+    echo "  ok  $name costs $on instruction(s) (budget $budget; IR pass off" \
+        "$(body "$WORK/off.s" "$name"), no forwarding $(body "$WORK/none.s" "$name"))"
 }
 
-# check <name> <budget>: the forwarded body must fit the budget, the disabled
-# pass must be strictly worse, and no staging reload may survive.
+# check <name> <budget> [ir]: the forwarded body must fit the budget, and with
+# no forwarding stage at all it must be strictly worse. With `ir` the IR pass
+# alone is the counterfactual: disabling just it must cost something too.
 check() {
-    local name=$1 budget=$2 on off
+    local name=$1 budget=$2 held=${3:-} on off none bad=0
     on=$(body "$WORK/on.s" "$name")
     off=$(body "$WORK/off.s" "$name")
-    if [ "$on" -eq 0 ] || [ "$off" -eq 0 ]; then
+    none=$(body "$WORK/none.s" "$name")
+    if [ "$on" -eq 0 ] || [ "$off" -eq 0 ] || [ "$none" -eq 0 ]; then
         echo "FAIL: no emitted body for '$name'" >&2
         fail=1; return
     fi
-    if [ "$off" -le "$on" ]; then
-        echo "FAIL: $name is $on instructions with the pass and $off without;" >&2
-        echo "      disabling it must cost something or this gate proves nothing" >&2
-        fail=1
+    if [ "$none" -le "$on" ]; then
+        echo "FAIL: $name is $on instructions with store forwarding and $none without" >&2
+        echo "      either stage; disabling both must cost something or this gate" >&2
+        echo "      proves nothing" >&2
+        bad=1
+    fi
+    if [ "$held" = ir ] && [ "$off" -le "$on" ]; then
+        echo "FAIL: $name is $on instructions with the IR pass and $off without;" >&2
+        echo "      only the IR pass has this shape, so disabling it must cost something" >&2
+        bad=1
     fi
     if [ "$on" -gt "$budget" ]; then
-        echo "FAIL: $name costs $on instructions (budget $budget, pre-fix $off)" >&2
-        printf '%s\n' "$text" | sed 's/^/        /' >&2
-        fail=1
+        echo "FAIL: $name costs $on instructions (budget $budget, no forwarding $none)" >&2
+        bad=1
     fi
-    if [ "$fail" = 0 ]; then
-        echo "  ok  $name costs $on instruction(s) (budget $budget, pre-fix $off)"
+    if [ "$bad" = 0 ]; then
+        echo "  ok  $name costs $on instruction(s) (budget $budget; IR pass off $off," \
+            "no forwarding $none)"
+    else
+        fail=1
     fi
 }
 
-# Measured, -O2 -mavx2, `on / off (GCC 16.2)`:
-#   float_256   loop store of a computed 256-bit value   14 / 18 (13)
-#   int_128     one 128-bit integer store                 3 /  4 (3)
-#   ps_256      single-shot 256-bit float store           4 /  8 (3, GCC
+# Measured, -O2 -mavx2: `on / IR pass off / no forwarding (GCC 16.2)`:
+#   float_256   loop store of a computed 256-bit value   14 / 14 / 18 (13)
+#   int_128     one 128-bit integer store                 3 /  3 /  7 (3)
+#   ps_256      single-shot 256-bit float store           4 /  4 /  8 (3, GCC
 #                                                        omits vzeroupper)
-#   chain_256   loop-invariant splats + forwarded store 22 / 24 (17)
-#   two_stores  one value read by two whole-vector stores 4 /  9 (4)
+#   chain_256   loop-invariant splats + forwarded store 22 / 22 / 22 (17)
+#   two_stores  one value read by two whole-vector stores 4 /  8 /  9 (4)
 check float_256 14
 check int_128 3
 check ps_256 4
-# chain_256 is budget-only. Its 256-bit result now has a YMM register home
-# (the straight-line 256-bit allocator in regalloc.rs), so the frame temporary
-# that the pass forwards no longer exists with or without the pass: the
-# counterfactual is 22 as well, below the 24 the pass used to save. The pass
-# still has a measured cost on float_256, int_128, ps_256 and two_stores above.
-# The budget still guards the forwarded body.
+# chain_256 is budget-only. Its 256-bit result has a YMM register home (the
+# straight-line 256-bit allocator in regalloc.rs), so the frame temporary that
+# either stage would forward does not exist: 22 in every configuration.
 check_budget chain_256 22
 
 # A value read by TWO stores is the multi-reader case: every reader is an
-# address-form store of the same width, so the pass forwards the register
+# address-form store of the same width, so the IR pass forwards the register
 # value to both and deletes the staging store and its frame slot.  Before the
 # generalized proof this shape kept a full stack round trip (9 instructions
-# with the pass, 9 without); it is 4 now, which is GCC's count exactly.
-check two_stores 4
+# with the pass, 9 without); it is 4 now, which is GCC's count exactly. The
+# peephole serves the first reader and leaves the slot for the second.
+check two_stores 4 ir
 
 if [ "$fail" != 0 ]; then
     echo "FAIL: whole-vector temporary stores are not forwarded" >&2

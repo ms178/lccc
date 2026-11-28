@@ -7,6 +7,7 @@
 
 use crate::backend::inline_asm::{AsmOperand, AsmOperandKind};
 use crate::common::types::IrType;
+use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::BlockId;
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -25,6 +26,81 @@ use std::fmt::Write;
 /// jump to a symbol no label of the function defines, it was a transfer to an
 /// unknown place, and register liveness gave up the whole function.
 pub(crate) const RETURN_THUNK_JUMP: &str = "jmp __x86_return_thunk";
+
+/// The x86-64 SIMD operations whose result is an integer the emitter leaves
+/// in `%rax`: a mask, a lane, a conversion, a test, a sum.
+///
+/// Each of them reads its vector operands into `%xmm0`/`%xmm1` (or their
+/// wider views), computes with those, `%k1` and `%rax`, and hands the result
+/// to `store_rax_to`, which writes a register as readily as a slot. None of
+/// that scratch is a register the allocator gives out, and the result is
+/// written after the last operand is read, so the result may live in a
+/// register, and may take the one an operand dies in.
+///
+/// In a slot, what nearly always follows read the slot back:
+/// `_mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) == 0xffff` was a store and a
+/// compare against memory, with a frame for the slot.
+///
+/// The list is every operation of `X86Codegen::emit_simd_scalar` and the
+/// eleven of `emit_intrinsic_impl` with the same shape; a test beside the
+/// emitters (`integer_result_contract_tests`) runs each one with its result
+/// in a register and holds it to the contract. The i686 emitters are others
+/// and are not on it.
+pub(crate) const X86_64_INTEGER_RESULTS: &[IntrinsicOp] = &[
+    IntrinsicOp::CmpeqEpu8Mask128,
+    IntrinsicOp::CmpeqEpu8Mask256,
+    IntrinsicOp::CmpeqEpu8Mask512,
+    IntrinsicOp::CmpEpi8Mask128,
+    IntrinsicOp::CmpEpi8Mask256,
+    IntrinsicOp::CmpEpi8Mask512,
+    IntrinsicOp::CmpeqEpu16Mask512,
+    IntrinsicOp::CmpEpu16Mask128,
+    IntrinsicOp::CmpEpu16Mask256,
+    IntrinsicOp::CmpEpi16Mask512,
+    IntrinsicOp::CmpEpi16Mask128,
+    IntrinsicOp::CmpEpi16Mask256,
+    IntrinsicOp::CmpeqEpu32Mask512,
+    IntrinsicOp::CmpEpu32Mask128,
+    IntrinsicOp::CmpEpu32Mask256,
+    IntrinsicOp::CmpEpi32Mask512,
+    IntrinsicOp::CmpEpi32Mask128,
+    IntrinsicOp::CmpEpi32Mask256,
+    IntrinsicOp::CmpeqEpu64Mask512,
+    IntrinsicOp::CmpEpu64Mask128,
+    IntrinsicOp::CmpEpu64Mask256,
+    IntrinsicOp::CmpEpi64Mask512,
+    IntrinsicOp::CmpEpi64Mask128,
+    IntrinsicOp::CmpEpi64Mask256,
+    IntrinsicOp::MovemaskPs128,
+    IntrinsicOp::MovemaskPd128,
+    IntrinsicOp::MovemaskPs256,
+    IntrinsicOp::MovemaskPd256,
+    IntrinsicOp::ExtractPs128,
+    IntrinsicOp::CvtSs2Si128,
+    IntrinsicOp::CvtSd2Si128,
+    IntrinsicOp::CvttSs2Si128,
+    IntrinsicOp::CvttSd2Si128,
+    IntrinsicOp::TestzPs128,
+    IntrinsicOp::TestzPs256,
+    IntrinsicOp::ReduceAddEpu32_512,
+    IntrinsicOp::ReduceAddEpu64_512,
+    IntrinsicOp::Pmovmskb128,
+    IntrinsicOp::Pmovmskb256,
+    IntrinsicOp::Testz128,
+    IntrinsicOp::Pextrb128,
+    IntrinsicOp::Pextrw128,
+    IntrinsicOp::Pextrd128,
+    IntrinsicOp::Pextrq128,
+    IntrinsicOp::Cvtsi128Si32,
+    IntrinsicOp::Cvtsi128Si64,
+    IntrinsicOp::Cvtsd2Si64,
+    IntrinsicOp::Cvtss2Si64,
+];
+
+/// Whether `op` is one of [`X86_64_INTEGER_RESULTS`].
+pub(crate) fn x86_64_integer_result_in_accumulator(op: IntrinsicOp) -> bool {
+    X86_64_INTEGER_RESULTS.contains(&op)
+}
 
 /// Packed element shifts saturate by the full count, not its low byte.
 /// Encoding a large/negative C int modulo 256 would incorrectly make 256 an

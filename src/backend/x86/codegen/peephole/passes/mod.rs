@@ -1718,6 +1718,10 @@ fn peephole_optimize_inner(
                 "fold_carry_addend",
                 multiword::fold_carry_addend(&mut store, &mut infos)
             );
+            fix1!(
+                "forward_carry_flag",
+                multiword::forward_carry_flag(&mut store, &mut infos)
+            );
         }
         if !sk("acc_roundtrip") {
             {
@@ -2214,6 +2218,56 @@ fn peephole_optimize_inner(
                     "fold_lea_all_uses_in_block",
                     local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos)
                 );
+            }
+            // The vector copies store forwarding creates. An operation
+            // that takes its operand through a pointer (`pmovmskb`, `movd`,
+            // `movmskps` behind a register-valued compare or add) has the
+            // operand stored to a slot and loaded again; phase 2 turns
+            // that pair into a register copy, and the vector copy passes
+            // had their last turn in phase 1, before there was one:
+            //
+            //     movaps %xmm0, %xmm15
+            //     pcmpeqb %xmm1, %xmm15        pcmpeqb %xmm1, %xmm0
+            //     movdqu %xmm15, %xmm0    ->   pmovmskb %xmm0, %eax
+            //     pmovmskb %xmm0, %eax
+            //
+            // `_mm_movemask_epi8(_mm_cmpeq_epi8(a, b))` was five
+            // instructions against two from GCC 16.2 and Clang 23.1.5.
+            // The same four passes in phase 1's order, under their own
+            // switches; each is asked again only while something changed.
+            if has_vec {
+                if !sk("vector_copy_retarget") {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "retarget_vex_result",
+                        vector_copy::retarget_vex_result(&mut store, &mut infos)
+                    );
+                }
+                if !sk("vector_copy_bracket") {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "coalesce_vector_brackets",
+                        vector_copy::coalesce_vector_brackets(&mut store, &mut infos)
+                    );
+                }
+                if !sk("vector_copy_prop") {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "propagate_vector_copies",
+                        vector_copy::propagate_vector_copies(&mut store, &mut infos)
+                    );
+                }
+                if !sk("vector_copy_dead") {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "eliminate_dead_vector_copies",
+                        vector_copy::eliminate_dead_vector_copies(&store, &mut infos)
+                    );
+                }
             }
             // Phase 2's copy propagation creates the LEA→memory shapes
             // phase 1's windowed folder never saw: `leaq K(%rax), %rax;
@@ -2904,6 +2958,21 @@ fn peephole_optimize_inner(
         dead_code::eliminate_flow_dead_vector_stores(&store, &mut infos);
     }
 
+    // Phase 5c: the carry of an `adc` chain that was parked in the frame
+    // between two links (`multiword::forward_carry_flag` dropped the `bt`
+    // that read the slot). The store into the slot went just above, so the
+    // `setc` and its extension are read by nobody; and with them gone, what
+    // they stood between closes up: the sum that was saved round them
+    // (`movq %rax, S; movzbl %cl, %eax; ...; movq S, %rax`) is a store and
+    // a load of the register it is still in, which store forwarding drops
+    // and whose slot is then read by nobody either.
+    if !skip_phase5 && !sk("multiword") && multiword::drop_unread_carries(&mut store, &mut infos) {
+        if !sk("store_fwd") {
+            store_forwarding::global_store_forwarding(&mut store, &mut infos);
+        }
+        dead_code::eliminate_never_read_stores(&store, &mut infos);
+    }
+
     // Select a native mask only from an already-BMI2, low-byte-saturating
     // sequence. Run before save/frame cleanup so dead temporaries do not
     // leave unnecessary callee-save traffic behind.
@@ -2967,6 +3036,24 @@ fn peephole_optimize_inner(
     // pattern pass so no earlier matcher has to know both spellings.
     if !sk("narrow_imm") {
         load_op_fuse::narrow_wide_immediates(&mut store, &mut infos);
+    }
+
+    // Phase 7c: the carry out of an `adc`/`sbb` straight into its register
+    // (`setc %cl; movzbl %cl, %r` -> `movl $0, %r; setc %rb`): one step from
+    // the flag to the register instead of two, which round a limb loop is
+    // one cycle in four.  Behind every pass that folds the `setcc; movzb`
+    // pair into something better (`multiword`'s own folds first of all), so
+    // that none of them has to know both spellings.
+    if !sk("multiword") && !sk("widen_carry") {
+        multiword::widen_carry_in_place(&mut store, &mut infos);
+    }
+
+    // Phase 7d: the carry of a limb loop stays in the flag round the back
+    // edge (`sub $1, n; test n, n; jne` -> `dec n; jne`, the `bt` in front
+    // of the loop and the `mov $0; setc` behind it).  Behind the widening:
+    // it moves the pair that pass writes.
+    if !sk("multiword") && !sk("carry_loop") {
+        multiword::keep_carry_round_loop(&mut store, &mut infos);
     }
 
     // Armed HERE, not at function entry: the first `late!` below must measure
@@ -5146,6 +5233,45 @@ mod tests {
         }
     }
 
+    /// A zero-extended byte or word is its own sign extension: bit 31 is
+    /// clear. (`movl` and 32-bit arithmetic are not: bit 31 may be set.)
+    #[test]
+    fn test_redundant_cltq_after_narrow_zero_extensions() {
+        for producer in [
+            "movzbl %cl, %eax",
+            "movzbl -8(%rbp), %eax",
+            "movzbq %dil, %rax",
+            "movzbq %al, %rax",
+            "movzwl %di, %eax",
+            "movzwq %di, %rax",
+            "movzwq %ax, %rax",
+        ] {
+            for between in ["", "    movq %rax, %r8\n"] {
+                let asm = format!("    {producer}\n{between}    cltq\n    movq %rax, (%rsi)\n");
+                let result = peephole_optimize(asm);
+                assert!(
+                    !result.contains("cltq"),
+                    "{producer} already extends to 64 bits: {result}"
+                );
+            }
+        }
+        for producer in ["movl %ecx, %eax", "movl -8(%rbp), %eax", "addl %ecx, %eax"] {
+            let asm = format!("    {producer}\n    cltq\n    movq %rax, (%rsi)\n");
+            let result = peephole_optimize(asm);
+            assert!(
+                result.contains("cltq") || result.contains("movslq"),
+                "bit 31 of {producer} may be set: {result}"
+            );
+        }
+        // Something that writes %eax in between.
+        let asm = "    movzbl %cl, %eax\n    negl %eax\n    cltq\n    movq %rax, (%rsi)\n";
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("cltq") || result.contains("movslq"),
+            "{result}"
+        );
+    }
+
     #[test]
     fn test_narrow_sign_extension_does_not_hide_rax_clobber_from_cltq() {
         for producer in ["movsbq %dil, %rax", "movswq %di, %rax"] {
@@ -6899,8 +7025,41 @@ mod regression_tests {
 
     /// With a prologue `subq` the frame-preserving form applies: the frame
     /// total, and with it every `%rsp`-relative (aligned) slot, is unchanged.
+    ///
+    /// The slot has to stay a slot for this to be about anything: `%ymm0` is
+    /// rewritten between the store and the reload, so store forwarding (which
+    /// serves a 32-byte reload from the register that filled the slot) has no
+    /// register to serve it from.
     #[test]
     fn fpo_dead_callee_save_dropped_with_aligned_vector_stack_traffic() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %r13\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    subq $32, %rsp\n",
+            "    vmovaps %ymm0, (%rsp)\n",
+            "    vxorps %xmm0, %xmm0, %xmm0\n",
+            "    vmovaps (%rsp), %ymm1\n",
+            "    addq $32, %rsp\n",
+            "    popq %r13\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%r13"), "{out}");
+        assert!(out.contains("subq $40, %rsp"), "{out}");
+        assert!(out.contains("addq $40, %rsp"), "{out}");
+        assert!(out.contains("vmovaps %ymm0, (%rsp)"), "{out}");
+        assert!(out.contains("vmovaps (%rsp), %ymm1"), "{out}");
+    }
+
+    /// The same frame with nothing between the store and the reload: the
+    /// reload is the register move, the store has no reader left, and a frame
+    /// that holds nothing goes with the save.
+    #[test]
+    fn fpo_forwarded_vector_slot_takes_its_frame_and_the_dead_save_with_it() {
         let asm = concat!(
             "f:\n",
             ".cfi_startproc\n",
@@ -6916,10 +7075,9 @@ mod regression_tests {
             ".size f, .-f\n",
         );
         let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("vmovaps %ymm0, %ymm1"), "{out}");
+        assert!(!out.contains("%rsp"), "{out}");
         assert!(!out.contains("%r13"), "{out}");
-        assert!(out.contains("subq $40, %rsp"), "{out}");
-        assert!(out.contains("addq $40, %rsp"), "{out}");
-        assert!(out.contains("vmovaps %ymm0, (%rsp)"), "{out}");
     }
 
     /// Without a `subq` the push must go outright, which moves `%rsp`:
@@ -7079,9 +7237,13 @@ mod regression_tests {
             assert!(!out.contains(gone), "{gone}: {out}");
         }
         // The 16 bytes are still stored through %rsi on the fall-through
-        // path, and the branch keeps both returns distinct.
+        // path, and the branch keeps both returns distinct. The store reads
+        // the register the reload was forwarded from: the vector copy
+        // passes have a turn behind the forwarder now. (The copy itself
+        // stays: this text has no return markers, and without them a `ret`
+        // reads %xmm1.)
         assert!(out.contains("movdqu %xmm0, %xmm1"), "{out}");
-        assert!(out.contains("movdqu %xmm1, (%rsi)"), "{out}");
+        assert!(out.contains("movdqu %xmm0, (%rsi)"), "{out}");
         assert_eq!(
             out.lines().filter(|l| l.trim_ascii() == "ret").count(),
             2,

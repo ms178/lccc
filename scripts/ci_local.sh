@@ -1370,6 +1370,30 @@ gate "x86-march-macro-parity" fast \
     python3 scripts/check_x86_march_macros.py "$LCCC" "${GCC16:-gcc-16}"
 gate "x86-mflag-macro-parity" fast \
     python3 scripts/check_x86_mflag_macros.py "$LCCC" --gcc "${GCC16:-gcc-16}"
+# The x86 `-m` options without code generation of their own: every spelling of
+# GCC 16.2's list is an arm of the driver or a row of the generated table
+# (docs/x86-machine-options.md), and the rows hold under both compilers.  The
+# second gate holds the rows that are implemented as a rule about the finished
+# text (-mharden-sls=, -mcld, notrack switch dispatch, the -pg names).
+gate "x86-mflag-policy" fast \
+    python3 scripts/gen_x86_mflag_policy.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "x86-mflag-effects" fast \
+    python3 tests/regression/check_x86_mflag_effects.py --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# `asm` operands in ymm, zmm, mask and MMX registers, which the lowering loads
+# and stores inside the statement: the text, GCC's template and diagnostics,
+# and generated statements run against GCC's build of them.
+gate "x86-asm-register-operands" fast \
+    python3 tests/regression/check_x86_asm_register_operands.py --lccc "$LCCC" \
+        --gcc "${GCC16:-gcc-16}"
+# 512-bit vector objects in zmm16..zmm31: the shapes, the registers nothing
+# else names, and generated programs run against GCC's build of them.
+gate "x86-zmm-homes" fast \
+    python3 tests/regression/check_x86_zmm_homes.py --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# The integer a SIMD operation returns: in a register, with no stack traffic
+# and no vector copy around it, as long as GCC's function, and equal to it.
+gate "x86-simd-integer-results" fast \
+    python3 tests/regression/check_x86_simd_integer_results.py --lccc "$LCCC" \
+        --gcc "${GCC16:-gcc-16}"
 # `-mprefer-vector-width=` is a cost-model request, so its gate is a codegen
 # gate, not a macro gate: it compares the register class lccc picks against
 # GCC for the same command line, proves the flag moves no predefined macro,
@@ -1387,6 +1411,12 @@ gate "x86-prefetch-instructions" fast \
 # directions.
 gate "x86-intrinsic-census" fast \
     python3 scripts/x86_intrinsic_census.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# A call that compiles also has a type. For 48 intrinsics lccc lowers by name
+# it was the implicit `int`, and its value the address of the vector:
+# `return _mm_sll_epi16(a, n);` returned a stack address. Every intrinsic lccc
+# has is asserted to have the type GCC 16.2's header gives it.
+gate "x86-intrinsic-types" fast \
+    python3 scripts/x86_intrinsic_types.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 # Which extension each SIMD helper needs, against the table generated from
 # GCC 16.2's headers (tests/simd/isa_permissions_gcc16.json). No compiler.
 gate "simd-isa-permissions" fast \
@@ -1427,6 +1457,15 @@ gate "gcc162-diagnostic-severity" fast \
 # with its -w/-Werror behaviour -- pinned line/column/message to gcc-16.2.
 gate "operand-diagnostics" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_operand_diagnostics.sh
+
+# Every operator on every kind of operand against GCC 16.2: 200 unary cells
+# and 14,112 binary ones. No cell may be a valid program refused or an
+# internal error; the cells lccc accepts where GCC refuses are counted in the
+# script and may only become fewer.
+gate "operand-constraint-matrix-self-test" fast \
+    python3 scripts/operand_constraint_matrix.py --self-test
+gate "operand-constraint-matrix" slow \
+    python3 scripts/operand_constraint_matrix.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 
 # Clang ext_vector_type component access against the Clang 23.1.5 oracle:
 # LCCC's diagnostics for ext_vector_select/errors.c equal Clang's (line,
@@ -1537,6 +1576,10 @@ gate "intrinsic-arity-selftest" fast \
     python3 scripts/check_intrinsic_arity.py --self-test
 gate "intrinsic-arity" fast \
     python3 scripts/check_intrinsic_arity.py --check
+gate "libc-builtin-types-selftest" fast \
+    python3 scripts/gen_libc_builtin_types.py --self-test
+gate "libc-builtin-types" fast \
+    python3 scripts/gen_libc_builtin_types.py --gcc "${GCC16:-gcc-16}" --check
 gate "libc-builtin-arity-selftest" fast \
     python3 scripts/check_libc_builtin_arity.py --self-test
 gate "libc-builtin-arity" fast \
@@ -3804,6 +3847,83 @@ gate "peephole-phi-hoist-safety" fast \
 
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh
+
+# The operators on `_Atomic` objects (`x++`, `x += v`, `x = v`, a read) are
+# atomic operations: one locked instruction or a compare-exchange loop on
+# every backend, and no update lost by the threaded program at any level.
+gate "atomic-operators" fast \
+    bash tests/regression/check_atomic_operators.sh
+
+# The arguments of `target("...")`, judged as GCC 16.2 judges them: unknown
+# arguments are errors, and the fixture's comments are GCC's own output.
+gate "target-attribute-arguments" fast \
+    python3 tests/regression/check_target_attribute_arguments.py --lccc target/fastbuild/lccc
+
+# Every symbol the compiler defines has a type and a size: the program's
+# functions and objects, and the helpers the driver adds (the CPUID probe of
+# `__builtin_cpu_supports`, the profile writer). Four targets, readelf only.
+gate "symbol-annotations" fast \
+    python3 tests/regression/check_symbol_annotations.py
+
+# The scalar and system intrinsics of x86gprintrin.h against GCC 16.2: which
+# instruction, in which form, and with which operands when it is reached
+# (the two programs are stopped in front of it under GDB; nothing an
+# intrinsic stands for is executed, so the verdict does not depend on the
+# processor the gate runs on).
+gate "x86-gpr-intrinsics" fast \
+    python3 tests/regression/check_x86_gpr_intrinsics.py --lccc target/fastbuild/lccc
+
+# Assembler statements against the registers the compiler keeps for itself
+# (the i686 GOT pointer in %ebx, the frame pointer, live values): programs,
+# shared libraries, refusals and clobber names against GCC 16.2.
+gate "asm-registers" fast \
+    python3 tests/regression/check_asm_registers.py --lccc target/fastbuild/lccc
+
+# Multi-word adders as adc/sbb chains (docs/x86-carry-chain.md). The shape
+# gate reads the assembly of carry_chain_adders.c (adc/sbb per function, no
+# setc/bt inside a straight chain, an instruction ceiling, four adc/sbb in
+# a row in the main loop of a limb loop and no boolean made of its carry);
+# the fuzz gate compares generated
+# adders, and things that only look like adders, with GCC 16.2's programs
+# through seven configurations, and with --limbs generated limb loops
+# through eight, where a floor is held under the share that limb_unroll
+# splits. All carry their negative control (the passes off; a planted wrong
+# carry).
+gate "carry-chain-shape" fast \
+    python3 tests/regression/check_carry_chain_shape.py --lccc target/fastbuild/lccc
+gate "carry-chain-fuzz-limbs" fast \
+    python3 tests/regression/check_carry_chain_fuzz.py --limbs --lccc target/fastbuild/lccc --gcc gcc-16
+gate "carry-chain-fuzz" fast \
+    python3 tests/regression/check_carry_chain_fuzz.py --lccc target/fastbuild/lccc --gcc gcc-16
+
+# What a loop carries has a register: the state of zstd_count's generator
+# round its query loop (the recurrence floor does not take a value that a
+# copy carries round a loop), and both phis of csv_field_sum's digit loop
+# share theirs with what is copied back (a temporary in a phi's register
+# takes the one the back-edge source leaves). The matchers first refuse
+# the code that had the two defects.
+gate "loop-carried-homes" fast \
+    python3 tests/regression/check_loop_carried_homes.py --lccc target/fastbuild/lccc
+
+# A switch dispatched through an absolute table (-fno-pic, the kernel code
+# model, an executable linked by the same invocation) is an edge the
+# peephole's liveness reads: a function that holds one is analysed like any
+# other. The fixture's output in 15 configurations, and each of its
+# functions position-fixed no longer than position-independent less the
+# three instructions a dispatch saves; one function as it was emitted
+# before is the negative control.
+gate "switch-table-liveness" fast \
+    python3 tests/regression/check_switch_table_liveness.py --lccc target/fastbuild/lccc --gcc gcc-16
+
+# A branch on a merge that one way in brings a constant to is left by
+# if-conversion and threaded behind the optimizer's rounds, a level of
+# nested conditions a round, and the set fold then makes what is left of a
+# character class one bit test. The fixture's output in 14 configurations
+# against GCC 16.2's, eleven functions no longer than today, no constant
+# written to be tested in zlib's sift loop; the early position of the
+# threader off and the set fold off are the negative controls.
+gate "boolean-merge-threads" fast \
+    python3 tests/regression/check_boolean_merge_threads.py --lccc target/fastbuild/lccc --gcc gcc-16
 
 # Indexed SIB fold with a scratch-homed index (S13): the x86-64 fold decider
 # must accept %rdx/%r11-homed SIB operands. Structural fold assertion on

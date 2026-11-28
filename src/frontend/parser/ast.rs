@@ -5,6 +5,15 @@ use crate::common::types::{AddressSpace, CType, ExtVectorLayout, PtrQuals};
 #[derive(Debug)]
 pub struct TranslationUnit {
     pub decls: Vec<ExternalDecl>,
+    /// Every `#pragma GCC target` of the unit: its strings, comma-joined,
+    /// and where it stands. Lowering judges each once, at the pragma, as
+    /// GCC does (`Lowerer::diagnose_x86_target_pragmas`).
+    pub pragma_target_sites: Vec<(String, Span)>,
+    /// The `_Atomic` keyword appears somewhere in the unit (a header's
+    /// `typedef _Atomic int atomic_int;` counts). No object can be atomic
+    /// without it, so everything that asks "is this lvalue atomic?" is
+    /// skipped outright when it is absent.
+    pub uses_atomic: bool,
 }
 
 /// Top-level declarations in a translation unit.
@@ -48,6 +57,11 @@ pub struct FunctionAttributes {
     pub symver: Option<String>,
     /// __attribute__((target("..."))) - comma-joined per-function ISA features
     pub target: Option<String>,
+    /// The strings of the `#pragma GCC target`s in force where the function
+    /// is defined, one pragma a line, in the order written. GCC applies
+    /// them before the function's own attribute; see
+    /// [`effective_target_options`].
+    pub pragma_target: Option<String>,
     /// __attribute__((target_clones("..."))) - comma-joined multiversion clone targets
     pub target_clones: Option<String>,
     /// __attribute__((__diagnose_as(__builtin_NAME, ...))) - builtin alias
@@ -128,7 +142,55 @@ pub struct DefSpecifiers {
     pub noinline: bool,
 }
 
+/// A declaration's target options in the order GCC applies them, as one
+/// comma-separated list: what the `#pragma GCC target`s in force say
+/// (`pragma`, one pragma a line), then the declaration's own `target`
+/// attribute. `None` when neither says anything.
+#[must_use]
+pub fn effective_target_options(pragma: Option<&str>, own: Option<&str>) -> Option<String> {
+    let mut options = String::new();
+    for part in pragma.into_iter().flat_map(|p| p.split('\n')).chain(own) {
+        if part.is_empty() {
+            continue;
+        }
+        if !options.is_empty() {
+            options.push(',');
+        }
+        options.push_str(part);
+    }
+    (!options.is_empty()).then_some(options)
+}
+
+#[cfg(test)]
+mod effective_target_options_tests {
+    use super::effective_target_options;
+
+    #[test]
+    fn pragmas_come_first_and_the_attribute_last() {
+        assert_eq!(effective_target_options(None, None), None);
+        assert_eq!(effective_target_options(Some(""), Some("")), None);
+        assert_eq!(
+            effective_target_options(None, Some("avx2")).as_deref(),
+            Some("avx2")
+        );
+        assert_eq!(
+            effective_target_options(Some("avx2"), None).as_deref(),
+            Some("avx2")
+        );
+        assert_eq!(
+            effective_target_options(Some("avx\nbmi2,lzcnt"), Some("no-avx")).as_deref(),
+            Some("avx,bmi2,lzcnt,no-avx")
+        );
+    }
+}
+
 impl FunctionAttributes {
+    /// [`effective_target_options`] of this definition.
+    #[must_use]
+    pub fn effective_target(&self) -> Option<String> {
+        effective_target_options(self.pragma_target.as_deref(), self.target.as_deref())
+    }
+
     /// Create a new `FunctionAttributes` with all flags cleared.
     pub fn new() -> Self {
         Self::default()
@@ -176,6 +238,7 @@ impl FunctionAttributes {
         attrs.visibility = decl.visibility.clone();
         attrs.symver = decl.symver.clone();
         attrs.target = decl.target.clone();
+        attrs.pragma_target = decl.pragma_target.clone();
         attrs.target_clones = decl.target_clones.clone();
         attrs.diagnose_as = decl.diagnose_as.clone();
         attrs.externally_visible = decl.externally_visible;
@@ -905,6 +968,9 @@ pub struct DeclAttributes {
     pub symver: Option<String>,
     /// __attribute__((target("..."))) - comma-joined per-function ISA features
     pub target: Option<String>,
+    /// The `#pragma GCC target` strings in force at the declaration (see
+    /// `FunctionAttributes::pragma_target`).
+    pub pragma_target: Option<String>,
     /// __attribute__((target_clones("..."))) - comma-joined multiversion clone targets
     pub target_clones: Option<String>,
     /// __attribute__((__diagnose_as(__builtin_NAME, ...))) - the declared
@@ -1212,7 +1278,11 @@ pub struct InitDeclarator {
     pub init: Option<Initializer>,
     /// Declarator attributes (GCC __attribute__, asm register, etc.).
     pub attrs: DeclAttributes,
+    /// Where the declaration begins (the same for all its declarators).
     pub span: Span,
+    /// Where the declared name stands, for the diagnostics GCC puts there
+    /// (the `target` attribute's among them); `None` without a name.
+    pub name_span: Option<Span>,
 }
 
 /// CVR qualifier bits carried by a pointer star (`DerivedDeclarator::Pointer`).
@@ -1222,7 +1292,12 @@ pub struct InitDeclarator {
 pub const CVR_CONST: u8 = PtrQuals::CONST;
 pub const CVR_VOLATILE: u8 = PtrQuals::VOLATILE;
 pub const CVR_RESTRICT: u8 = PtrQuals::RESTRICT;
-pub const CVR_ALL: u8 = CVR_CONST | CVR_VOLATILE | CVR_RESTRICT;
+/// `_Atomic` written among a star's qualifiers or a specifier list's; see
+/// [`PtrQuals::ATOMIC`].
+pub const CVR_ATOMIC: u8 = PtrQuals::ATOMIC;
+pub const CVR_ALL: u8 = CVR_CONST | CVR_VOLATILE | CVR_RESTRICT | CVR_ATOMIC;
+// `CastQualifiers` packs one level's bits into a field of `CVR_ALL`'s width.
+const _: () = assert!(CVR_ALL == (1 << CVR_ALL.count_ones()) - 1);
 
 /// `true` when the `const` bit is set in a CVR mask.
 pub fn cvr_is_const(cvr: u8) -> bool {
@@ -2175,14 +2250,16 @@ pub struct CastQualifiers {
     /// (`(const char *const *)`), its length (`0` otherwise, or past
     /// [`Self::MAX_STAR_CHAIN`] levels) ...
     pub star_chain_len: u8,
-    /// ... and each star's `CVR_*` bits, 3 per level (level 1, closest to
+    /// ... and each star's `CVR_*` bits, 4 per level (level 1, closest to
     /// the base, in the lowest bits). See [`Self::star_chain`].
     pub star_chain_cvr: u64,
 }
 
 impl CastQualifiers {
+    /// Bits of [`Self::star_chain_cvr`] per pointer level: one per `CVR_*`.
+    const STAR_BITS: usize = CVR_ALL.count_ones() as usize;
     /// The longest star chain [`Self::star_chain_cvr`] holds.
-    pub const MAX_STAR_CHAIN: usize = 21;
+    pub const MAX_STAR_CHAIN: usize = u64::BITS as usize / Self::STAR_BITS;
 
     /// The per-level qualifiers of a plain star-chain type name, innermost
     /// level first; `None` for any other type name.
@@ -2190,7 +2267,9 @@ impl CastQualifiers {
         let len = usize::from(self.star_chain_len);
         (len > 0).then(|| {
             (0..len)
-                .map(|level| ((self.star_chain_cvr >> (3 * level)) & 0b111) as u8)
+                .map(|level| {
+                    ((self.star_chain_cvr >> (Self::STAR_BITS * level)) & u64::from(CVR_ALL)) as u8
+                })
                 .collect()
         })
     }
@@ -2215,7 +2294,7 @@ impl CastQualifiers {
         if plain {
             self.star_chain_len = wraps as u8;
             self.star_chain_cvr = levels.iter().enumerate().fold(0, |bits, (level, cvr)| {
-                bits | (u64::from(cvr & 0b111) << (3 * level))
+                bits | (u64::from(cvr & CVR_ALL) << (Self::STAR_BITS * level))
             });
         }
     }
@@ -2356,6 +2435,13 @@ pub struct GenericAssociation {
     /// Used by _Generic matching to distinguish e.g. `const int *` from `int *`,
     /// since CType does not track const/volatile qualifiers.
     pub is_const: bool,
+    /// Every qualifier the association's type name wrote, as a cast's type
+    /// name records them: the base type's and each star's. `const int *`,
+    /// `volatile int *`, `_Atomic int *` and `int *` are four types, and a
+    /// selection has to tell them apart (C11 6.5.1.1p2: "compatible"); the
+    /// record lets sema compare them level by level against the controlling
+    /// operand's own (`PtrQuals`). Empty for `default`.
+    pub quals: CastQualifiers,
 }
 
 /// Sizeof argument can be a type or expression.

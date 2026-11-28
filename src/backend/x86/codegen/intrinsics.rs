@@ -1873,24 +1873,36 @@ impl X86Codegen {
     /// of staging a copy of the live one.
     ///
     /// SSE is destructive: `op a, b` must destroy one operand.  When one of
-    /// them is at its last use (`value_use_counts`, the map the ALU and cast
-    /// emitters already fold on) and lives in a register, destroy THAT one
-    /// and read the other as the source: `op %live, %dying` — legal because
-    /// `sse128_mnemonic_commutative` proved the swap is value-preserving.
+    /// them dies at this instruction and lives in a register, destroy THAT
+    /// one and read the other as the source: `op %live, %dying` — legal
+    /// because `sse128_mnemonic_commutative` proved the swap is
+    /// value-preserving.
     ///
-    /// SLP-vectorized FP loops are the payoff: `c[j] += s * b[j]` used to
-    /// copy the loop-invariant broadcast into scratch every iteration
-    /// (`movdqa %xmm15, %xmm0`) purely to have a destructible operand.
+    /// "Dies at this instruction" is `vector_dying_values`: read once, by an
+    /// instruction of the block that defines it, so that every time the use
+    /// is reached again the definition has run again first.  A use count of
+    /// one is not that.  A broadcast hoisted in front of a loop is read at
+    /// one place and by every iteration, and its register is its home for
+    /// all of them: this form used to add the loaded bytes INTO such a home
+    /// (`paddb %xmm4, %xmm8`, `%xmm8` the hoisted `c - 59` bias of a byte
+    /// classifier) whenever the result had no register of its own, and
+    /// every 16-byte step after the first classified against a bias that
+    /// held the previous step's sum.  The FMA memory-fold emitters hold the
+    /// same rule for the same reason (see `dying_home` there).
+    ///
+    /// SLP-vectorized FP loops are the payoff: in `c[j] += s * b[j]` the
+    /// product is the operand that dies, and the add is computed into it
+    /// instead of into a staged copy.
     ///
     /// Candidates are tried best-first: `args[1]` then `args[0]` (historical
     /// operand order when both are dying), and within that an operand whose
     /// register already IS the destination's home — nothing to destroy,
     /// nothing to move — before one that merely happens to be free.  When
-    /// the destination has no home, any last-use register serves: the result
+    /// the destination has no home, any dying register serves: the result
     /// is claimed there and `finish_lane_dest` materialises the slot.
     ///
     /// Declines (returns false, letting the caller stage through %xmm0) on
-    /// any missing premise: no use count or more than one use, no
+    /// any missing premise: an operand that does not die here, no
     /// materialised register for the dying value, a deferred store still
     /// naming it, both operands resolving to one register, or a destination
     /// allocated to some third register.
@@ -1911,7 +1923,7 @@ impl X86Codegen {
         }
         let dest_home = self.dest_xmm_home_name(dest_ptr);
         for (live, dying) in [(v0, v1), (v1, v0)] {
-            if self.value_use_counts.get(&dying.0).copied() != Some(1) {
+            if !self.state.vector_dying_values.contains(&dying.0) {
                 continue;
             }
             if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(dying.0) {
@@ -3525,6 +3537,17 @@ impl X86Codegen {
                 if let Some(d) = dest {
                     self.store_rax_to(d);
                 }
+            }
+            // One half of a full adder whose partner is not directly
+            // behind it (dead, or parted from it): the pair is emitted by
+            // the driver (`emit_carry_pair`).
+            IntrinsicOp::Carry(carry) => {
+                let (word, out) = if carry.out {
+                    (None, dest.as_ref())
+                } else {
+                    (dest.as_ref(), None)
+                };
+                self.emit_carry_impl(word, out, *carry, args);
             }
             IntrinsicOp::Pdep32
             | IntrinsicOp::Pdep64
@@ -15112,34 +15135,33 @@ mod intrinsic_destination_contract_tests {
         }
     }
 
-    /// The dying-operand form destroys an operand that is at its LAST use,
-    /// in either position, and only then.  Pinned in both directions: the
-    /// positive shapes must emit exactly one instruction into the dying
-    /// value's own register (no copy of the live operand), and every missing
-    /// premise must decline so the caller stages instead.
+    /// The dying-operand form destroys an operand that dies at this
+    /// instruction, in either position, and only then.  Pinned in both
+    /// directions: the positive shapes must emit exactly one instruction
+    /// into the dying value's own register (no copy of the live operand),
+    /// and every missing premise must decline so the caller stages instead.
     #[test]
     fn dying_operand_form_destroys_a_last_use_operand_in_either_position() {
-        // live = v0 in xmm6 (PhysReg 24); dying = v1 in xmm7 (PhysReg 25);
-        // destination v2 is slot-homed (no XMM home).
-        fn setup(uc: [u32; 3]) -> X86Codegen {
+        // v0 in xmm6 (PhysReg 24) and v1 in xmm7 (PhysReg 25); destination
+        // v2 is slot-homed (no XMM home).  `dying` names the operands that
+        // are read once, in the block that defines them.
+        fn setup(dying: &[u32]) -> X86Codegen {
             let mut cg = X86Codegen::new();
             slot_homed(&mut cg, 2);
             cg.reg_assignments.insert(0, PhysReg(24));
             cg.reg_assignments.insert(1, PhysReg(25));
             cg.state.vector_values.insert(0);
             cg.state.vector_values.insert(1);
-            cg.value_use_counts.insert(0, uc[0]);
-            cg.value_use_counts.insert(1, uc[1]);
-            cg.value_use_counts.insert(2, uc[2]);
+            cg.state.vector_dying_values.extend(dying.iter().copied());
             cg
         }
         let args = [Operand::Value(Value(0)), Operand::Value(Value(1))];
 
-        // args[1] is the last use: destroy it (xmm7), read args[0] (xmm6).
-        let mut cg = setup([2, 1, 1]);
+        // args[1] dies here: destroy it (xmm7), read args[0] (xmm6).
+        let mut cg = setup(&[1]);
         assert!(
             cg.emit_sse_dying_operand_form(&Value(2), &args, "paddd"),
-            "last-use args[1] must fire"
+            "a dying args[1] must fire"
         );
         assert_eq!(
             cg.state.out.buf.lines().map(str::trim).collect::<Vec<_>>(),
@@ -15147,12 +15169,12 @@ mod intrinsic_destination_contract_tests {
             "args[1]-dying form: one op into the dying home, then the slot store"
         );
 
-        // args[0] is the last use and the op commutes: destroy args[0] (xmm6),
+        // args[0] dies here and the op commutes: destroy args[0] (xmm6),
         // read args[1] (xmm7) -- the generalisation the candidate loop adds.
-        let mut cg = setup([1, 2, 1]);
+        let mut cg = setup(&[0]);
         assert!(
             cg.emit_sse_dying_operand_form(&Value(2), &args, "paddd"),
-            "last-use args[0] must fire for a commutative op"
+            "a dying args[0] must fire for a commutative op"
         );
         assert_eq!(
             cg.state.out.buf.lines().map(str::trim).collect::<Vec<_>>(),
@@ -15160,8 +15182,8 @@ mod intrinsic_destination_contract_tests {
             "args[0]-dying form must destroy args[0], not copy the live one"
         );
 
-        // No last-use premise on either operand: decline, emit nothing.
-        let mut cg = setup([2, 3, 1]);
+        // Neither operand dies here: decline, emit nothing.
+        let mut cg = setup(&[]);
         assert!(!cg.emit_sse_dying_operand_form(&Value(2), &args, "paddd"));
         assert!(
             cg.state.out.buf.trim().is_empty(),
@@ -15170,7 +15192,7 @@ mod intrinsic_destination_contract_tests {
 
         // Non-commutative mnemonic: swapping operands changes the result, so the
         // form must never fire even with a perfect liveness premise.
-        let mut cg = setup([2, 1, 1]);
+        let mut cg = setup(&[1]);
         assert!(!cg.emit_sse_dying_operand_form(&Value(2), &args, "psubd"));
         assert!(
             cg.state.out.buf.trim().is_empty(),
@@ -15179,16 +15201,59 @@ mod intrinsic_destination_contract_tests {
 
         // Destination homed to a THIRD register: destroying either operand would
         // clobber a register the allocator expects to hold the result.
-        let mut cg = setup([2, 1, 1]);
+        let mut cg = setup(&[1]);
         cg.reg_assignments.insert(2, PhysReg(26));
         assert!(!cg.emit_sse_dying_operand_form(&Value(2), &args, "paddd"));
         assert!(cg.state.out.buf.trim().is_empty());
 
         // Both operands resolving to one register would compute `x op x`.
-        let mut cg = setup([2, 1, 1]);
+        let mut cg = setup(&[1]);
         cg.reg_assignments.insert(0, PhysReg(25));
         assert!(!cg.emit_sse_dying_operand_form(&Value(2), &args, "paddd"));
         assert!(cg.state.out.buf.trim().is_empty());
+    }
+
+    /// One place that reads a value is not the value's last read.  A
+    /// broadcast hoisted in front of a loop is read by the loop's one `paddb`
+    /// in every iteration: its use count is one, its home has to hold it for
+    /// all of them, and the op is staged through the scratch pair instead.
+    #[test]
+    fn dying_operand_form_leaves_a_loop_invariant_operand_its_home() {
+        // v0 = the bytes loaded this iteration (xmm4, read again below),
+        // v1 = the hoisted broadcast (xmm8), v2 = the sum, slot-homed.
+        let mut cg = X86Codegen::new();
+        slot_homed(&mut cg, 2);
+        cg.reg_assignments.insert(0, PhysReg(22));
+        cg.reg_assignments.insert(1, PhysReg(26));
+        cg.state.vector_values.insert(0);
+        cg.state.vector_values.insert(1);
+        // What the emitter used to decide by: each operand's use count.
+        cg.value_use_counts.insert(0, 4);
+        cg.value_use_counts.insert(1, 1);
+        cg.value_use_counts.insert(2, 1);
+        let args = [Operand::Value(Value(0)), Operand::Value(Value(1))];
+        assert!(
+            !cg.emit_sse_dying_operand_form(&Value(2), &args, "paddb"),
+            "a value read at one place by every iteration does not die there"
+        );
+        assert!(cg.state.out.buf.trim().is_empty());
+
+        // The whole emitter: neither operand's register is written.
+        let home_of = |reg: u8| phys_reg_name(PhysReg(reg));
+        let (bytes, bias) = (home_of(22), home_of(26));
+        cg.emit_sse_binary_128(&Value(2), &args, "paddb");
+        let out = cg.state.out.buf.clone();
+        for line in out.lines().map(str::trim) {
+            let written = line.rsplit(", ").next().unwrap_or("");
+            assert!(
+                written != format!("%{bias}") && written != format!("%{bytes}"),
+                "`{line}` writes an operand's home:\n{out}"
+            );
+        }
+        assert!(
+            out.contains("paddb"),
+            "the add is still emitted, staged:\n{out}"
+        );
     }
 
     /// `finish_lane_dest` is the single tail of every non-staging lane form.

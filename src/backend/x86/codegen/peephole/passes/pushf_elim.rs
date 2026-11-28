@@ -89,6 +89,11 @@ fn is_flag_neutral_line(m: &str) -> bool {
     if m.starts_with("popf") {
         return false;
     }
+    // Nor `popcnt`, which is no pop at all and writes every one of the six
+    // flags (ZF from the result, the other five cleared).
+    if m.starts_with("popcnt") {
+        return false;
+    }
     if m.starts_with("push") {
         return true;
     }
@@ -364,6 +369,33 @@ mod tests {
         let mut asm = input.to_string();
         let _ = eliminate_redundant_pushfq(&mut asm);
         assert_eq!(asm, input, "nothing inside a region may be removed");
+    }
+
+    /// `popcnt` shares its first three letters with `pop` and nothing else:
+    /// it writes all six flags, so the saved ones must be restored after it.
+    #[test]
+    fn popcnt_is_a_flag_writer_not_a_pop() {
+        use super::is_flag_neutral_line;
+        for line in [
+            "popcntq %rax, %rdx",
+            "popcntl %esi, %esi",
+            "popcnt %rax, %rdx",
+        ] {
+            assert!(!is_flag_neutral_line(line), "{line}");
+        }
+        for line in ["popq %rbx", "pushq %rbx", "movq %rax, %rdx"] {
+            assert!(is_flag_neutral_line(line), "{line}");
+        }
+        let input = concat!(
+            "f:\n",
+            "    pushfq\n",
+            "    popcntq %rax, %rdx\n",
+            "    popfq\n",
+            "    ret\n",
+        );
+        let mut asm = input.to_string();
+        assert!(!eliminate_redundant_pushfq(&mut asm));
+        assert_eq!(asm, input);
     }
 
     #[test]

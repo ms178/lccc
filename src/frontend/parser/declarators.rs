@@ -195,6 +195,10 @@ impl Parser {
         // The inner declarator's object qualifiers: when it has a `*`, the
         // declared object is that pointer (`int (*_Atomic p)[3]`).
         let mut inner_object_quals = (false, false);
+        // ... and whether that pointer is itself volatile (`int (*volatile
+        // f)(int)`): the inner call's answer, which the outer call's own
+        // derivations (the parameter list, the array bound) say nothing of.
+        let mut inner_object_volatile = false;
         let (name, inner_derived) = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
             // A *definition* reports `-Wstrict-prototypes` at its name, a
@@ -212,10 +216,12 @@ impl Parser {
                 self.attrs.declarator_object_restrict,
                 self.attrs.declarator_object_atomic,
             );
+            inner_object_volatile = self.attrs.declarator_object_volatile;
             if !self.consume_if(&TokenKind::RParen) {
                 self.pos = save;
                 inner_object_space = AddressSpace::Default;
                 inner_object_quals = (false, false);
+                inner_object_volatile = false;
                 (None, Vec::new())
             } else {
                 (inner_name, inner_derived)
@@ -373,15 +379,28 @@ impl Parser {
                 self.attrs.set_atomic(true);
             }
         }
-        self.attrs.declarator_object_volatile = match combined.last() {
-            // A typedef name's object qualifier is the typedef's own; the base
-            // qualifier (`spec_volatile` on a typedef use) is the pointee/element.
-            None if typedef_use => typedef_object_volatile,
-            None => spec_volatile,
-            Some(DerivedDeclarator::Pointer(..)) => last_star_volatile.unwrap_or(false),
-            Some(_) => false,
-        };
         let inner_has_pointer = inner_derived_has_pointer;
+        self.attrs.declarator_object_volatile = if inner_has_pointer {
+            // `int (*volatile f)(int)`, `long (*volatile ap)[4]`: the object
+            // is the parenthesised pointer, and the qualifier behind its `*`
+            // is the object's.  (Only `restrict` and `_Atomic` were read
+            // from the inner declarator; a volatile pointer to a function
+            // was an ordinary one.)
+            inner_object_volatile
+        } else {
+            match combined.last() {
+                // A typedef name's object qualifier is the typedef's own
+                // (`typedef int *volatile VIP`) or one written beside the
+                // name (`volatile fn_t f`), which the specifiers fold into
+                // the same flag where they read the keyword.  The base
+                // qualifier (`spec_volatile` on a typedef use: `typedef
+                // volatile int *VPI`) is the pointee's or the element's.
+                None if typedef_use => typedef_object_volatile,
+                None => spec_volatile,
+                Some(DerivedDeclarator::Pointer(..)) => last_star_volatile.unwrap_or(false),
+                Some(_) => false,
+            }
+        };
         let all_arrays = !combined.is_empty()
             && combined
                 .iter()
@@ -471,10 +490,11 @@ impl Parser {
             // ride on the declarator or the read-only check cannot see it.
             // The qualifiers the star wrote: an `_Atomic` there set
             // `volatile` for the way the pointer is accessed, and is not one
-            // (see `DeclAttributes::base_atomic`).
+            // (see `DeclAttributes::base_atomic`); it is recorded as itself.
             let star_cvr = u8::from(self.attrs.parsing_pointer_const())
                 | (u8::from(star_volatile && !last_star_atomic) << 1)
-                | (u8::from(last_star_restrict) << 2);
+                | (u8::from(last_star_restrict) << 2)
+                | (u8::from(last_star_atomic) * CVR_ATOMIC);
             // The last star's is also the declared object's space.
             derived.push(DerivedDeclarator::Pointer(star_space, star_cvr));
             object_space = star_space;
@@ -1342,7 +1362,8 @@ impl Parser {
         // set `volatile` for the access, and wrote none.
         let cvr = u8::from(self.attrs.parsing_pointer_const())
             | (u8::from(star_volatile && !star_atomic) << 1)
-            | (u8::from(star_restrict) << 2);
+            | (u8::from(star_restrict) << 2)
+            | (u8::from(star_atomic) * CVR_ATOMIC);
         self.attrs.set_volatile(outer_volatile || star_volatile);
         self.attrs.set_restrict(outer_restrict || star_restrict);
         self.attrs.set_atomic(outer_atomic);
@@ -2159,11 +2180,12 @@ impl Parser {
             // every type-name `*const`, so `*(int *const *)p = 0` passed.
             // An `_Atomic` after the star set `volatile` for the access and
             // wrote none (see `parse_pointer_prefix`).
-            let star_written_volatile =
-                self.attrs.parsing_volatile() && !self.attrs.parsing_atomic();
+            let star_atomic = self.attrs.parsing_atomic();
+            let star_written_volatile = self.attrs.parsing_volatile() && !star_atomic;
             let star_cvr = u8::from(self.attrs.parsing_pointer_const())
                 | (u8::from(star_written_volatile) << 1)
-                | restrict_bit;
+                | restrict_bit
+                | (u8::from(star_atomic) * CVR_ATOMIC);
             let star_space = self.attrs.parsing_address_space;
 
             self.attrs.set_const(saved_const);
@@ -2374,5 +2396,121 @@ mod tests {
     #[test]
     fn plain_stars_requires_the_closing_paren() {
         assert!(!plain(false, vec![], vec![], 0, vec![], None, false));
+    }
+}
+
+#[cfg(test)]
+mod object_volatile_tests {
+    //! Which declarations declare a volatile OBJECT.  The qualifier behind
+    //! the declarator's last `*` is the object's, a parenthesised inner
+    //! pointer is the object where there is one, and a qualifier in the
+    //! specifiers qualifies a typedef'd type whole.
+    use super::*;
+    use crate::frontend::lexer::Lexer;
+
+    fn object_volatile(source: &str) -> Vec<(String, bool)> {
+        let mut parser = Parser::new(Lexer::new(source, 0).tokenize());
+        let tu = parser.parse();
+        assert_eq!(parser.error_count, 0, "{source}");
+        tu.decls
+            .iter()
+            .filter_map(|d| match d {
+                ExternalDecl::Declaration(decl) => Some(decl),
+                _ => None,
+            })
+            .flat_map(|decl| &decl.declarators)
+            .filter(|d| !d.name.is_empty())
+            .map(|d| (d.name.clone(), d.attrs.object_volatile))
+            .collect()
+    }
+
+    #[test]
+    fn the_qualifier_of_the_pointer_object_is_read_wherever_it_is_written() {
+        let found = object_volatile(
+            "typedef int (*fn_t)(int);\n\
+             typedef int *ip_t;\n\
+             typedef volatile int *vpi_t;\n\
+             typedef volatile fn_t vfn_t;\n\
+             typedef volatile int vint;\n\
+             int plain;\n\
+             volatile int scalar;\n\
+             vint through_typedef;\n\
+             int *volatile pointer;\n\
+             volatile int *to_volatile;\n\
+             int *volatile *to_volatile_pointer;\n\
+             int **volatile outer_star;\n\
+             int (*volatile function)(int);\n\
+             int (*plain_function)(int);\n\
+             long (*volatile to_array)[4];\n\
+             long (*plain_to_array)[4];\n\
+             volatile fn_t typedef_before;\n\
+             fn_t volatile typedef_after;\n\
+             fn_t plain_typedef;\n\
+             volatile ip_t data_typedef;\n\
+             volatile fn_t *to_volatile_typedef;\n\
+             vpi_t pointee_typedef;\n\
+             volatile vpi_t both_before;\n\
+             vpi_t volatile both_after;\n\
+             vfn_t chained;\n\
+             volatile fn_t first, second;\n\
+             fn_t *volatile star_first, star_second;\n\
+             volatile fn_t *pointer_first, plain_second;\n\
+             volatile fn_t array[2];\n\
+             vpi_t pointee_array[2];\n\
+             int after_all;\n",
+        );
+        let expected = [
+            ("fn_t", false),
+            ("ip_t", false),
+            // The pointee's qualifier is no qualifier of the pointer ...
+            ("vpi_t", false),
+            // ... and one beside a typedef name is the named type's.
+            ("vfn_t", true),
+            ("vint", true),
+            ("plain", false),
+            ("scalar", true),
+            ("through_typedef", true),
+            ("pointer", true),
+            ("to_volatile", false),
+            ("to_volatile_pointer", false),
+            ("outer_star", true),
+            // The parenthesised pointer is the object: its qualifier was
+            // not read, and a volatile pointer to a function was plain.
+            ("function", true),
+            ("plain_function", false),
+            ("to_array", true),
+            ("plain_to_array", false),
+            // `volatile fn_t f` is `int (*volatile f)(int)`.
+            ("typedef_before", true),
+            ("typedef_after", true),
+            ("plain_typedef", false),
+            ("data_typedef", true),
+            ("to_volatile_typedef", false),
+            // `typedef volatile int *vpi_t; vpi_t p;` is a plain pointer to
+            // a volatile int: the base qualifier the typedef brings is not
+            // one written beside its name.
+            ("pointee_typedef", false),
+            ("both_before", true),
+            ("both_after", true),
+            ("chained", true),
+            // The specifiers' qualifier is every declarator's, a star's its
+            // own declarator's.
+            ("first", true),
+            ("second", true),
+            ("star_first", true),
+            ("star_second", false),
+            ("pointer_first", false),
+            ("plain_second", true),
+            // An array is no volatile object by this flag: its elements
+            // are, which the base flag says.
+            ("array", false),
+            ("pointee_array", false),
+            ("after_all", false),
+        ];
+        let expected: Vec<(String, bool)> = expected
+            .iter()
+            .map(|&(name, volatile)| (name.to_string(), volatile))
+            .collect();
+        assert_eq!(found, expected);
     }
 }

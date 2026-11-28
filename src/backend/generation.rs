@@ -6532,7 +6532,8 @@ fn generate_function_body(
                 if mc.record {
                     let lbl = mcount_label.as_deref().unwrap();
                     cg.state().emit_fmt(format_args!(
-                        ".section __mcount_loc,\"a\",@progbits,{}",
+                        ".section {},\"a\",@progbits,{}",
+                        mc.record_section_name(),
                         lbl
                     ));
                     // Raw non-text `.section` emission: invalidate so the
@@ -6565,7 +6566,8 @@ fn generate_function_body(
                     if let Some(lbl) = &mcount_label {
                         cg.state().emit_fmt(format_args!("{}:", lbl));
                     }
-                    cg.state().emit("call __fentry__");
+                    cg.state()
+                        .emit_fmt(format_args!("call {}", mc.fentry_symbol()));
                 } else {
                     // Classic `call mcount`: deferred until AFTER the frame is
                     // set up (push %rbp; mov %rsp,%rbp) — the mcount ABI reads
@@ -6621,19 +6623,38 @@ fn generate_function_body(
         )
         .is_none();
 
-    let has_inline_asm_fp = func.blocks.iter().any(|block| {
-        block.instructions.iter().any(|inst| {
-            if let Instruction::InlineAsm {
-                template, clobbers, ..
-            } = inst
-            {
-                template_mentions_frame_pointer(template)
-                    || clobbers.iter().any(|c| clobber_is_frame_pointer(c))
-            } else {
-                false
-            }
-        })
-    });
+    // An x86-64 statement that takes %rbp for itself (a clobber, a register
+    // variable) asks for the opposite of one that reads it: the function
+    // must not address its frame through a register the statement destroys.
+    // It used to get a frame pointer like the readers, and every slot access
+    // behind the statement went through the destroyed register. Now %rbp is
+    // an ordinary callee-saved register of such a function, as in GCC --
+    // and where the function cannot do without its frame pointer the
+    // statement is refused in GCC's words, below. (i686 decides the same in
+    // its own prologue; the other targets keep their rule.)
+    let asm_takes_frame_pointer = crate::common::types::target_elf_machine() == 62 // EM_X86_64
+        && func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(inst, Instruction::InlineAsm { outputs, inputs, clobbers, .. }
+                    if crate::backend::inline_asm::x86_asm_takes_frame_pointer(
+                        outputs, inputs, clobbers,
+                    ))
+            })
+        });
+    let has_inline_asm_fp = !asm_takes_frame_pointer
+        && func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                if let Instruction::InlineAsm {
+                    template, clobbers, ..
+                } = inst
+                {
+                    template_mentions_frame_pointer(template)
+                        || clobbers.iter().any(|c| clobber_is_frame_pointer(c))
+                } else {
+                    false
+                }
+            })
+        });
     let has_frame_address = func.blocks.iter().any(|block| {
         block.instructions.iter().any(|inst| {
             matches!(
@@ -6734,6 +6755,12 @@ fn generate_function_body(
     // by accident and makes one addressing mode -- the validated one -- total.
     if frame_size > i32::MAX as i64 {
         cg.state().omit_frame_pointer = false;
+    }
+    if asm_takes_frame_pointer && !cg.state_ref().omit_frame_pointer {
+        // GCC reports it at the end of the function, where it finds out.
+        let at = func.body_span.closing_delimiter().unwrap_or(func.body_span);
+        cg.state_ref()
+            .report_error(at, "bp cannot be used in 'asm' here");
     }
     cg.emit_prologue(func, frame_size);
     // Use counts must be visible to `emit_store_params`: the x86 prologue
@@ -7414,6 +7441,9 @@ fn generate_function_body(
         // load/store pair emitted the store, so the loop must not emit it
         // again (it would read the value's now-stale frame slot).
         let mut skip_i128_copy_store = false;
+        // The carry half of a full adder, emitted with the word before it:
+        // its index in the block.
+        let mut carry_out_emitted: Option<usize> = None;
 
         cg.state().block_use_counts.clear();
         cg.state().pending_load_cmp.clear();
@@ -7540,6 +7570,10 @@ fn generate_function_body(
                 continue;
             }
             if bit_test_fusions.take_covered() {
+                cg.state().current_program_point += 1;
+                continue;
+            }
+            if carry_out_emitted == Some(idx) {
                 cg.state().current_program_point += 1;
                 continue;
             }
@@ -7931,6 +7965,34 @@ fn generate_function_body(
             if bit_test_fusions.try_emit(cg, block, idx) {
                 cg.state().current_program_point += 1;
                 continue;
+            }
+
+            // The word of a full adder directly followed by its carry out:
+            // one `adc` and its flag (`passes::carry_chain` places them so).
+            if let (
+                Instruction::Intrinsic {
+                    dest: Some(word),
+                    op: crate::ir::intrinsics::IntrinsicOp::Carry(carry),
+                    args,
+                    ..
+                },
+                Some(Instruction::Intrinsic {
+                    dest: Some(out),
+                    op: crate::ir::intrinsics::IntrinsicOp::Carry(partner),
+                    args: out_args,
+                    ..
+                }),
+            ) = (inst, block.instructions.get(idx + 1))
+                && !carry.out
+                && *partner == carry.partner()
+                && args == out_args
+            {
+                cg.flush_machinst();
+                if cg.emit_carry_pair(word, out, *carry, args) {
+                    carry_out_emitted = Some(idx + 1);
+                    cg.state().current_program_point += 1;
+                    continue;
+                }
             }
 
             if let Some(fusion) = conditional_increment_fusions

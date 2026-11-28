@@ -35,12 +35,39 @@
 //! keeps the declared alignment.  Relaxation stops at 16: a 16-byte slot
 //! is a direct frame slot (no masked addressing) and still satisfies every
 //! aligned-SSE contract the backend may apply to it.
+//!
+//! What sits BESIDE the call is the other half.  The home a call marshals
+//! is, in real code, filled or drained by an intrinsic in pointer form:
+//!
+//! ```c
+//! _mm256_storeu_si256(d, step(_mm256_loadu_si256(x), _mm256_loadu_si256(y), k));
+//! ```
+//!
+//! ```text
+//!   %a = alloca 32 align 32
+//!   Loadu256  dest_ptr=%a, args=[%x]        ; fills the argument home
+//!   %r = alloca 32 align 32
+//!   call step(%r, %a, ...)                  ; %a in %ymm0, %r the %ymm0 result
+//!   Storeu256 dest_ptr=%d, args=[%r]        ; drains the result buffer
+//! ```
+//!
+//! Phase 11d refuses the home for its call, and this pass used to refuse it
+//! for its intrinsic: neither relaxed it, and each of its accesses paid the
+//! masked address (six `leaq`/`andq` pairs per iteration of that loop, 2.6
+//! times GCC 16.2's time).  The two allowlists are one question asked of two
+//! kinds of use, so an intrinsic position is answered here by the table
+//! Phase 11d answers it with (`intrinsic_arg_required_alignment` /
+//! `intrinsic_dest_required_alignment`): a position the emitter reaches with
+//! an unaligned-safe access, or one whose contract is 16 bytes, survives the
+//! relaxation to 16; a 32-byte contract (`_mm256_store_si256`,
+//! `_mm256_stream_si256`, `_mm256_load_si256`) and every position the table
+//! does not list keep the declared alignment.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::AddressSpace;
 use crate::ir::instruction::Instruction;
 use crate::ir::intrinsics::IntrinsicOp;
-use crate::ir::reexports::{IrFunction, IrModule, Operand};
+use crate::ir::reexports::{IrFunction, IrModule, Operand, Value};
 
 /// Relax the alignment of call-marshalled vector homes across `module`.
 /// Returns the number of allocas changed.
@@ -137,6 +164,39 @@ fn call_use_is_marshalled(
         }
     }
     true
+}
+
+/// Whether every appearance of an alias in one explicit-SIMD intrinsic is a
+/// memory operand that tolerates a home aligned to 16.
+///
+/// The answer is the table Phase 11d relaxes by, read with this pass's
+/// target in mind: `Some(n)` is the alignment the emitter's access of that
+/// position needs (0: an unaligned-safe move or a VEX/EVEX memory operand),
+/// `None` a position that is not known to be a memory operand at all (an
+/// immediate, a count, an address taken as a value).  Sixteen is what the
+/// home keeps, at every constant offset: a derivation `home + k` is aligned
+/// to 16 exactly when `k` is, before the relaxation and after it.
+fn intrinsic_use_tolerates_16(
+    op: IntrinsicOp,
+    has_result: bool,
+    dest_ptr: Option<&Value>,
+    args: &[Operand],
+    aliases: &FxHashSet<u32>,
+    home_size: usize,
+) -> bool {
+    use super::vector_temp_promotion::{
+        intrinsic_arg_required_alignment, intrinsic_dest_required_alignment,
+    };
+    if dest_ptr.is_some_and(|pointer| aliases.contains(&pointer.0))
+        && !intrinsic_dest_required_alignment(op, has_result, home_size)
+            .is_some_and(|required| required <= 16)
+    {
+        return false;
+    }
+    args.iter().enumerate().all(|(index, arg)| {
+        !operand_aliases(arg, aliases)
+            || intrinsic_arg_required_alignment(op, index).is_some_and(|required| required <= 16)
+    })
 }
 
 fn relax_in_function(func: &mut IrFunction) -> usize {
@@ -262,9 +322,13 @@ fn relax_in_function(func: &mut IrFunction) -> usize {
                     // relies on).
                     Instruction::Memcpy { .. } => true,
                     // Whole-register unaligned vector readers/writers, in
-                    // their address position only.
+                    // their address position only; every other intrinsic by
+                    // the per-position alignment table.
                     Instruction::Intrinsic {
-                        op, args, dest_ptr, ..
+                        dest,
+                        op,
+                        args,
+                        dest_ptr,
                     } => {
                         if whole_vector_load(*op) {
                             dest_ptr.is_none()
@@ -276,7 +340,14 @@ fn relax_in_function(func: &mut IrFunction) -> usize {
                                 && !operand_aliases(&args[0], aliases)
                                 && matches!(args[2], Operand::Const(_))
                         } else {
-                            false
+                            intrinsic_use_tolerates_16(
+                                *op,
+                                dest.is_some(),
+                                dest_ptr.as_ref(),
+                                args,
+                                aliases,
+                                candidates[&root],
+                            )
                         }
                     }
                     Instruction::Call { info, .. } => {
@@ -595,6 +666,227 @@ mod tests {
         );
         assert_eq!(relax_in_function(&mut f), 0);
         assert_eq!(alignment_of(&f, 1), 32);
+    }
+
+    fn simd(
+        op: IntrinsicOp,
+        dest: Option<u32>,
+        dest_ptr: Option<u32>,
+        args: Vec<Operand>,
+    ) -> Instruction {
+        Instruction::Intrinsic {
+            dest: dest.map(Value),
+            op,
+            dest_ptr: dest_ptr.map(Value),
+            args,
+        }
+    }
+
+    fn value(id: u32) -> Operand {
+        Operand::Value(Value(id))
+    }
+
+    /// `_mm256_storeu_si256(d, step(_mm256_loadu_si256(x), _mm256_loadu_si256(y)))`:
+    /// two argument homes an unaligned load fills, a result buffer an
+    /// unaligned store drains.  All three are direct slots afterwards.
+    #[test]
+    fn homes_filled_and_drained_by_unaligned_intrinsics_relax() {
+        let mut f = function(
+            "step",
+            vec![block(
+                0,
+                vec![
+                    alloca(1, 32, 32),
+                    simd(IntrinsicOp::Loadu256, Some(11), Some(1), vec![value(20)]),
+                    alloca(2, 32, 32),
+                    simd(IntrinsicOp::Loadu256, Some(12), Some(2), vec![value(21)]),
+                    alloca(3, 32, 32),
+                    ymm_call(vec![3, 1, 2], true),
+                    simd(IntrinsicOp::Storeu256, None, Some(22), vec![value(3)]),
+                ],
+            )],
+        );
+        assert_eq!(relax_in_function(&mut f), 3);
+        for home in [1, 2, 3] {
+            assert_eq!(alignment_of(&f, home), 16, "home {home}");
+        }
+    }
+
+    /// The same at the other two widths: a 16-byte home declared over-aligned
+    /// and a 64-byte one, each beside its call.
+    #[test]
+    fn the_union_holds_at_16_and_64_bytes() {
+        for (size, load, class_tail) in [
+            (16usize, IntrinsicOp::Loaddqu, 1usize),
+            (64, IntrinsicOp::Loadu512, 7),
+        ] {
+            let mut call = ymm_call(vec![1], false);
+            if let Instruction::Call { info, .. } = &mut call {
+                let mut classes = vec![EightbyteClass::Sse];
+                classes.extend(std::iter::repeat_n(EightbyteClass::SseUp, class_tail));
+                info.struct_arg_sizes = vec![Some(size)];
+                info.struct_arg_aligns = vec![Some(size)];
+                info.struct_arg_classes = vec![classes];
+            }
+            let mut f = function(
+                "wide",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(1, size, 64),
+                        simd(load, Some(11), Some(1), vec![value(20)]),
+                        call,
+                    ],
+                )],
+            );
+            assert_eq!(relax_in_function(&mut f), 1, "{size} bytes");
+            assert_eq!(alignment_of(&f, 1), 16, "{size} bytes");
+        }
+    }
+
+    /// A binary operation reads the home as a vector operand and writes a
+    /// second one; a 16-byte contract (`_mm_stream_si128`) is one the relaxed
+    /// home still meets.
+    #[test]
+    fn vector_operands_and_16_byte_contracts_relax() {
+        let mut f = function(
+            "ops",
+            vec![block(
+                0,
+                vec![
+                    alloca(1, 32, 32),
+                    alloca(2, 32, 32),
+                    simd(
+                        IntrinsicOp::Paddd256,
+                        Some(11),
+                        Some(2),
+                        vec![value(1), value(20)],
+                    ),
+                    ymm_call(vec![1, 2], false),
+                ],
+            )],
+        );
+        assert_eq!(relax_in_function(&mut f), 2);
+        let mut call = ymm_call(vec![1], false);
+        if let Instruction::Call { info, .. } = &mut call {
+            info.struct_arg_sizes = vec![Some(16)];
+            info.struct_arg_aligns = vec![Some(16)];
+            info.struct_arg_classes = vec![vec![EightbyteClass::Sse, EightbyteClass::SseUp]];
+        }
+        let mut g = function(
+            "stream",
+            vec![block(
+                0,
+                vec![
+                    alloca(1, 16, 32),
+                    simd(IntrinsicOp::Movntdq, None, Some(1), vec![value(20)]),
+                    call,
+                ],
+            )],
+        );
+        assert_eq!(relax_in_function(&mut g), 1);
+        assert_eq!(alignment_of(&g, 1), 16);
+    }
+
+    /// What must keep its alignment: a 32-byte contract in either direction
+    /// (`_mm256_store_si256`, `_mm256_stream_si256`, `_mm256_load_si256`), a
+    /// position that is no memory operand (a shift count), an operation the
+    /// table does not know, and a home that is one operand too many.
+    #[test]
+    fn aligned_contracts_and_unlisted_positions_are_refused() {
+        let refused = [
+            (
+                "aligned store",
+                simd(IntrinsicOp::Store256, None, Some(1), vec![value(20)]),
+            ),
+            (
+                "streaming store",
+                simd(IntrinsicOp::Movntdq256, None, Some(1), vec![value(20)]),
+            ),
+            (
+                "aligned load",
+                simd(IntrinsicOp::Load256, Some(11), Some(9), vec![value(1)]),
+            ),
+            (
+                "streaming load",
+                simd(IntrinsicOp::Movntdqa256, Some(11), Some(9), vec![value(1)]),
+            ),
+            (
+                "shift count",
+                simd(
+                    IntrinsicOp::Psllidi256,
+                    Some(11),
+                    Some(9),
+                    vec![value(20), value(1)],
+                ),
+            ),
+            (
+                "unlisted operation",
+                simd(
+                    IntrinsicOp::Rdtscp,
+                    Some(11),
+                    None,
+                    vec![value(20), value(1)],
+                ),
+            ),
+            (
+                "third operand of a binary operation",
+                simd(
+                    IntrinsicOp::Paddd256,
+                    Some(11),
+                    Some(9),
+                    vec![value(20), value(21), value(1)],
+                ),
+            ),
+        ];
+        for (why, use_of_home) in refused {
+            let mut f = function(
+                "kept",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(1, 32, 32),
+                        alloca(9, 32, 16),
+                        use_of_home,
+                        ymm_call(vec![1], false),
+                    ],
+                )],
+            );
+            assert_eq!(relax_in_function(&mut f), 0, "{why}");
+            assert_eq!(alignment_of(&f, 1), 32, "{why}");
+        }
+    }
+
+    /// A result written into a home of another size is not the whole-object
+    /// write the table speaks of.
+    #[test]
+    fn a_result_of_another_width_is_refused() {
+        let mut call = ymm_call(vec![1], false);
+        if let Instruction::Call { info, .. } = &mut call {
+            let mut classes = vec![EightbyteClass::Sse];
+            classes.extend(std::iter::repeat_n(EightbyteClass::SseUp, 7));
+            info.struct_arg_sizes = vec![Some(64)];
+            info.struct_arg_aligns = vec![Some(64)];
+            info.struct_arg_classes = vec![classes];
+        }
+        let mut f = function(
+            "narrow",
+            vec![block(
+                0,
+                vec![
+                    alloca(1, 64, 64),
+                    simd(
+                        IntrinsicOp::Paddd256,
+                        Some(11),
+                        Some(1),
+                        vec![value(20), value(21)],
+                    ),
+                    call,
+                ],
+            )],
+        );
+        assert_eq!(relax_in_function(&mut f), 0);
+        assert_eq!(alignment_of(&f, 1), 64);
     }
 
     /// Without any call the pass leaves the function to

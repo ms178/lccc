@@ -206,7 +206,7 @@ class RegistryTableTest(unittest.TestCase):
 
     def test_every_cell_is_known(self):
         verdicts = matrix.registry_verdicts()
-        self.assertEqual(len(verdicts), 30, 'fifteen names x two targets')
+        self.assertEqual(len(verdicts), 32, 'sixteen names x two targets')
         self.assertLessEqual(
             set(verdicts.values()),
             {'Default', 'GccIgnored', 'OnlyAvailable32Bit', 'Unsupported',
@@ -226,6 +226,14 @@ class RegistryTableTest(unittest.TestCase):
         }
         for cell, verdict in expected.items():
             self.assertEqual(verdicts[cell], verdict, cell)
+
+    def test_an_interrupt_handler_is_refused_on_both_targets(self):
+        # The contract is with the CPU (an interrupt frame, every register
+        # preserved, `iret`): compiled as an ordinary function it links
+        # and faults when the interrupt fires.
+        verdicts = matrix.registry_verdicts()
+        for target in ('x86-64', 'i686'):
+            self.assertEqual(verdicts[('interrupt', target)], 'Unsupported', target)
 
     def test_register_contracts_are_refused(self):
         verdicts = matrix.registry_verdicts()

@@ -232,9 +232,21 @@ impl Lowerer {
         r
     }
 
-    /// The callee a call to `func` targets, seen through `(*f)(...)` on a
-    /// function pointer or designator and `(&g)(...)` on a function name.
-    pub(super) fn resolve_callee<'e>(&self, func: &'e Expr) -> &'e Expr {
+    /// `func` without the dereferences that designate the function it
+    /// already designates: `(*f)(x)` and `(**f)(x)` of a function pointer or
+    /// a function name are `f(x)`.  A `*pp` of a pointer to a function
+    /// pointer is a load and stays: what is called is what it loads, and its
+    /// type is the type of the call.
+    ///
+    /// Every question about a call asks through here -- which function, what
+    /// it returns, how its result is passed -- so that the answers describe
+    /// one callee.  The type questions used to take every `*` off instead,
+    /// and typed `(*pp)(1)` by `pp`: an `int` came back as a pointer, which
+    /// is 64 bits wide and unsigned.  With `int (**pp)(int)` and a function
+    /// that returns -1, `long f(void) { return (*pp)(1); }` returned
+    /// 4294967295, `(*pp)(1) < 0` was false, and `(*dpp)(5.0) + 1` of a
+    /// `double (**dpp)(double)` added 1 to the bits of the double.
+    pub(super) fn strip_designator_derefs<'e>(&self, func: &'e Expr) -> &'e Expr {
         let mut callee = func;
         while let Expr::Deref(inner, _) = callee {
             if !self.is_function_pointer_deref(inner) {
@@ -242,6 +254,13 @@ impl Lowerer {
             }
             callee = inner;
         }
+        callee
+    }
+
+    /// The callee a call to `func` targets, seen through `(*f)(...)` on a
+    /// function pointer or designator and `(&g)(...)` on a function name.
+    pub(super) fn resolve_callee<'e>(&self, func: &'e Expr) -> &'e Expr {
+        let mut callee = self.strip_designator_derefs(func);
         if let Expr::AddressOf(inner, _) = callee {
             if let Expr::Identifier(name, _) = inner.as_ref() {
                 if !self.is_func_ptr_variable(name) {

@@ -1,0 +1,1 @@
+-O2 -madx -mrdpid -mclflushopt -mclwb -mxsaveopt -mxsavec -mshstk -msse4.2 -mbmi

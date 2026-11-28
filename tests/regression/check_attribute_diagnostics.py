@@ -128,6 +128,28 @@ PROBES = [
      "'noinline' attribute ignored", False),
     ('ignored-cleanup-on-pointer-return-function', 'int __attribute__((cleanup(c))) *f(void);',
      "'cleanup' attribute ignored", False),
+    # A declarator of a typedef that names a function type declares a
+    # function (`F f;`), so a function attribute applies to it; a typedef of
+    # any other type declares an object, and a pointer to the function type
+    # is an object too. The typedef's own scope decides which name is meant.
+    ('ok-noinline-function-typedef',
+     'typedef int F(void); __attribute__((noinline)) F f;', None, False),
+    ('ok-target-function-typedef',
+     'typedef int F(void); __attribute__((target("sse4.2"))) F f;', None, False),
+    ('ok-cold-typedef-of-function-typedef',
+     'typedef int F(void); typedef F G; __attribute__((cold)) G g;', None, False),
+    ('ok-cold-function-typedef-after-local-shadow',
+     'typedef int F(void); void h(void) { typedef int F; F v = 0; (void)v; } '
+     '__attribute__((cold)) F after;', None, False),
+    ('ignored-noinline-object-typedef',
+     'typedef int T; __attribute__((noinline)) T x;',
+     "'noinline' attribute ignored", False),
+    ('ignored-noinline-pointer-to-function-typedef',
+     'typedef int F(void); typedef F *PF; __attribute__((noinline)) PF p;',
+     "'noinline' attribute ignored", False),
+    ('ignored-cold-object-typedef-after-local-shadow',
+     'typedef int T; void h(void) { typedef int T(void); extern T inner; (void)inner; } '
+     '__attribute__((cold)) T x;', "'cold' attribute ignored", False),
     # `noreturn` on a declarator that names a function TYPE belongs to that
     # type; gcc-16.2 is silent for a function-pointer object and a typedef
     # (measured), so the object-target verdict must not fire.
@@ -158,7 +180,7 @@ UNIMPLEMENTED = sorted(set("""
 access alloc_align alloc_size artificial assume assume_aligned btf_decl_tag btf_type_tag
 cf_check copy deprecated expected_throw
 fallthrough fd_arg fd_arg_read fd_arg_write flag_enum flatten format
-format_arg hardbool hot indirect_branch indirect_return interrupt leaf malloc
+format_arg hardbool hot indirect_branch indirect_return leaf malloc
 may_alias ms_hook_prologue musttail no_address_safety_analysis
 no_icf no_profile_instrument_function
 no_reorder no_sanitize_address no_sanitize_coverage no_sanitize_thread no_split_stack

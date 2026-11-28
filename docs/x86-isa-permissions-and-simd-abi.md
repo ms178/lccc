@@ -91,10 +91,65 @@ implied) happens before either.
 * **Then the override implications**, unless the implied feature is
   explicit, from the command line or an option: `-mno-popcnt` with
   `target("sse4.2")` has no POPCNT.
-* **Errors** use GCC's wording: a repeated `key=`, an unknown or `native`
-  CPU, `arch=generic` (allowed only for `tune=`), and a 32-bit-only CPU
-  on x86-64. `target` together with `target_clones` is diagnosed, and the
-  `target_clones` attribute is ignored, as in GCC.
+* **Errors** use GCC's wording: a repeated `arch=` or `tune=`, an unknown
+  or `native` CPU, `arch=generic` (allowed only for `tune=`), and a
+  32-bit-only CPU on x86-64. `target` together with `target_clones` is
+  diagnosed, and the `target_clones` attribute is ignored, as in GCC.
+* **An argument GCC does not know is an error**: "attribute 'target'
+  argument 'foo' is unknown", once per argument, at the function's name.
+  Until PR #1211 lccc ignored such an argument in silence, so
+  `target("avx2,ssse4.1")` compiled its function without the misspelt
+  extension and `target("AVX2")`, `target("-mavx2")` and `target("bmi 2")`
+  without any. The vocabulary is measured, not listed by hand: the
+  generator tries every `-mNAME` option GCC documents as an attribute
+  argument, in both modes, and records the 119 names GCC takes
+  (`X86_TARGET_ATTRIBUTE_NAMES`), the one it will not negate
+  (`general-regs-only`), and the values of `fpmath=` and
+  `prefer-vector-width=`; `arch=` and `tune=` are the only other keys.
+  The string is read as GCC reads it, a blank being part of a name
+  (`"avx2, sse"` names ` sse`), and the whole string `default` is the
+  multiversioning spelling. A name of the list that lccc does not model
+  (`rdseed`, `clwb`, `tbm`, ...) is accepted and changes nothing. Gate:
+  `tests/regression/check_target_attribute_arguments.py` (91
+  declarations in two fixtures, 73 errors, lccc and GCC 16.2 each against
+  the fixtures' comments).
+* **Every declaration counts, not the definition alone.** GCC merges the
+  declarations of a function, and the last one that names a target
+  decides (`Lowerer::function_decl_targets`): a definition that says
+  nothing is compiled for the target its prototype named, and
+  `target("avx2")` on a prototype followed by `target("bmi2")` on the
+  definition is BMI2 only. Until PR #1211 lccc looked at the definition
+  alone, so `__attribute__((target("avx2"))) __m256i f(__m256i);` followed
+  by a plain definition using `_mm256_add_epi32` was refused. A prototype's
+  string is judged like a definition's, at the declared name, and a
+  function declared through a typedef of a function type (`fn_type f;`)
+  is a function for the attribute (it used to draw "'target' attribute
+  ignored").
+* **`#pragma GCC target("...")`** puts its strings in front of the
+  `target` of every function declared after it, until `#pragma GCC
+  pop_options` returns to what the matching `push_options` saved or
+  `reset_options` to the command line; several pragmas accumulate, a
+  pragma takes several strings (`target("bmi", "bmi2")`), adjacent
+  literals paste, the parentheses are optional, and `_Pragma` works the
+  same. The preprocessor turns each pragma into a marker statement
+  (`pragma_gcc_options_marker`, rendered back by `-E`), the parser keeps
+  the strings in force and stamps them on each declaration
+  (`DeclAttributes::pragma_target`), and `effective_target_options` joins
+  them with the declaration's own attribute. Until PR #1211 the pragma
+  was dropped whole: the functions of a region were compiled without the
+  extensions the region asked for and refused as soon as they used one,
+  which is how vendored SIMD kernels are written. Diagnostics follow
+  GCC: a pragma whose string is refused is diagnosed once, where it
+  stands, and does not reach the functions after it (GCC prints these as
+  `cc1: error:` without a location; lccc gives the pragma's line); an
+  `arch=` in a pragma and another on the function, or in a second
+  pragma, is "was already specified" at each function declared under
+  both; the pragma inside a function body is "'#pragma GCC option' is
+  not allowed inside functions". Not done: the pragma does not update the
+  predefined macros (`__AVX2__` stays as the command line left it, where
+  GCC defines it inside the region), `#pragma GCC optimize` is ignored,
+  and the `-Wpragmas` warnings for a malformed pragma or a `pop_options`
+  without a push are not given (the pragma is ignored, as in GCC).
 
 ### 1.3 Intrinsic permission
 
@@ -181,7 +236,94 @@ path they select compiles.
 ### 1.6 Predefined macros
 
 The ISA macros (`__AVX2__`, `__BMI2__`, ...) follow the resolved
-permission (§1). GCC also names the CPU:
+permission (§1).
+
+**The scalar and system extensions** (PR #1211) are announced the same
+way: `adx`, `cldemote`, `clflushopt`, `clwb`, `clzero`, `enqcmd`,
+`fsgsbase`, `hreset`, `movdir64b`, `movdiri`, `mwaitx`, `pconfig`, `pku`,
+`ptwrite`, `rdpid`, `rdseed`, `rtm`, `sahf`, `serialize`, `sgx`, `shstk`,
+`tsxldtrk`, `uintr`, `waitpkg`, `wbnoinvd`, `xsavec`, `xsaveopt` and
+`xsaves`. Each is one or a few instructions on general registers or memory
+that no generated code uses, so the whole of it is an option, a macro and
+the intrinsics of `include/x86gprintrin.h`:
+
+* `-mNAME` / `-mno-NAME` are accepted (they were "unsupported machine
+  option"), the last explicit spelling deciding on either side of a
+  `-march=`, and each CPU row grants what GCC grants: `-march=skylake`
+  now defines `__ADX__`, `__RDSEED__`, `__CLFLUSHOPT__`, `__FSGSBASE__`,
+  `__XSAVEC__`, `__XSAVES__`, `__SGX__`, ... Before, lccc defined none of
+  these 28 macros for any CPU.
+* They are rows of the generated table (`X86ExtraFeature`, measured from
+  GCC by `scripts/gen_x86_arch_table.py` like the features), and the
+  driver keeps them as bits of one word (`Driver::x86_plain_extras`)
+  instead of a field, an option arm and a macro arm each: an extension of
+  this kind is added by adding its row. The 14 older macro-only
+  extensions keep their fields, which code generation or another option
+  reads.
+* What GCC makes of them is measured, not assumed: the XSAVE family
+  brings `__XSAVE__` and leaves with `-mno-xsave`; `__LAHF_SAHF__` is
+  defined in every 32-bit mode unless `-mno-sahf` denies it; `-muintr` is
+  an error in 32-bit code ("'-muintr' not supported for 32-bit code") and
+  a CPU row's user interrupts are left out there. `-march=native` grants
+  them from the same CPUID probe as `__builtin_cpu_supports`.
+* The macro is a promise of the intrinsics, and the header keeps it: 83
+  intrinsics of 27 GCC headers that could not be called can
+  (`tests/x86-intrinsics/expected.txt`: 6,183 missing before, 6,100
+  after). Each is the instruction itself, as an assembler statement; the
+  add-with-carry family (`_addcarry_u64`, `_subborrow_u64`, ...) is
+  arithmetic. `tests/regression/check_x86_gpr_intrinsics.py` holds every
+  one to GCC 16.2 without executing it: the same instruction in the same
+  form, and, with both programs stopped in front of it under GDB, the
+  same explicit operands and the same implicitly read registers (ECX = 0
+  for `rdpkru`, EDX:EAX for the XSAVE family, RBX/RCX/RDX per enclave
+  leaf). The ones a process may execute are executed
+  (`x86_gpr_intrinsics_runtime.c`, and `_i686`).
+* The same promise for the AVX-512 integer compares that write a mask.
+  `vpcmp` takes its predicate as an immediate; the headers name six of
+  the eight (`cmpeq`, `cmpneq`, `cmplt`, `cmple`, `cmpgt`, `cmpge`) and
+  give every form a twin under a mask (`_mm512_mask_cmpge_epu8_mask`,
+  `_mm256_mask_cmp_epi64_mask`), for eight element types and three
+  widths. lccc had `cmpeq` and the numbered form; the other 288 are
+  generated from the same rows (`scripts/gen_lcccsimd.py`; 6,100 missing
+  before, 5,812 after). `tests/regression/avx512_mask_compare_names.c`
+  calls every form and holds each mask to a compare of the elements one
+  at a time.
+
+Not announced, and their options still refused: `prefetchi` (the
+instruction prefetches only through a RIP-relative operand, which the
+assembler-statement form does not produce: the intrinsic would be a
+no-operation), `kl`/`widekl`, `lwp`, `tbm`, `sse4a`, `fma4`, `xop`, the
+AMX sub-extensions and 3DNow!, whose intrinsics lccc does not have. The
+refusal says so, and the `-mno-` form of each is accepted: none of
+their instructions is ever generated.
+
+Two extensions GCC has a bit of its own for ride another one here.
+`__CRC32__` and the `crc32` intrinsics are SSE4.2's, `_mm_monitor` and
+`_mm_mwait` are SSE3's. `-mcrc32` and `-mmwait` are therefore accepted
+where the parent is enabled and refused where it is not, and `-mno-crc32`
+and `-mno-mwait` the other way round: with SSE4.2 on, `-mno-crc32` used
+to pass in silence and leave `__CRC32__` defined, where GCC withdraws it.
+
+#### Machine options that are not ISA options
+
+Every other x86 `-m` spelling of GCC 16.2 (666 in all,
+`gcc --completion=-m`) that no arm of the driver takes is a row of a
+generated table, `docs/x86-machine-options.md`: accepted in silence where
+it names what the compiler does (`-mlong-double-80`, `-masm=att`,
+`-mtls-direct-seg-refs`, `-mfpmath=sse` on x86-64), a hint with a warning
+where it chooses among equivalent code (`-mbranch-cost=`,
+`-mtune-ctrl=`, `-mstv`), and refused with the reason where it asks for
+another layout, convention or record (`-mabi=ms`, `-mlong-double-64`,
+`-mno-direct-extern-access`, `-mneeded`). `scripts/gen_x86_mflag_policy.py`
+owns the table and holds it to both compilers.
+
+Known cost: lccc does not carry the carry flag from one `_addcarry_u64`
+to the next. A 2,048-limb addition takes 2.25 s where GCC 16.2 takes
+0.75 s and Clang 23.1.5 0.50 s (400,000 rounds, Ice Lake); about fifteen
+instructions a limb instead of one `adc` chain. The results are equal;
+the code generation is open work.
+
+GCC also names the CPU:
 
 * `-march=X` defines X's measured `-march=` macros. The default `x86-64`
   (and v2 to v4) define `__k8`/`__k8__`.
@@ -302,6 +444,323 @@ flag moves no predefined macro — GCC defines none for it either.
 caller/callee pairings. `check_legacy_sse_permissions.py` checks the
 SSE1/SSE2 boundary of every public intrinsic.
 
+### 2.1 Vector, mask and MMX operands of `asm` statements
+
+The back ends give an `asm` operand a general register or an `xmm`
+register. Operands of three other kinds are loaded and stored by the
+statement itself: the lowering rewrites it
+(`src/ir/lowering/x86_asm_registers.rs`).
+
+| Operand | Constraint | Register | Moves |
+|---|---|---|---|
+| 256-bit vector | `x`, `v`, `Yz` | `ymm15` downwards (`ymm7` on i686), `ymm0` for `Yz` | `vmovdqu` from and to memory |
+| 512-bit vector | `x`, `v`, `Yz` | `zmm15` downwards | `vmovdqu64` |
+| integer or pointer of 8 to 64 bits | `k`, `Yk` | `k7` down to `k1` | `kmovw`, `kmovd`, `kmovq` through a general register; 64 bits on i686 through memory |
+| 64-bit vector, integer of 32 or 64 bits | `y` | `mm7` downwards | `movd`, `movq` through a general register; 64 bits on i686 through memory |
+
+A register that the template or the clobber list names is not taken, and
+the registers taken are added to the clobbers. `%x0`, `%t0` and `%g0`
+print the `xmm`, `ymm` and `zmm` name of a vector operand's register. An
+input tied to such an operand is loaded into its register. A constraint
+that offers memory beside the register (`xm`) is given memory. A local
+register variable of a vector type (`register __m256i v asm("ymm7")`)
+keeps its register.
+
+Before this, a 256- or 512-bit operand was moved eight bytes wide into an
+`xmm` register and printed under the `xmm` name (wrong values at every
+level, no diagnostic), `k` was refused, and `Yk` and `y` stopped in the
+assembler. A 64-bit vector in any register class was the address of the
+variable instead of its value.
+
+Differences from GCC 16.2, each pinned by the gate:
+
+* An eight-bit mask has the bits above it cleared in the mask register
+  (`kshiftlw`, `kshiftrw`); GCC without AVX-512DQ leaves them as the
+  general register had them.
+* `"y"` with a `float` is refused; GCC moves it into an MMX register.
+* An output of an `asm goto` and a register variable in a mask or MMX
+  register are refused.
+* The function's instruction sets are not asked: 64 bits of mask without
+  AVX-512BW and a 256-bit vector without AVX are accepted. The statement
+  names the registers, and its instructions need the extension anyway.
+* A wide vector is in memory before and behind the statement, so each
+  operand costs a load or a store that GCC does not emit. The intrinsics
+  do not go this way.
+
+### 2.2 512-bit vector objects in registers
+
+A vector has no IR type: a `__m512i` is a 64-byte object, an operation
+reads and writes it through pointers, and each inlined intrinsic copies
+its arguments. The 128- and 256-bit widths leave that form in the pass
+pipeline. The 512-bit width keeps it, and `backend::x86_zmm_homes` gives
+the object a register instead of a stack slot at the end of the pipeline:
+
+* **Which objects.** A 64-byte object, not volatile and not a parameter's
+  home, whose every mention reads or writes it whole: the operations of
+  `x86_zmm_homes::signature` and 64-byte copies. One lane access, call
+  argument, masked operation, `_mm512_castsi512_si256`, `asm` operand or
+  address that goes anywhere else leaves the object in memory.
+* **Which registers.** `zmm16`..`zmm31`. Nothing else in the back end
+  names them, both calling conventions leave them to the caller, and
+  `vzeroupper` neither clears them nor is needed after code that writes
+  only them (GCC 16.2 and Clang 23.1.5 emit none there either).
+* **Calls.** Nobody preserves the registers. An object that holds a value
+  across a call, a library helper or an `asm` statement with a template
+  stays in memory; the others of the same function do not.
+* **Copies.** The names one value has (the parameter of an inlined
+  function, its result, a plain `b = a`) are one register where no name is
+  written while another still holds the value. A copy between them is no
+  instruction.
+* **Which functions.** Those with a 512-bit operation. A function that
+  only copies 64-byte structures has not said that it may execute AVX-512.
+* **Not yet.** Parameters and results (a `__m512i` parameter is stored to
+  its slot by the prologue and read from there), and the operations
+  outside the table: widening, conversions between widths, insert and
+  extract, masked forms.
+
+`CCC_DISABLE_PASSES=zmmhome` switches it off. The decision is checked
+again at code generation, and a function for which it no longer holds is
+compiled without homes; `CCC_VERIFY_IR=1` reports such a function.
+
+### 2.3 Integer results of vector operations
+
+`_mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) == 0xffff` asks whether two
+blocks are equal. It is a vector operation whose result is an integer,
+followed by integer code, and four things stood between the two:
+
+* **The result had no register.** The mask, movemask, extract, conversion
+  and test operations (`x86_common::X86_64_INTEGER_RESULTS`, 48 of them)
+  were not register candidates, so the result went to a stack slot and
+  the compare behind it read the slot. They are candidates now. Their
+  emitters compute in `%xmm0`, `%xmm1`, `%k1` and `%rax`, none of which
+  the allocator gives out, and write the result after the last operand is
+  read; `integer_result_contract_tests` runs each of the 48 with its
+  result in a register and holds it to that.
+* **A result in a register was computed in `%rax` and copied.** The
+  peephole's producer retarget (`retarget_producer_into_copy`) knows the
+  instructions that move a value out of a vector or mask register
+  (`pmovmskb`, `movmskps`, `movd`, `pextrw`, `cvttsd2si`, `kmovw`, ...) and
+  writes the destination directly. A 64-bit result under a 32-bit copy
+  is left alone.
+* **The copies around the operand outlived the passes that remove them.**
+  An operation that takes its operand through a pointer has the operand
+  stored and loaded again; store forwarding turns the pair into a
+  register copy in phase 2, behind the last turn of the vector copy
+  passes. Those four passes run again in phase 3. `pmovmskb`, `movmskps`
+  and `movmskpd` are listed with the one vector register they read;
+  unlisted, they read all of them and kept every copy alive.
+* **A 512-bit mask compare loaded its second source.** `vpcmp*` takes a
+  register or memory there, and EVEX asks no alignment: the operand is
+  compared where it is (`mask_cmp_source_512`), and the `kmov` behind it
+  is a plain write for the peephole, with the zero-extension its width
+  gives.
+* **A 32-byte store had no mapping.** The store forwarder kept a slot's
+  register for stores of sixteen bytes and fewer, so a 256-bit value that
+  went through a slot came back through it. A 32-byte store from
+  `%ymm0`..`%ymm15` maps its slot now, and a 32-byte reload is the register
+  move of the load's own spelling: both copy 256 bits and, being VEX.256,
+  zero bits 256 and up of the destination. Into the register that wrote
+  the slot, only that zeroing is left of the reload; it goes when the
+  upper half of the `zmm` register is dead and stays otherwise. A narrower
+  reload reads the low half (`%xmmN` of `%ymmN`). `vzeroupper` ends a
+  32-byte mapping and no other. The unaligned double-precision move
+  (`movupd`, `vmovupd`) was the one packed spelling that was no slot move
+  to the peephole at all, at either width: every `__m128d` and `__m256d`
+  home kept its store and its reload.
+* **The float sign masks had no row.** `_mm256_movemask_ps` and
+  `_mm256_movemask_pd` read their operand whole through an unaligned load,
+  like the byte mask, but were not among the operations of
+  `pointer_vector_arg_width` that say so. A home they read kept its
+  32-byte alignment (an address computed and masked at every access), and
+  a parameter was copied into such a home half by half. The same table
+  had no row for `vtestps`, the variable blends, the 256-bit FMA3 forms
+  and eleven of the fourteen VNNI dot products, and
+  `IntrinsicOp::vector_home_width` none for the results of the last three
+  groups.
+
+Instructions, `ret` included, at `-O2`:
+
+| Function | before | now | GCC 16.2 | Clang 23.1.5 |
+|---|---|---|---|---|
+| `_mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) == 0xffff` | 12, with a frame | 6 | 6 | 6 |
+| `_mm_movemask_epi8(_mm_cmpeq_epi8(a, b))` | 6 | 3 | 3 | 3 |
+| `_mm_cvtsi128_si32(_mm_add_epi32(a, b))` | 5 | 3 | 3 | 3 |
+| `_mm_movemask_ps(_mm_cmplt_ps(a, b))` | 5 | 3 | 3 | 3 |
+| `_mm512_cmpge_epu32_mask(a, b) == 0xffff`, two loads | 13, with a frame | 8 | 7 | 7 |
+| `_mm512_mask_cmplt_epi32_mask(k, a, b)`, two loads | 10 | 7 | 6 | 6 |
+| `_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) == -1` | 11, with a frame | 7 | 6 | 6 |
+| `_mm256_movemask_pd(a) != 0` | 19, with a frame | 6 | 5 | 5 |
+| `_mm256_movemask_ps(_mm256_cmp_ps(a, b, 1))` | 15, with a frame | 7, with a frame | 3 | 4 |
+
+The one instruction more than GCC's in the 256-bit rows is `vzeroupper`:
+GCC leaves the upper halves to a caller that passed a 256-bit argument,
+lccc and Clang clear them before they return.
+
+Open, and recorded in the gate at the length they have: a mask is moved
+to a general register and compared there where GCC tests it in place
+(`kortestw`); a mask operand `k` is combined in a general register where
+GCC compares under it; and in the last row the compare's second operand is
+stored and read back as the instruction's memory operand (`vmovdqu %ymm1,
+40(%rsp); vcmpps $1, 40(%rsp), %ymm0, %ymm0`), which the store forwarder
+does not rewrite: it serves loads, not operands.
+
+### 2.4 Homes beside a call
+
+A 256-bit argument is an object in the IR, and the object has the
+alignment of its type: every access of it computes its address and masks
+it (`leaq`; `andq $-32`). Two passes take the alignment away where nothing
+can observe it. `downgrade_nonescaping_vector_align` does so for a home
+whose every use is an intrinsic operand the emitter reaches with an
+unaligned-safe access, and refuses any home a call uses.
+`relax_call_marshalled_vector_align` (x86-64) accepts the two call uses the
+back end marshals itself, a vector argument passed in a register and the
+buffer of a `%ymm0`/`%zmm0` result, and refused any home an intrinsic uses
+beyond the `VecLoad`/`VecStore` family. A home with one use of each kind
+was refused by both:
+
+```c
+_mm256_storeu_si256(d, step(_mm256_loadu_si256(x), _mm256_loadu_si256(y), k));
+```
+
+Two argument homes an intrinsic fills and a result buffer an intrinsic
+drains: six masked addresses per iteration of that loop. The second
+pass now answers an intrinsic use from the table the first one relaxes by
+(`intrinsic_arg_required_alignment`, `intrinsic_dest_required_alignment`):
+a position reached without an alignment assumption, or with one of sixteen
+bytes, survives the relaxation to sixteen; a 32-byte contract
+(`_mm256_store_si256`, `_mm256_stream_si256`, `_mm256_load_si256`), a
+position that is no memory operand, and an operation the table does not
+list keep the declared alignment.
+
+### 2.5 The type of an intrinsic call
+
+lccc lowers some public names itself: `_mm_sll_epi16` is the instruction,
+and no header function stands behind it. A call is typed by the declaration
+in scope, and 48 such names had none (the count-in-XMM shifts,
+`_mm_avg_epu16`, `_mm_mul_epi32`, `_mm256_cmpgt_epi8`, the two
+`_mm256_bs?li_epi128`, the GFNI three, and every VNNI dot product at both
+widths). So did 37 builtins of lccc's own under `__builtin_ia32_` names the
+table generated from GCC's has no row for (`__builtin_ia32_pand256`,
+`__builtin_ia32_pshufd128`). A call without a type is the implicit `int`,
+and its value is the address of the 16- or 32-byte result. An `__m128i`
+variable initialized from it gets the right bytes, which is the shape of
+every test these intrinsics had. Read by its type, the call was wrong code:
+
+```c
+__m128i f(__m128i a, __m128i n) { return _mm_sll_epi16(a, n); }   /* a stack address in %xmm0 */
+g(_mm_avg_epu16(a, b));                                           /* a pointer in %rdi */
+sizeof(_mm_mul_epi32(a, b))                                       /* 8 */
+```
+
+Three things changed. The names have their types
+(`sema::builtins::x86_vector_builtin_ctype`): `__m128i` or `__m256i` by the
+width where the call is the vector, and `void *` for the fourteen private
+names whose callers in the headers dereference the call
+(`__CCC_M128I_FROM_BUILTIN(call)` is `*(__m128i *)(call)`), which is what
+that convention always meant. The lowering refuses a vector builtin whose
+call is neither typed at the width it yields nor a pointer
+(`mistyped_x86_vector_call`), so the next name without a type is a compile
+error where it is used and not a wrong value where it is returned. And `scripts/x86_intrinsic_types.py` asserts, for every
+intrinsic lccc has, that a call has the type GCC 16.2's header gives it:
+1,555 intrinsics, none wrong; 48 before.
+
+### 2.6 What one call costs
+
+`scripts/x86_intrinsic_shapes.py` compiles, for every intrinsic both
+compilers take for a target, a function that calls it once with its
+operands as parameters, and counts instructions. It is the worklist for
+this chapter: an intrinsic is supposed to be an instruction, and where a
+header writes it as a loop over the lanes, or the operands go through the
+stack, it is twenty or a hundred and no test fails. It also found §2.5:
+the first function it wrote for `_mm_sll_epi16` returned an address.
+
+### 2.7 A load inside an operation
+
+`_mm256_add_epi32(a, _mm256_loadu_si256(p + 1))` is one instruction. The
+lowering of a packed operation (`try_native_packed_map`, and the SHA forms
+beside it) does not materialise an operand that is itself a whole-register
+load: it takes the address the load reads (`direct_vector_load_ptr`), and
+the load becomes the memory operand of the instruction. A constant offset
+in that address is moved into the displacement (`split_const_offset`), so
+no `addq` is emitted for it.
+
+The offset is counted as C counts it:
+
+| written | displacement |
+|---|---|
+| `p + 1`, `const __m256i *p` | 32 |
+| `(const __m256i *)(p + 3)`, `const int *p` | 12 |
+| `(const __m256i *)(p + 8)`, a byte pointer | 8 |
+| `p - 1`, `1 + p`, `p + 9 - 4` | the same sums, signed |
+| `(const __m256i *)((const short *)(p + 1) + 3) + 1`, `const int *p` | 4 + 6 + 32 |
+| `(const __m256i *)(p + 12)`, `const void *p` | 12 (GNU C) |
+| `table + 2`, `__m256i table[4]` | 64 |
+
+Each `+` counts in the pointee of the pointer it is applied to, and a cast
+between pointer types changes what the next `+` out counts in. What is not
+an address the whole way stays in the base and is computed as written: a
+sum of integers converted to a pointer afterwards (it wraps at the
+integer's width), a variable index, a pointer into a variable-length array
+type, an unsigned count that does not fit its signed type, and an offset
+beyond a 32-bit displacement.
+
+Until PR #1211 the constant was taken as bytes whatever the pointer
+pointed to, and every cast was seen through. A byte pointer came out
+right. Everything else was wrong code at `-O1` and above with nothing
+said: the first row read at `1(%rdi)`. The only shape any gate ran was a
+`const void *` with no offset.
+
+Gates: `check_x86_int_map_registers.sh` (section 4b: nine forms, each one
+instruction on the displacement of the table above, and GCC 16.2 reading
+the same sources agrees with every row) and the corpus test
+`tests/regression/x86_vector_load_const_offset.c` (35 functions, executed,
+output against GCC's).
+
+### 2.8 Scalar arguments
+
+The scalar parameter of an intrinsic is an `int`, a `char`, a `long long`
+or a `float`, and C converts the argument to it as an assignment would.
+For a constant the lowering makes the conversion itself
+(`lower_typed_x86_builtin_argument`), so that an immediate is a constant
+at every optimization level: an integer constant expression is its value
+however it is spelled, and a floating constant given to an integer
+parameter is the `int` it converts to, toward zero
+(`integer_constant_argument`; GCC 16.2 reads `_mm_shuffle_epi32(v, 27.9)`
+as selector 27). A floating parameter takes the expression.
+
+The conversion is made once. Until PR #1211 a floating constant for an
+integer parameter was read as its integer and then converted "from
+double" again, with the integer's bits taken for a double. The optimizer
+folded that second conversion by value; without it the code generator
+converted the bits, so at `-O0` only, `_mm_set1_epi32(3.7)` was a vector
+of zeros, `_mm_slli_epi32(v, 2.9)` a shift by none and
+`_mm_crc32_u32(1.5, 77.7)` the checksum of two zeros. Gate: the case
+`tests/intrinsics/cases/constant_arguments.c` of the intrinsic
+differential (57 rows: floating constants for integer parameters of every
+width, integer constants of another width or signedness, floating
+parameters; with and without optimization, against GCC 16.2).
+
+An argument that is no constant is converted by the same function, to the
+type the tables give the parameter: the generated table of GCC's builtins
+(`x86_builtin_types::argument_scalar_types`), the prototype a header
+declares, or, for the builtins only lccc's headers call,
+`private_x86_argument_scalar_types`. A builtin none of them described
+took its scalar argument as written. That was the element of
+`_mm_insert_epi8/16/32/64` (macros over `__builtin_ia32_pinsr[bwdq]128`):
+a `double` element inserted the low bits of the double, and an `int`
+element of `_mm_insert_epi64` was not extended without optimization. And a
+macro that used a mask argument directly (`(__k) & compare(...)`, the 168
+`_mask_cmp*_mask` forms of `lcccsimd.h`) had no conversion at all; the
+generator casts the mask to its type now.
+
+Gate: the value differential calls every intrinsic that has a scalar
+parameter twice more, with its scalar arguments in objects of another
+arithmetic type (`name@`: an integer in a `double` with a fraction that
+only truncation removes, a floating value as a `long long`; `name&`: an
+integer in an integer of another width). A unit test requires every
+`__builtin_ia32_*` name a bundled header calls to be in one of the two
+builtin tables.
+
 ## 3. Call-frame information
 
 Code generation never writes `.cfi_*` directives. `backend/cfi_synth.rs`
@@ -324,9 +783,29 @@ instructions.
 | `scripts/check_x86_march_macros.py LCCC` | Every CPU, `-m64` and `-m32`: ISA, CPU-name and `-mtune=` macros against GCC |
 | `scripts/check_x86_mflag_macros.py LCCC [--pairs]` | Every `-m` ISA option, alone on six bases, plus the 24 ordered XSAVE/SSE-denial `CASCADES` that decide the option-layer mixes (`--pairs` widens it to every ordering): macros against GCC |
 | `scripts/check_x86_prefer_vector_width.py LCCC` | `-mprefer-vector-width=` codegen class per row against GCC, macro neutrality, rejection wording |
+| `scripts/gen_x86_mflag_policy.py --check --lccc LCCC --gcc GCC` | The table of machine options without code generation: every row under lccc (also under the strict policy), every spelling of GCC's list decided, nothing GCC refuses accepted, GCC's warnings word for word |
+| `tests/regression/check_x86_mflag_effects.py` | `-mharden-sls=`, `-mcld`, `notrack` on the jump of a `switch` under `-fcf-protection=branch`, the `-pg` names and negatives: shape per function against GCC, and the program run |
+| `tests/regression/check_x86_asm_register_operands.py` | `asm` operands in `ymm`, `zmm`, mask and MMX registers (§2.1): the statement's text line for line, GCC's template and diagnostics, generated statements run against GCC's build |
+| `tests/regression/check_x86_zmm_homes.py` | 512-bit objects in `zmm16`..`zmm31` (§2.2): the instructions of chains, copies and a loop; no register above 15 anywhere with the homes off; no home given up at code generation; generated programs run at every level against GCC's build |
+| `tests/regression/check_x86_simd_integer_results.py` | Integer results of vector operations (§2.3): no stack traffic, no vector copy, no `%zmm1` in a mask compare, length against GCC's function measured in the run, the open shapes at their recorded length; the probe run against GCC's build where the CPU has the extension |
+| `integer_result_contract_tests` (unit) | Each of the 48 operations whose result may live in a register: the emitter takes it, writes no allocatable register on the way, and writes the result last |
+| `scripts/x86_intrinsic_types.py --check` | The type of a call of every intrinsic lccc has (§2.5): `__builtin_types_compatible_p` with the return type of GCC 16.2's header, asserted at compile time for the widest target |
+| `tests/regression/x86_intrinsic_call_types.c` (corpus) | The 48 public names without a header: their types asserted; the calls an AVX2 machine executes returned, passed on, chosen, stored in a member and measured, against GCC's output |
+| `x86_vector_builtin_type_tests` (unit) | The table of §2.5: each row's width, the dereferenced names typed as pointers and in no other list, no row for a name another table or a header types, every row a registered intrinsic |
+| `homes_filled_and_drained_by_unaligned_intrinsics_relax` and its neighbours (unit) | §2.4: a home with a call use and an intrinsic use relaxes when both tolerate sixteen bytes, at 16, 32 and 64 bytes; a 32-byte contract, a count position, an unlisted operation and a result of another width refuse |
+| `qq_*` in `store_forwarding` (unit) | 32-byte store forwarding (§2.3): the six spellings, the self-reload under a live and a dead `zmm` upper half, narrower reloads, and every event that ends the mapping (a write of the register at any width or under a mask, a write into the slot at each edge, `vzeroupper`, a call, a stack adjustment) |
+| `every_signature_holds_for_its_emitter` (unit) | Each operation a homed object may be an operand of, with its operands in registers, in memory and shared with the result: the value the destination ends with is the one the all-in-memory path computes |
 | `x86_macro_gate_tests` (unit) | XSAVE precedence, the AES/PCLMUL/GFNI announcement split, the POPCNT unwind matrix, sticky `-mno-mmx`, `-mprefer-vector-width=` parsing |
+| `check_x86_int_map_registers.sh` | Packed operations on registers and on a folded load: budgets per shape, values against a scalar reference and GCC, and (section 4b) the displacement of a constant offset in the load's address (§2.7) |
+| `tests/regression/x86_vector_load_const_offset.c` (corpus) | §2.7: 35 ways of writing `pointer + constant` inside a packed operation, executed, output against GCC's |
+| `tests/intrinsics/cases/constant_arguments.c` (intrinsic differential, `-O2` and `-O0`) | §2.8: a constant argument is converted to its parameter's type once; 57 rows against GCC |
+| `scripts/x86_intrinsic_values.py --check` (the `@` and `&` tests) | §2.8: every intrinsic with a scalar parameter, its scalar arguments passed in objects of another arithmetic type, result against GCC's |
+| `every_builtin_the_headers_call_has_its_scalar_operands_typed` (unit) | §2.8: each `__builtin_ia32_*` name of the bundled headers is in the generated table or in the private one, and in one only |
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |
 | `check_target_attribute_isa.sh` | `target()` scoping, ordering, errors and intrinsic verdicts, re-measured on GCC |
+| `check_target_attribute_arguments.py` | The arguments of `target("...")` on definitions and prototypes and of `#pragma GCC target`: errors, order and position against GCC 16.2 |
+| `check_x86_gpr_intrinsics.py` | The scalar and system intrinsics: instruction, form and (under GDB, without executing it) operands against GCC 16.2, x86-64 and i686 |
+| `tests/regression/pragma_gcc_target.c` (corpus) | `#pragma GCC target` regions, the option stack and targets inherited from prototypes, executed |
 | `check_x86_scalar_intrinsics.sh` | Portable scalar intrinsics: semantics and instruction contract |
 | `check_public_simd_abi.py` | SIMD argument and result ABI against GCC |
 | `check_legacy_sse_permissions.py` | SSE1/SSE2 intrinsic boundary |

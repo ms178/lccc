@@ -110,6 +110,10 @@ pub struct Lowerer {
     /// Set of function names declared with __attribute__((noreturn)) or _Noreturn.
     /// After calls to these functions, emit Unreachable to avoid generating dead epilogue code.
     pub(super) noreturn_functions: FxHashSet<String>,
+    /// The library builtins this unit calls, each with the library function
+    /// its call is (`__builtin_sqrt`: `sqrt`): what the `__asm__` label of
+    /// the builtin's declaration would say (`declare_library_builtin`).
+    pub(super) library_builtins: FxHashMap<String, &'static str>,
     /// Set of function names declared with __attribute__((fastcall)).
     /// On i386, these use ecx/edx for the first two integer/pointer args.
     pub(super) fastcall_functions: FxHashSet<String>,
@@ -208,6 +212,23 @@ pub struct Lowerer {
     /// yield a dead local's address. They are evaluated for side effects and
     /// return a null pointer (GCC 16.2's code generation).
     pub(super) sema_local_address_returns: FxHashSet<ExprId>,
+    /// The `#pragma GCC target` strings that were refused where they stand
+    /// (`diagnose_x86_target_pragmas`).
+    pub(super) refused_pragma_targets: FxHashSet<String>,
+    /// The target options of each function of the unit, by C name: those of
+    /// its last declaration that states any (a `target` attribute, or a
+    /// `#pragma GCC target` in force there). GCC merges declarations this
+    /// way: a definition that says nothing inherits what its prototype
+    /// said, and a later declaration that does say something replaces what
+    /// came before -- the definition's own attribute included.
+    pub(super) function_decl_targets: FxHashMap<String, String>,
+    /// Sema's `SemaResult::generic_choices`: the association each `_Generic`
+    /// selects, by its controlling operand. Sema compares qualifiers the
+    /// lowerer has no record of.
+    pub(super) sema_generic_choices: FxHashMap<ExprId, (Span, u32)>,
+    /// Sema's `SemaResult::atomic_lvalues`: the lvalues that designate an
+    /// `_Atomic` object. See `Lowerer::lvalue_is_atomic`.
+    pub(super) sema_atomic_lvalues: FxHashMap<ExprId, Span>,
     /// Stack of local label scopes from GNU __label__ declarations.
     /// Each entry maps a label name to its scope-qualified name.
     /// When resolving a label, the stack is searched top-down so that
@@ -243,6 +264,12 @@ pub struct Lowerer {
     /// Wrapped in RefCell because many lowering methods take &self (not &mut self)
     /// but still need to emit diagnostics (same pattern as expr_ctype_cache).
     pub(super) diagnostics: RefCell<DiagnosticEngine>,
+    /// Where the binary operator being lowered stands in the source: the
+    /// place GCC's "invalid operands to binary" points at. The operand
+    /// lowering functions are handed the operands and not the expression;
+    /// the one diagnostic they are the last to be able to give
+    /// (`lower_arithmetic_binop`) reads the place here.
+    pub(super) binary_operator_span: Option<Span>,
     /// Source-span identity of materialized compound literals. Initializer
     /// canonicalization clones Exprs into temporary allocations, so pointer
     /// identity can be reused for DIFFERENT literals and silently alias them.
@@ -318,6 +345,18 @@ impl Lowerer {
     /// (`SemaResult::local_address_returns`).
     pub fn with_local_address_returns(mut self, returns: FxHashSet<ExprId>) -> Self {
         self.sema_local_address_returns = returns;
+        self
+    }
+
+    /// Sema's `_Generic` verdicts and atomic lvalues (`SemaResult`'s
+    /// `generic_choices` and `atomic_lvalues`).
+    pub fn with_qualifier_verdicts(
+        mut self,
+        generic_choices: FxHashMap<ExprId, (Span, u32)>,
+        atomic_lvalues: FxHashMap<ExprId, Span>,
+    ) -> Self {
+        self.sema_generic_choices = generic_choices;
+        self.sema_atomic_lvalues = atomic_lvalues;
         self
     }
 
@@ -444,6 +483,7 @@ impl Lowerer {
             error_functions: FxHashSet::default(),
             diagnose_as_builtins: FxHashMap::default(),
             noreturn_functions: FxHashSet::default(),
+            library_builtins: FxHashMap::default(),
             fastcall_functions: FxHashSet::default(),
             regparm_functions: FxHashMap::default(),
             pure_functions: FxHashSet::default(),
@@ -467,12 +507,17 @@ impl Lowerer {
             sema_const_values,
             sema_enumerator_refs: FxHashMap::default(),
             sema_local_address_returns: FxHashSet::default(),
+            refused_pragma_targets: FxHashSet::default(),
+            function_decl_targets: FxHashMap::default(),
+            sema_generic_choices: FxHashMap::default(),
+            sema_atomic_lvalues: FxHashMap::default(),
             local_label_scopes: Vec::new(),
             next_local_label_scope: 0,
             asm_label_map: FxHashMap::default(),
             symver_ref_map: FxHashMap::default(),
             expr_ctype_cache: RefCell::new(FxHashMap::default()),
             diagnostics: RefCell::new(diagnostics),
+            binary_operator_span: None,
             materialized_compound_literals: FxHashMap::default(),
             gnu89_inline,
             trapv: false,
@@ -1070,6 +1115,70 @@ impl Lowerer {
         self.register_nested_function_metas(&func.name, &func.body);
     }
 
+    /// Whether a file-scope declarator declares a function: written as one
+    /// (`int f(void);`), or through a typedef of a function type (`fn_t f;`).
+    /// An object of function-pointer type is not one.
+    fn declares_function_entity(
+        &self,
+        decl: &crate::frontend::parser::ast::Declaration,
+        declarator: &crate::frontend::parser::ast::InitDeclarator,
+    ) -> bool {
+        DerivedDeclarator::declares_function(&declarator.derived)
+            || (declarator.derived.is_empty()
+                && matches!(&decl.type_spec, TypeSpecifier::TypedefName(name)
+                    if self.types.function_typedefs.contains_key(name)))
+    }
+
+    /// The target options each function of the unit is compiled with
+    /// (`function_decl_targets`), before anything is lowered.
+    ///
+    /// GCC merges the declarations of a function, and the last one that
+    /// names a target decides, a definition included: a plain definition
+    /// after `__attribute__((target("avx2"))) int f(void);` is an AVX2
+    /// function, and so is one whose prototype stood in a `#pragma GCC
+    /// target("avx2")` region. A declaration's options are the pragmas in
+    /// force where it stands, then its own attribute.
+    ///
+    /// The pragmas are judged here, each once where it stands, and every
+    /// prototype's options at its name; a definition's are judged where its
+    /// body is lowered.
+    fn collect_function_decl_targets(&mut self, tu: &TranslationUnit) {
+        use crate::frontend::parser::ast::effective_target_options;
+        self.diagnose_x86_target_pragmas(&tu.pragma_target_sites);
+        for decl in &tu.decls {
+            match decl {
+                ExternalDecl::FunctionDef(func) => {
+                    if let Some(options) = func.attrs.effective_target() {
+                        self.function_decl_targets
+                            .insert(func.name.clone(), options);
+                    }
+                }
+                ExternalDecl::Declaration(decl) if !decl.is_typedef() => {
+                    for declarator in &decl.declarators {
+                        if declarator.name.is_empty()
+                            || !self.declares_function_entity(decl, declarator)
+                        {
+                            continue;
+                        }
+                        let pragma = declarator.attrs.pragma_target.as_deref();
+                        let own = declarator.attrs.target.as_deref();
+                        if let Some(options) = effective_target_options(pragma, own) {
+                            self.diagnose_x86_target_options(
+                                pragma,
+                                own,
+                                declarator.name_span,
+                                decl.span,
+                            );
+                            self.function_decl_targets
+                                .insert(declarator.name.clone(), options);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn lower(mut self, tu: &TranslationUnit) -> (IrModule, DiagnosticEngine, TypeContext) {
         // Sema has already populated TypeContext with typedefs, enum constants,
         // struct/union layouts, function typedefs, and function pointer typedefs.
@@ -1126,6 +1235,7 @@ impl Lowerer {
         // First pass: collect all function signatures (return types, param types,
         // variadic status, sret) so we can distinguish functions from globals and
         // insert proper casts/ABI handling during lowering.
+        self.collect_function_decl_targets(tu);
         for decl in &tu.decls {
             if let ExternalDecl::FunctionDef(func) = decl {
                 self.register_definition_signature(func);
@@ -1135,10 +1245,7 @@ impl Lowerer {
                     // Unlike a parser's one-way inheritance, this pre-pass also
                     // sees attributes declared after the definition. Do not
                     // classify function-pointer objects as functions.
-                    let function_entity = DerivedDeclarator::declares_function(&declarator.derived)
-                        || (declarator.derived.is_empty()
-                            && matches!(&decl.type_spec, TypeSpecifier::TypedefName(name)
-                                if self.types.function_typedefs.contains_key(name)));
+                    let function_entity = self.declares_function_entity(decl, declarator);
                     if function_entity && !decl.is_typedef() && !declarator.name.is_empty() {
                         if let Some(section) = &declarator.attrs.section {
                             self.function_decl_sections
@@ -1590,14 +1697,23 @@ impl Lowerer {
     /// Resolve a symbol reference: versioned .symver references first (glibc
     /// compat_symbol_reference), then __asm__("label") redirects, else the
     /// plain name.
+    ///
+    /// A library builtin is the library function, under the name the unit
+    /// gave that function: after glibc's `extern int sscanf(...)
+    /// __asm__("__isoc23_sscanf");` a `__builtin_sscanf` call is a call of
+    /// `__isoc23_sscanf` (GCC renames the builtin with the declaration,
+    /// `set_builtin_user_assembler_name`).
     pub(super) fn resolve_ref_name(&self, name: &str) -> String {
         if let Some(v) = self.symver_ref_map.get(name) {
             return v.clone();
         }
-        self.asm_label_map
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| name.to_string())
+        if let Some(label) = self.asm_label_map.get(name) {
+            return label.clone();
+        }
+        match self.library_builtins.get(name) {
+            Some(library_name) => self.resolve_ref_name(library_name),
+            None => name.to_string(),
+        }
     }
 
     /// Register function metadata (return type, param types, variadic, sret) for
@@ -1625,6 +1741,58 @@ impl Lowerer {
         }
         let sig = self.build_function_sig(name, ret_type_spec, ptr_count, params, variadic, is_kr);
         self.func_meta.sigs.insert(name.to_string(), sig);
+    }
+
+    /// The IR type the result of a call comes back as, for a function whose
+    /// return type is the scalar or complex type `ct` (an aggregate is
+    /// classified by `build_function_sig`).
+    ///
+    /// A complex value has no IR type of its own; the calling convention
+    /// decides what the call instruction yields:
+    ///
+    /// x86-64:
+    ///   _Complex double: real in xmm0 (F64), imag in xmm1 -> F64
+    ///   _Complex float: packed two F32 in xmm0 as F64 -> F64
+    ///   _Complex long double: real in x87 st(0) -> F128
+    ///
+    /// ARM64/RISC-V:
+    ///   _Complex double: real in d0 (F64), imag in d1 -> F64
+    ///   _Complex float: real in s0 (F32), imag in s1 -> F32
+    ///
+    /// i686:
+    ///   _Complex float (8 bytes): packed in eax:edx -> I64
+    ///   _Complex double (16 bytes), _Complex long double (24 bytes): the
+    ///   hidden-pointer convention, so the default `Ptr` stands
+    ///   _Float128/_Decimal128 (TFmode/TDmode, 16 bytes): class MEMORY -- GCC
+    ///   returns it through a hidden pointer (first stack arg, callee-popped
+    ///   with `ret $4`). The IR return becomes Ptr and the body stores the
+    ///   16-byte carrier through the sret buffer (try_sret_return). x86-64
+    ///   keeps the U128/xmm0:xmm1 return.
+    ///
+    /// One function for a declared function's signature and for a library
+    /// builtin asked about before its first call is lowered
+    /// (`builtin_return_type`): the two answers are one answer.
+    pub(super) fn call_result_ir_type(&self, ct: &CType) -> IrType {
+        if matches!(ct, CType::ComplexLongDouble) && self.returns_complex_long_double_in_regs() {
+            // x86-64: real part in x87 st(0); ARM64: real part in q0
+            IrType::F128
+        } else if matches!(ct, CType::ComplexDouble) && self.decomposes_complex_double() {
+            IrType::F64
+        } else if matches!(ct, CType::ComplexFloat) {
+            if self.uses_packed_complex_float() {
+                IrType::F64
+            } else if self.decomposes_complex_float() {
+                IrType::F32
+            } else {
+                IrType::I64
+            }
+        } else if (matches!(ct, CType::Float128) || *ct == CType::Decimal128)
+            && crate::common::types::target_is_32bit()
+        {
+            IrType::Ptr
+        } else {
+            IrType::from_ctype(ct)
+        }
     }
 
     /// The call-ABI signature of function `name` (return convention,
@@ -1668,61 +1836,9 @@ impl Lowerer {
             ct
         };
 
-        // Compute return type, wrapping with pointer levels if needed
-        let mut ret_ty = IrType::from_ctype(&full_ret_ctype);
-        // Complex return types need special IR type overrides based on target ABI:
-        //
-        // x86-64:
-        //   _Complex double: real in xmm0 (F64), imag in xmm1 -> IR ret type F64
-        //   _Complex float: packed two F32 in xmm0 as F64 -> IR ret type F64
-        //   _Complex long double: real in x87 st(0) -> IR ret type F128
-        //
-        // ARM64/RISC-V:
-        //   _Complex double: real in d0 (F64), imag in d1 -> IR ret type F64
-        //   _Complex float: real in s0 (F32), imag in s1 -> IR ret type F32
-        //
-        // i686:
-        //   _Complex float (8 bytes): packed in eax:edx -> IR ret type I64
-        //   _Complex double (16 bytes): sret hidden pointer (ret_ty stays Ptr)
-        //   _Complex long double (24 bytes): sret hidden pointer (ret_ty stays Ptr)
-        if ptr_count == 0 {
-            if matches!(full_ret_ctype, CType::ComplexLongDouble)
-                && self.returns_complex_long_double_in_regs()
-            {
-                // x86-64: real part in x87 st(0); ARM64: real part in q0
-                ret_ty = IrType::F128;
-            } else if matches!(full_ret_ctype, CType::ComplexDouble)
-                && self.decomposes_complex_double()
-            {
-                // x86-64/ARM64/RISC-V: _Complex double returns real in FP reg
-                ret_ty = IrType::F64;
-            } else if matches!(full_ret_ctype, CType::ComplexFloat) {
-                if self.uses_packed_complex_float() {
-                    // x86-64: packed two F32 in one xmm register as F64
-                    ret_ty = IrType::F64;
-                } else if self.decomposes_complex_float() {
-                    // ARM64/RISC-V: real in first FP register as F32
-                    ret_ty = IrType::F32;
-                } else {
-                    // i686: _Complex float (8 bytes) fits in eax:edx, pack as I64
-                    ret_ty = IrType::I64;
-                }
-            }
-            // i686: ComplexDouble (16 bytes) and ComplexLongDouble (24 bytes) keep
-            // ret_ty = IrType::Ptr (the default from_ctype mapping for complex types).
-            // They will be handled via sret below.
-            // i686: _Float128/_Decimal128 (TFmode/TDmode, 16 bytes) is class
-            // MEMORY — GCC returns it through a hidden pointer (first stack
-            // arg, callee-popped with `ret $4`). The IR return becomes Ptr and
-            // the body stores the 16-byte carrier through the sret buffer
-            // (try_sret_return). x86-64 keeps the U128/xmm0:xmm1 return.
-            else if (matches!(full_ret_ctype, CType::Float128)
-                || full_ret_ctype == CType::Decimal128)
-                && crate::common::types::target_is_32bit()
-            {
-                ret_ty = IrType::Ptr;
-            }
-        }
+        // The IR type the result travels as (complex values and the i686
+        // `_Float128` have a form of their own: `call_result_ir_type`).
+        let mut ret_ty = self.call_result_ir_type(&full_ret_ctype);
 
         // Track CTypes used to resolve aggregate and ext-vector call results.
         // Ext vectors can use scalar GP return registers on i686, so their

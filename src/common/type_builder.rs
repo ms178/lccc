@@ -807,6 +807,7 @@ fn written_param_cvr(param: &ParamDecl) -> u8 {
     u8::from(param.is_const) * PtrQuals::CONST
         | u8::from(param.volatile_written()) * PtrQuals::VOLATILE
         | u8::from(param.base_restrict) * PtrQuals::RESTRICT
+        | u8::from(param.is_atomic) * PtrQuals::ATOMIC
 }
 
 /// Whether `spec` derives a type (array, function, pointer) rather than

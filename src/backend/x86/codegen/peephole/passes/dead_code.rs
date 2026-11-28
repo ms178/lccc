@@ -456,13 +456,22 @@ fn frame_base(line: &str, default: u8) -> u8 {
 /// rsp down 8 (delta +8), `pop` reverses it (delta -8), `subq $N,%rsp` adds
 /// N and `addq $N,%rsp` subtracts N. `None` means the shift cannot be parsed
 /// as a constant, so the caller must keep its historical fail-closed rule.
+///
+/// By mnemonic: only the pushes and pops of one 8-byte word have the step
+/// this returns. `pushw`/`popw` move 2 bytes and APX `push2`/`pop2` 16, so
+/// they are `None` like any other shift that cannot be read off the text --
+/// and `popcnt`, which the prefix `pop` used to cover, is not a shift at all
+/// (`helpers::is_push_or_pop_line`).
 fn rsp_delta_step(t: &str) -> Option<i64> {
     let t = t.trim_ascii();
-    if t.starts_with("push") {
-        return Some(8);
-    }
-    if t.starts_with("pop") {
-        return Some(-8);
+    let mnemonic = t
+        .split(|c: char| c.is_ascii_whitespace())
+        .next()
+        .unwrap_or("");
+    match mnemonic {
+        "push" | "pushq" | "pushf" | "pushfq" => return Some(8),
+        "pop" | "popq" | "popf" | "popfq" => return Some(-8),
+        _ => {}
     }
     if let Some(rest) = t.strip_prefix("subq $") {
         return rest
@@ -1618,6 +1627,28 @@ fn shifted_jmp_target_touches_frame(
 /// or a shifted unconditional jmp whose target block accesses a frame slot.
 /// A fall-through/loop-header label deliberately does not reset the depth:
 /// loop back-edges legitimately target a label inside an open push/pop window.
+///
+/// A sibling call the codegen published (`# LCCC_TAIL_CALL` behind its
+/// `jmp`, [`super::liveness::tail_call_marked`]) leaves the function as a
+/// `ret` does, whether it jumps to a symbol or through a register: the
+/// epilogue before it has released the frame, which is the displacement it
+/// is reached at, and nothing behind it is reached from it.  Read as a
+/// branch at a displaced `%rsp`, `jmpq *%r10` gave up the whole function --
+/// `return o->fn(1);` kept the store of the target it had just loaded and
+/// the frame around it,
+///
+/// ```text
+///     subq $8, %rsp
+///     movq (%rdi), %r10
+///     movq %r10, 0(%rsp)
+///     movl $1, %edi
+///     addq $8, %rsp
+///     jmpq *%r10
+/// ```
+///
+/// -- and `jmp f@PLT` was asked what the block behind the next label reads,
+/// which is not where it goes: with a frame access there, every never-read
+/// store of the function stayed.
 fn step_rsp_depth(
     store: &LineStore,
     infos: &[LineInfo],
@@ -1627,12 +1658,14 @@ fn step_rsp_depth(
     path_ended: &mut bool,
 ) -> bool {
     let t = infos[k].trimmed(store.get(k));
+    let sibling_call = matches!(infos[k].kind, LineKind::Jmp | LineKind::JmpIndirect)
+        && super::liveness::tail_call_marked(store, infos, k);
     if infos[k].kind == LineKind::Label {
         if *path_ended {
             *rsp_delta = 0;
         }
         *path_ended = false;
-    } else if infos[k].kind == LineKind::Ret {
+    } else if infos[k].kind == LineKind::Ret || sibling_call {
         *path_ended = true;
     } else if infos[k].kind == LineKind::Jmp {
         if *rsp_delta != 0 && shifted_jmp_target_touches_frame(store, infos, k, func_end) {
@@ -1647,7 +1680,7 @@ fn step_rsp_depth(
         // frame slot at the pre-shift depth; counting only the delta step would
         // drop that frame access. Register/immediate forms carry no frame
         // operand and are safe to model as a bare step.
-        if (t.starts_with("push") || t.starts_with("pop")) && t.contains('(') {
+        if is_push_or_pop_line(t) && t.contains('(') {
             return false;
         }
         match rsp_delta_step(t) {
@@ -1667,7 +1700,9 @@ fn step_rsp_depth(
         }
     }
     // A branch that leaves RSP displaced cannot be folded into a bare step.
-    *rsp_delta == 0 || !matches!(infos[k].kind, LineKind::CondJmp | LineKind::JmpIndirect)
+    *rsp_delta == 0
+        || sibling_call
+        || !matches!(infos[k].kind, LineKind::CondJmp | LineKind::JmpIndirect)
 }
 
 /// True when `line` is a LEA whose `(%rbp)` operand names a DATA register, not
@@ -1782,6 +1817,139 @@ mod tests {
         assert!(!infos[stores[0]].is_nop() && !infos[stores[1]].is_nop());
         assert!(infos[stores[2]].is_nop() && !infos[stores[3]].is_nop());
         assert!(!eliminate_dead_stores(&store, &mut infos));
+    }
+
+    /// The lines of `asm` that are left and name a frame slot.
+    fn frame_lines_left(asm: &str) -> Vec<String> {
+        let (store, mut infos) = build(asm);
+        eliminate_never_read_stores(&store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim_ascii().to_string())
+            .filter(|t| t.contains("(%rsp)"))
+            .collect()
+    }
+
+    /// `return o->fn(1);` -- the target is loaded, parked in its home and
+    /// jumped through.  Nothing reads the home, and the sibling call leaves
+    /// the function: the store goes.
+    #[test]
+    fn a_never_read_store_before_an_indirect_sibling_call_goes() {
+        let asm = concat!(
+            "c1:\n",
+            ".cfi_startproc\n",
+            "    subq $8, %rsp\n",
+            ".cfi_def_cfa_offset 16\n",
+            "    movq (%rdi), %r10\n",
+            "    movq %r10, 0(%rsp)\n",
+            "    movl $1, %edi\n",
+            "    addq $8, %rsp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    jmpq *%r10\n",
+            "    # LCCC_TAIL_CALL\n",
+            "    # LCCC_CALL_ARGS 1\n",
+            "    # LCCC_CALL_FP 0\n",
+            ".cfi_endproc\n",
+            ".size c1, .-c1\n",
+        );
+        assert_eq!(frame_lines_left(asm), Vec::<String>::new());
+
+        // The control: the same jump without the marker is a computed goto
+        // for all this pass knows, reached at a displaced `%rsp`, and the
+        // function is left as it is.
+        let unmarked = asm.replace("    # LCCC_TAIL_CALL\n", "");
+        assert_eq!(frame_lines_left(&unmarked), ["movq %r10, 0(%rsp)"]);
+
+        // A slot that IS read before the call keeps its store.
+        let read = asm.replace(
+            "    movl $1, %edi\n",
+            "    movl $1, %edi\n    movq 0(%rsp), %rsi\n",
+        );
+        assert_eq!(
+            frame_lines_left(&read),
+            ["movq %r10, 0(%rsp)", "movq 0(%rsp), %rsi"]
+        );
+    }
+
+    /// A direct sibling call in the middle of a function: the block behind
+    /// the next label is not where it goes, so what that block reads says
+    /// nothing about the depth the call leaves at.  The never-read store of
+    /// the function goes; the slot the other path reads keeps its store.
+    #[test]
+    fn a_sibling_call_does_not_ask_the_next_block_what_it_reads() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subq $24, %rsp\n",
+            ".cfi_def_cfa_offset 32\n",
+            "    movq %rsi, 0(%rsp)\n",
+            "    movq %rdx, 8(%rsp)\n",
+            "    testl %edi, %edi\n",
+            "    je .LBB2\n",
+            ".LBB1:\n",
+            "    addq $24, %rsp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    jmp g@PLT\n",
+            "    # LCCC_TAIL_CALL\n",
+            "    # LCCC_CALL_ARGS 1\n",
+            "    # LCCC_CALL_FP 0\n",
+            ".LBB2:\n",
+            ".cfi_def_cfa_offset 32\n",
+            "    movq 8(%rsp), %rax\n",
+            "    addq $24, %rsp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        assert_eq!(
+            frame_lines_left(asm),
+            ["movq %rdx, 8(%rsp)", "movq 8(%rsp), %rax"]
+        );
+    }
+
+    /// `popcnt` is no `pop`: `%rsp` stands where it stood, and the slot read
+    /// after it is the slot the text names. Taken for a pop it moved every
+    /// later read up by 8 bytes, so the store that fed `0(%rsp)` had no
+    /// reader and was deleted (`tests/regression/popcnt_stack_slot_reads.c`
+    /// is the program this is the kernel of).
+    #[test]
+    fn never_read_stores_keep_the_slot_read_after_a_popcnt() {
+        let asm = "f:\n.cfi_startproc\n    subq $24, %rsp\n    movq %rsi, 0(%rsp)\n    movq %rdx, 8(%rsp)\n    movq %rcx, 16(%rsp)\n    popcntq %rdi, %rax\n    movq 0(%rsp), %rsi\n    addq %rsi, %rax\n    movq 8(%rsp), %rdx\n    addq %rdx, %rax\n    addq $24, %rsp\n    ret\n.cfi_endproc\n.size f, .-f\n";
+        let (store, mut infos) = build(asm);
+        let slot_store = |infos: &[LineInfo], at: i32| {
+            (0..store.len())
+                .find(
+                    |&i| matches!(infos[i].kind, LineKind::StoreRbp { offset, .. } if offset == at),
+                )
+                .expect("the store is in the text")
+        };
+        let (s0, s8, s16) = (
+            slot_store(&infos, 0),
+            slot_store(&infos, 8),
+            slot_store(&infos, 16),
+        );
+        eliminate_never_read_stores(&store, &mut infos);
+        assert!(!infos[s0].is_nop(), "0(%rsp) is read after the popcnt");
+        assert!(!infos[s8].is_nop(), "8(%rsp) is read after the popcnt");
+        assert!(infos[s16].is_nop(), "16(%rsp) has no reader and goes");
+    }
+
+    /// The steps a stack shift has, by mnemonic.
+    #[test]
+    fn rsp_delta_step_reads_the_mnemonic_not_a_prefix() {
+        assert_eq!(rsp_delta_step("pushq %rbx"), Some(8));
+        assert_eq!(rsp_delta_step("push %rbx"), Some(8));
+        assert_eq!(rsp_delta_step("pushfq"), Some(8));
+        assert_eq!(rsp_delta_step("popq %rbx"), Some(-8));
+        assert_eq!(rsp_delta_step("popfq"), Some(-8));
+        assert_eq!(rsp_delta_step("subq $40, %rsp"), Some(40));
+        assert_eq!(rsp_delta_step("addq $40, %rsp"), Some(-40));
+        // Not one 8-byte word, or no shift at all.
+        assert_eq!(rsp_delta_step("pushw %ax"), None);
+        assert_eq!(rsp_delta_step("popw %ax"), None);
+        assert_eq!(rsp_delta_step("push2 %rax, %rbx"), None);
+        assert_eq!(rsp_delta_step("popcntq %rdi, %rax"), None);
     }
 
     /// A vector spill overwritten by a later spill of the same bytes, with no

@@ -42,6 +42,7 @@ HOOKS=$(grep -c 'verify::verify_after_pass(module,' src/passes/mod.rs || true)
 WANT_LITERAL=$(sort -k2 <<'EOF'
 1 aggcopy16
 2 aggregate_sroa
+1 carry
 1 deadslotload
 1 diffcmp
 2 fmanegpeel
@@ -52,6 +53,7 @@ WANT_LITERAL=$(sort -k2 <<'EOF'
 1 interval
 1 jump_thread
 1 jump_thread_cleanup
+1 jump_thread_early
 1 load_forward
 2 loop_carried_forward
 1 loop_carried_forward_late
@@ -100,7 +102,7 @@ for funnel in iphase_dump o1_checkpoint preloop_dump timed_pass; do
     grep -q "macro_rules! $funnel" src/passes/mod.rs \
         || { echo "FAIL: hook funnel $funnel is gone from src/passes/mod.rs" >&2; exit 1; }
 done
-WANT_HOOKS=44
+WANT_HOOKS=46
 if [ "$HOOKS" -ne "$WANT_HOOKS" ]; then
     echo "FAIL: $HOOKS verify::verify_after_pass hooks in src/passes/mod.rs, pinned at $WANT_HOOKS." >&2
     echo "      If a pass hook was added/removed on purpose, update WANT_HOOKS in this same change." >&2

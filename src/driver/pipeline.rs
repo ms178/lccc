@@ -312,6 +312,22 @@ pub struct Driver {
     /// when mcount_pg is true (matching GCC: -pg is the trigger, the -m flags
     /// only configure how the call is emitted).
     pub(super) mcount_submode: crate::backend::McountInstrumentation,
+    /// `-mharden-sls=`: an `int3` behind returns and indirect jumps.
+    pub(super) harden_sls: crate::backend::x86_late_text::HardenSls,
+    /// `-mcld`: `cld` in front of the string instructions the compiler
+    /// writes.
+    pub(super) mcld: bool,
+    /// `-mapx-inline-asm-use-gpr32`: GCC's macro of that name. The
+    /// permission it stands for (r16 to r31 for `asm` operands) is not
+    /// used.
+    pub(super) apx_inline_asm_use_gpr32: bool,
+    /// The x86 machine options `x86_mflag_policy` decides, in the order
+    /// given. They are judged after the last argument: `-m32` may follow
+    /// them, and two of them depend on the ISA.
+    pub(super) x86_deferred_mflags: Vec<String>,
+    /// The x86-64 code model named last (`-mcmodel=small|medium|kernel`),
+    /// for the error IA-32 has for each of them.
+    pub(super) x86_code_model_name: Option<&'static str>,
     /// Set by -pg: activates function-entry mcount instrumentation using the
     /// configured mcount_submode. The kernel's CFLAGS_REMOVE mechanism strips
     /// -pg (e.g. for VDSO objects) leaving the sub-modes inert, matching GCC.
@@ -581,7 +597,12 @@ pub struct Driver {
     /// The extensions granted by their own `-m` option (as opposed to a
     /// `-march=` row): those keep their grant when the only missing
     /// prerequisite is XSAVE itself, exactly like GCC's option bits.
-    pub(super) x86_extras_explicit: u32,
+    pub(super) x86_extras_explicit: u64,
+    /// The enabled macro-only extensions that have no field of their own:
+    /// one bit per `X86ExtraFeature`, for the scalar and system extensions
+    /// (`adx`, `rdseed`, `clwb`, ...) that nothing but the predefined macro
+    /// and the header's intrinsics read. See `Driver::x86_extra_slot`.
+    pub(super) x86_plain_extras: u64,
     /// `-mprefer-vector-width=` (or the `-mprefer-avx128` alias), in bits.
     /// `None` keeps the resolved value: the tuning row's SIMD datapath,
     /// floored at 256 because every 256-bit emitter here runs at full rate up
@@ -919,6 +940,11 @@ impl Driver {
             indirect_branch_thunk: false,
             patchable_function_entry: None,
             mcount_submode: crate::backend::McountInstrumentation::default(),
+            harden_sls: crate::backend::x86_late_text::HardenSls::default(),
+            mcld: false,
+            apx_inline_asm_use_gpr32: false,
+            x86_deferred_mflags: Vec::new(),
+            x86_code_model_name: None,
             mcount_pg: false,
             instrument_functions: false,
             cf_protection_branch: false,
@@ -1023,6 +1049,7 @@ impl Driver {
             x86_tune: None,
             x86_tune_spelling: None,
             x86_extras_explicit: 0,
+            x86_plain_extras: 0,
             x86_prefer_vector_bits: None,
             x86_march: None,
             pack_struct_cap: None,
@@ -2323,6 +2350,38 @@ impl Driver {
         }
     }
 
+    /// The x86 macros that are not rows of the feature table: the CPU's
+    /// names, and the extensions that are announced without being a code
+    /// generation permission.
+    fn define_x86_cpu_and_extension_macros(&self, preprocessor: &mut Preprocessor) {
+        for macro_name in self.x86_cpu_name_macros() {
+            preprocessor.define_macro(macro_name, "1");
+        }
+        // `__PRFCHW__` mirrors the codegen permission exactly (GCC defines
+        // it for `-mprfchw` and every PRFCHW `-march=`, independent of SSE).
+        if self.resolved_prfchw() {
+            preprocessor.define_macro("__PRFCHW__", "1");
+        }
+        if self.resolved_abm() {
+            preprocessor.define_macro("__ABM__", "1");
+        }
+        // GCC defines it for the option alone, in both modes and with or
+        // without APX (measured, 16.2).
+        if self.apx_inline_asm_use_gpr32 && matches!(self.target, Target::X86_64 | Target::I686) {
+            preprocessor.define_macro("__APX_INLINE_ASM_USE_GPR32__", "1");
+        }
+        // The scalar and system extensions (`__ADX__`, `__RDSEED__`,
+        // `__CLWB__`, ...): the macro of each one that is enabled, from the
+        // table GCC's own macros were measured into.
+        if matches!(self.target, Target::X86_64 | Target::I686) {
+            for extra in crate::backend::x86::arch_table::X86ExtraFeature::ALL {
+                if self.x86_plain_extras & (1 << extra as u8) != 0 {
+                    preprocessor.define_macro(extra.macro_name(), "1");
+                }
+            }
+        }
+    }
+
     /// Configure the preprocessor with CLI-defined macros and target.
     pub(super) fn configure_preprocessor(
         &self,
@@ -2561,17 +2620,7 @@ impl Driver {
             self.enable_apxf,
             self.enable_user_msr,
         );
-        for macro_name in self.x86_cpu_name_macros() {
-            preprocessor.define_macro(macro_name, "1");
-        }
-        // `__PRFCHW__` mirrors the codegen permission exactly (GCC defines
-        // it for `-mprfchw` and every PRFCHW `-march=`, independent of SSE).
-        if self.resolved_prfchw() {
-            preprocessor.define_macro("__PRFCHW__", "1");
-        }
-        if self.resolved_abm() {
-            preprocessor.define_macro("__ABM__", "1");
-        }
+        self.define_x86_cpu_and_extension_macros(preprocessor);
         // Define _REENTRANT when -pthread is used.
         // GCC and Clang automatically define _REENTRANT=1 when -pthread is passed.
         // Many configure scripts (e.g., iperf3's ax_pthread.m4) check for this macro
@@ -3487,7 +3536,8 @@ impl Driver {
         .with_default_visibility(self.default_visibility.clone())
         .with_builtin_policy(self.builtin_policy.clone())
         .with_enumerator_refs(sema_result.enumerator_refs)
-        .with_local_address_returns(sema_result.local_address_returns);
+        .with_local_address_returns(sema_result.local_address_returns)
+        .with_qualifier_verdicts(sema_result.generic_choices, sema_result.atomic_lvalues);
         let (mut module, mut diagnostics, _lowered_types) = lowerer.lower(&ast);
         // IR lowering is a user-facing phase: it rejects ill-typed builtins,
         // target-specific intrinsics and unsupported constructs, and every one
@@ -3780,6 +3830,27 @@ impl Driver {
         }
     }
 
+    /// A 512-bit vector object that is only ever read and written whole
+    /// lives in one of zmm16..zmm31 instead of a 64-byte-aligned stack slot
+    /// (`backend::x86_zmm_homes`). The last step of `optimize_ir_module`:
+    /// behind every pass that can add a use of an object or a call (the
+    /// inliner, IPA-PTA, the return duplication) and behind the TLS table,
+    /// which says what is a call; in front of the splitters, to whose
+    /// liveness a `Memcpy` is a call point and the register move it becomes
+    /// here is not. Kill switch: CCC_DISABLE_PASSES=zmmhome.
+    fn home_512_bit_objects(&self, module: &mut crate::ir::module::IrModule) {
+        if self.target == Target::X86_64
+            && self.opt_level >= 1
+            && !crate::passes::pass_disabled(
+                std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
+                "zmmhome",
+            )
+            && crate::backend::x86_zmm_homes::assign(module) != 0
+        {
+            crate::passes::verify::verify_after_pass(module, "zmmhome");
+        }
+    }
+
     fn optimize_ir_module(
         &self,
         mut module: crate::ir::module::IrModule,
@@ -3987,6 +4058,12 @@ impl Driver {
             }
         }
 
+        // Behind the last pass that may re-point a store into a volatile
+        // object (the passes above, and the inliner PGO promotion runs
+        // again): each access of such an object is a volatile instruction
+        // when the backend reads it.
+        crate::passes::close_volatile_objects(&mut module);
+
         // Pressure-guided live-range shrinkage runs after PGO promotion and
         // every ordinary SSA transform, but before call/global splitters and
         // phi elimination create non-SSA copy webs.  The pass itself is the
@@ -4069,6 +4146,7 @@ impl Driver {
                 floor: self.tls_model_floor,
             },
         ));
+        self.home_512_bit_objects(&mut module);
         (module, pgo_unit)
     }
 
@@ -5034,8 +5112,10 @@ impl Driver {
         let frame_report = frame_diagnostics
             .warning_enabled(crate::common::error::WarningKind::FrameLargerThan)
             .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())));
+        let codegen_errors: crate::backend::CodegenErrors = Default::default();
         let opts = crate::backend::CodegenOptions {
             frame_report: frame_report.clone(),
+            codegen_errors: Some(codegen_errors.clone()),
             debug_homes,
             ra_config,
             // At -O0 phi elimination leaves non-SSA multi-def webs. The linear
@@ -5058,6 +5138,8 @@ impl Driver {
                 None
             },
             cf_protection_branch: self.cf_protection_branch,
+            harden_sls: self.harden_sls,
+            cld: self.mcld,
             stack_clash_protection: self.stack_clash_protection,
             stack_protector_guard: (self.stack_protector_mode
                 != crate::backend::stack_protector::StackProtectorMode::None)
@@ -5137,6 +5219,27 @@ impl Driver {
             &opts,
             source_manager.map(|sm| &**sm),
         );
+        // What code generation refused: printed where GCC prints it, and the
+        // compilation fails.
+        {
+            let errors = std::mem::take(
+                &mut *codegen_errors
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if !errors.is_empty() {
+                if let Some(sm) = source_manager {
+                    frame_diagnostics.set_shared_source_manager(sm.clone());
+                }
+                for (file_id, start, end, message) in errors {
+                    frame_diagnostics.error(
+                        message,
+                        crate::common::source::Span::new(start, end, file_id),
+                    );
+                }
+                return Err("code generation diagnostics failed".to_string());
+            }
+        }
         if let Some(report) = frame_report {
             let report = report
                 .lock()

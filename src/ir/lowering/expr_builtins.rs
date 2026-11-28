@@ -492,175 +492,40 @@ impl Lowerer {
         // A NaN builtin whose payload is not a string literal cannot fold: it
         // is a call to the library function (GCC: `__builtin_nan(s)` calls
         // `nan(s)`), not the canonical NaN.
-        let nan_call;
-        let kind = match (&builtin_info.kind, nan_library_function(name)) {
-            (BuiltinKind::ConstantF64(_) | BuiltinKind::ConstantF128(_), Some(lib))
-                if args
-                    .first()
-                    .is_some_and(|a| !matches!(a, Expr::StringLiteral(..))) =>
-            {
-                nan_call = BuiltinKind::LibcAlias(lib.to_string());
-                &nan_call
+        if matches!(
+            builtin_info.kind,
+            BuiltinKind::ConstantF64(_) | BuiltinKind::ConstantF128(_)
+        ) && args
+            .first()
+            .is_some_and(|a| !matches!(a, Expr::StringLiteral(..)))
+        {
+            if let Some((library_name, prototype)) = nan_library_function(name) {
+                return Some(self.lower_library_builtin_call(
+                    name,
+                    library_name,
+                    prototype,
+                    args,
+                    Self::builtin_arg_span(args),
+                ));
             }
-            (kind, _) => kind,
-        };
-        match kind {
+        }
+        match &builtin_info.kind {
             BuiltinKind::LibcAlias(libc_name) => {
-                // Source types must describe the values `lower_expr` really
-                // produces (see the long note in `expr_calls.rs`):
-                // `get_expr_type` reports the storage-level width and lies
-                // about `i + 1`, which is an `int`.
-                let mut arg_types: Vec<IrType> =
-                    args.iter().map(|a| self.value_ir_type(a)).collect();
-                let mut arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
-                // A `__builtin_*` call carries the libc function's signature
-                // whether or not the TU declared the libc symbol, so the
-                // parameter conversions are part of the builtin's contract.
-                // Without them `__builtin_memcmp(p, q, i + 1)` passed a raw
-                // 32-bit `int` where `size_t` was expected: at -O0 the 8-byte
-                // argument load read the neighbouring 4-byte slot as the high
-                // half (gcc.c-torture `pr59229.c`), and a negative length was
-                // zero-extended instead of sign-extended.
-                if let Some(params) = builtins::libc_alias_param_types(libc_name.as_str()) {
-                    for (i, &param_ty) in params.iter().enumerate() {
-                        if i >= arg_vals.len() {
-                            break;
-                        }
-                        let from = arg_types[i];
-                        if from == param_ty
-                            || from == IrType::Ptr
-                            || param_ty == IrType::Ptr
-                            || !from.is_integer()
-                            || !param_ty.is_integer()
-                        {
-                            continue;
-                        }
-                        arg_vals[i] = self.emit_implicit_cast(arg_vals[i].clone(), from, param_ty);
-                        arg_types[i] = param_ty;
+                if libc_name == "memcpy" {
+                    if let Some(dest) = self.try_lower_constant_memcpy(args) {
+                        return Some(dest);
                     }
                 }
-                // -----------------------------------------------------------------
-                // Constant-size `__builtin_memcpy` / `__builtin_mempcpy`.  The
-                // libc forwarding below would emit a real `call memcpy`, but a copy
-                // of compile-time-constant size is better modelled by the native IR
-                // `Memcpy` instruction: the backend inlines small copies, and the
-                // SROA / store-load-forwarding passes can then forward a load out of
-                // the destination (read64's `__builtin_memcpy(&v, p, 8); return v`
-                // collapses to a single unaligned load) instead of leaving a
-                // store-to-temp + reload in every hot loop that does an unaligned
-                // 64-bit read.  This fires ONLY for the *builtin* spelling, which by
-                // construction names the libc function; a plain `memcpy(...)` call
-                // (which could be a user-provided function of that name) stays a
-                // call, preserving exact user semantics.  `memmove` is never
-                // rewritten because its overlap contract is different.
-                //
-                // SOUNDNESS for the native Memcpy: C `memcpy` already has the
-                // no-overlap precondition (overlap is UB), which is exactly the
-                // contract `Instruction::Memcpy` assumes, so lowering a valid
-                // `memcpy` to it is value-preserving.  The result of `memcpy` is the
-                // destination pointer, so on success we yield that operand directly.
-                if libc_name == "memcpy" && arg_vals.len() == 3 {
-                    // The size argument is promoted to `size_t` (U64) by the
-                    // libc-alias cast above, so even a literal `8` lowers to a
-                    // ZExt/Cast *value*, not a `Const`.  Const-evaluate the
-                    // source expression directly rather than inspecting the
-                    // lowered operand.
-                    let size = match self.eval_const_expr(&args[2]) {
-                        Some(IrConst::I64(v)) if v > 0 => v as usize,
-                        Some(IrConst::I32(v)) if v > 0 => v as usize,
-                        Some(IrConst::I128(v)) if v > 0 && v <= usize::MAX as i128 => v as usize,
-                        _ => 0,
-                    };
-                    if size > 0 {
-                        if let (Operand::Value(dp), Operand::Value(sp)) =
-                            (&arg_vals[0], &arg_vals[1])
-                        {
-                            let dp = *dp;
-                            let sp = *sp;
-                            // A whole-register vector copy (`memcpy(&v, p,
-                            // sizeof v)` / `memcpy(p, &v, sizeof v)`) is a
-                            // packed load + store the vector passes see
-                            // through (`vec_ssa` dissolves the temporary).
-                            if self.try_emit_vector_memcpy(&args[0], &args[1], dp, sp, size) {
-                                return Some(Operand::Value(dp));
-                            }
-                            self.emit(Instruction::Memcpy {
-                                dest: dp,
-                                src: sp,
-                                size,
-                            });
-                            // `__builtin_memcpy` returns its destination.
-                            return Some(Operand::Value(dp));
-                        }
-                    }
-                }
-                let dest = self.fresh_value();
-                // The builtin is callable without a prior libc prototype
-                // (`__builtin_printf("%g", f)` in a TU that never includes
-                // <stdio.h>).  The variadic contract of the printf family is
-                // part of the builtin's own signature, so it must not depend
-                // on whether the user happened to declare the libc symbol:
-                // without it, a `float` argument was passed as a 4-byte F32
-                // in an XMM register and printf read garbage (C11 6.5.2.2p6
-                // requires float->double, char/short->int promotion).
-                let libc_sig = self.func_meta.sigs.get(libc_name.as_str());
-                let (variadic, n_fixed) = match libc_sig {
-                    Some(sig) if sig.is_variadic => (true, sig.param_types.len()),
-                    // Unprototyped declaration (`int printf();`): the default
-                    // argument promotions apply to EVERY argument (C11
-                    // 6.5.2.2p6), and the callee is the real variadic libc
-                    // function — use the builtin's own fixed-arity contract.
-                    Some(sig) if sig.param_types.is_empty() => {
-                        match builtin_variadic_fixed_arity(libc_name.as_str()) {
-                            Some(n) => (true, n),
-                            None => (true, arg_vals.len()),
-                        }
-                    }
-                    Some(_) => (false, arg_vals.len()),
-                    None => match builtin_variadic_fixed_arity(libc_name.as_str()) {
-                        Some(n) => (true, n),
-                        None => (false, arg_vals.len()),
-                    },
-                };
-                let libc_return_type = libc_sig.map(|s| s.return_type);
-                if variadic {
-                    self.promote_variadic_args(&mut arg_vals, &mut arg_types, n_fixed);
-                }
-                let return_type = self
-                    .builtin_return_type(name)
-                    .or(libc_return_type)
-                    .unwrap_or(crate::common::types::target_int_ir_type());
-                let struct_arg_sizes = vec![None; arg_vals.len()];
-                self.emit(Instruction::Call {
-                    func: libc_name.clone(),
-                    info: CallInfo {
-                        dest: Some(dest),
-                        args: arg_vals,
-                        arg_types,
-                        return_type,
-                        is_variadic: variadic,
-                        num_fixed_args: n_fixed,
-                        struct_arg_sizes,
-                        struct_arg_aligns: vec![],
-                        struct_arg_classes: Vec::new(),
-                        struct_arg_fp_agg_classes: Vec::new(),
-                        struct_arg_is_f128_sse: Vec::new(),
-                        is_sret: false,
-                        calling_convention: crate::common::types::CallingConvention::Default,
-                        is_fastcall: false,
-                        regparm: None,
-                        is_pure: false,
-                        is_const: false,
-                        memory: Default::default(),
-                        // Spelled `__builtin_<name>`: the library function by definition.
-                        assume_library: true,
-                        ret_eightbyte_classes: Vec::new(),
-                        ret_is_f128_sse: false,
-                        ret_is_vector128: false,
-                        cold: false,
-                    },
-                });
-                Some(Operand::Value(dest))
+                // No alias is registered without GCC's prototype of it
+                // (`library_builtin_tests`).
+                let (library_name, prototype) = builtins::library_alias(name)?;
+                Some(self.lower_library_builtin_call(
+                    name,
+                    library_name,
+                    prototype,
+                    args,
+                    Self::builtin_arg_span(args),
+                ))
             }
             BuiltinKind::Identity => Some(
                 args.first()
@@ -702,6 +567,61 @@ impl Lowerer {
                 self.lower_builtin_intrinsic(intrinsic, name, args)
             }
         }
+    }
+
+    /// `__builtin_memcpy(d, s, N)` with a positive constant `N`: the native
+    /// IR `Memcpy` instead of `call memcpy`, and its destination as the
+    /// value. `None`, with nothing lowered, for every other call.
+    ///
+    /// The backend inlines small copies, and the SROA / store-load-forwarding
+    /// passes can then forward a load out of the destination (read64's
+    /// `__builtin_memcpy(&v, p, 8); return v` collapses to a single unaligned
+    /// load) instead of leaving a store-to-temp + reload in every hot loop
+    /// that does an unaligned 64-bit read. This fires ONLY for the *builtin*
+    /// spelling, which by construction names the libc function; a plain
+    /// `memcpy(...)` call (which could be a user-provided function of that
+    /// name) stays a call, preserving exact user semantics. `memmove` is
+    /// never rewritten because its overlap contract is different.
+    ///
+    /// SOUNDNESS for the native Memcpy: C `memcpy` already has the
+    /// no-overlap precondition (overlap is UB), which is exactly the
+    /// contract `Instruction::Memcpy` assumes, so lowering a valid `memcpy`
+    /// to it is value-preserving.
+    fn try_lower_constant_memcpy(&mut self, args: &[Expr]) -> Option<Operand> {
+        let [dest, src, size] = args else {
+            return None;
+        };
+        // The size is converted to `size_t` when the call is lowered, so the
+        // expression itself is evaluated: a constant expression has no side
+        // effect to keep.
+        let size = match self.eval_const_expr(size)? {
+            IrConst::I64(v) if v > 0 => v as usize,
+            IrConst::I32(v) if v > 0 => v as usize,
+            IrConst::I128(v) if v > 0 && v <= usize::MAX as i128 => v as usize,
+            _ => return None,
+        };
+        // Only pointers: an argument of another type is converted by the
+        // call (and GCC refuses most of them).
+        let is_pointer = |this: &Self, e: &Expr| this.value_ir_type(e) == IrType::Ptr;
+        if !is_pointer(self, dest) || !is_pointer(self, src) {
+            return None;
+        }
+        let dest_value = self.lower_expr(dest);
+        let src_value = self.lower_expr(src);
+        let dp = self.operand_to_value(dest_value);
+        let sp = self.operand_to_value(src_value);
+        // A whole-register vector copy (`memcpy(&v, p, sizeof v)` /
+        // `memcpy(p, &v, sizeof v)`) is a packed load + store the vector
+        // passes see through (`vec_ssa` dissolves the temporary).
+        if !self.try_emit_vector_memcpy(dest, src, dp, sp, size) {
+            self.emit(Instruction::Memcpy {
+                dest: dp,
+                src: sp,
+                size,
+            });
+        }
+        // `__builtin_memcpy` returns its destination.
+        Some(Operand::Value(dp))
     }
 
     // --- Builtin-call diagnostics (AUD-ICE-1 / AUD-DIAG-1) -------------------
@@ -881,6 +801,52 @@ impl Lowerer {
 
     /// Reject a builtin call, lower the arguments for their side effects, and
     /// return a placeholder of `bytes` bytes.
+    /// The type a call of the public or GNU-named x86 intrinsic `name` has,
+    /// when that type is neither `bytes` wide nor a pointer.
+    ///
+    /// The value of such a call is the address of a `bytes`-byte result, and
+    /// every consumer reads it by the call's type: a return copies that many
+    /// bytes, an argument is passed in a vector register, `sizeof` is that
+    /// number. Two types say what the value is. A vector (or a record) of
+    /// `bytes` bytes: the call is the object at that address. A pointer: the
+    /// call is the address, and the header dereferences it
+    /// (`__CCC_M128I_FROM_BUILTIN`). A call typed as anything else -- the
+    /// implicit `int` of a name no header declares and no builtin table
+    /// types -- is compiled as a scalar whose value is that address.
+    /// `_mm_sll_epi16` was one of 48: `return _mm_sll_epi16(a, n);` returned
+    /// a stack address.
+    ///
+    /// The type is looked up as `get_expr_ctype` looks it up for the call
+    /// expression: the declaration in scope first, the builtin's own type
+    /// second. The header-private spellings (`__lccc_*`) are not asked: they
+    /// are declared by the generated header, each with the type its one
+    /// caller there expects.
+    fn mistyped_x86_vector_call(&self, name: &str, bytes: usize) -> Option<String> {
+        if !(name.starts_with("_mm") || name.starts_with("__builtin_ia32_")) {
+            return None;
+        }
+        let key = self.callee_signature_key(name);
+        let typed = self
+            .func_meta
+            .sigs
+            .get(key.as_str())
+            .and_then(|sig| sig.return_ctype.clone())
+            .or_else(|| {
+                self.sema_functions
+                    .get(key.as_str())
+                    .map(|info| info.return_type.clone())
+            })
+            .or_else(|| {
+                crate::frontend::sema::type_checker::ExprTypeChecker::builtin_return_ctype(name)
+            });
+        match typed {
+            Some(CType::Pointer(..)) => None,
+            Some(ctype) if ctype.size_ctx(&*self.types.borrow_struct_layouts()) == bytes => None,
+            Some(ctype) => Some(format!("{ctype}")),
+            None => Some("int".to_string()),
+        }
+    }
+
     pub(super) fn reject_builtin_call(
         &mut self,
         message: String,
@@ -1339,13 +1305,11 @@ impl Lowerer {
             BuiltinIntrinsic::Parity => self.lower_parity_intrinsic(name, args),
             BuiltinIntrinsic::ComplexReal => self.lower_complex_part(name, args, true),
             BuiltinIntrinsic::ComplexImag => self.lower_complex_part(name, args, false),
-            BuiltinIntrinsic::ComplexConj => {
-                if !args.is_empty() {
-                    Some(self.lower_complex_conj(&args[0]))
-                } else {
-                    Some(Operand::Const(IrConst::F64(0.0)))
-                }
-            }
+            BuiltinIntrinsic::ComplexConj => match (args.first(), Self::complex_conj_ctype(name)) {
+                (Some(arg), Some(target)) => Some(self.lower_complex_conj_as(arg, &target)),
+                (Some(arg), None) => Some(self.lower_complex_conj(arg)),
+                (None, _) => Some(Operand::Const(IrConst::F64(0.0))),
+            },
             BuiltinIntrinsic::Fence => Some(Operand::Const(IrConst::I64(0))),
             BuiltinIntrinsic::FpClassify => self.lower_builtin_fpclassify(args),
             BuiltinIntrinsic::IsNan => self.lower_builtin_isnan(args),
@@ -1372,7 +1336,6 @@ impl Lowerer {
             BuiltinIntrinsic::StackSave => self.lower_builtin_stack_save(args),
             BuiltinIntrinsic::StackRestore => self.lower_builtin_stack_restore(args),
             BuiltinIntrinsic::Cexpi => self.lower_builtin_cexpi(args),
-            BuiltinIntrinsic::Cpow => self.lower_builtin_cpow(args),
             BuiltinIntrinsic::Gcc16GenericBit => self.lower_gcc16_generic_bit_builtin(name, args),
             BuiltinIntrinsic::Gcc16Carry => self.lower_gcc16_carry_builtin(name, args),
             BuiltinIntrinsic::Gcc16BswapBitrev => self.lower_gcc16_bswap_bitrev_builtin(name, args),
@@ -1876,9 +1839,6 @@ impl Lowerer {
             BuiltinIntrinsic::X86AvxWiden(op) => self.lower_avx_widen(*op, name, args),
             BuiltinIntrinsic::X86AvxTest(test) => self.lower_avx_test(*test, name, args),
             BuiltinIntrinsic::LcccSimd => self.lower_lccc_simd(name, args),
-            // __builtin___*_chk: fortification builtins forward to unchecked libc equivalents.
-            // Each __builtin___X_chk(args..., extra_check_args...) becomes X(args...).
-            BuiltinIntrinsic::FortifyChk => self.lower_fortify_chk(name, args),
             // __builtin_va_arg_pack / __builtin_va_arg_pack_len: forward the
             // wrapper's caller variadic arguments during inlining.  Lowered
             // to a zero-arg sentinel CALL (`__lccc_va_arg_pack` /
@@ -2104,137 +2064,6 @@ impl Lowerer {
                     Some(Operand::Const(IrConst::I64(0)))
                 }
             }
-        }
-    }
-
-    /// Lower __builtin___X_chk fortification builtins by forwarding all arguments
-    /// to the glibc __X_chk runtime function (e.g., __builtin___snprintf_chk -> __snprintf_chk).
-    /// This avoids infinite recursion when glibc's fortification headers redefine functions
-    /// like snprintf as always_inline wrappers that call __builtin___snprintf_chk.
-    fn lower_fortify_chk(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
-        // Map __builtin___X_chk to the glibc runtime __X_chk function.
-        // All arguments are forwarded as-is (the runtime function does the checking).
-        let libc_chk_name: &str = match name {
-            "__builtin___memcpy_chk" => "__memcpy_chk",
-            "__builtin___memmove_chk" => "__memmove_chk",
-            "__builtin___memset_chk" => "__memset_chk",
-            "__builtin___strcpy_chk" => "__strcpy_chk",
-            "__builtin___strncpy_chk" => "__strncpy_chk",
-            "__builtin___strcat_chk" => "__strcat_chk",
-            "__builtin___strncat_chk" => "__strncat_chk",
-            "__builtin___sprintf_chk" => "__sprintf_chk",
-            "__builtin___snprintf_chk" => "__snprintf_chk",
-            "__builtin___dprintf_chk" => "__dprintf_chk",
-            "__builtin___vsprintf_chk" => "__vsprintf_chk",
-            "__builtin___vsnprintf_chk" => "__vsnprintf_chk",
-            "__builtin___printf_chk" => "__printf_chk",
-            "__builtin___fprintf_chk" => "__fprintf_chk",
-            "__builtin___vprintf_chk" => "__vprintf_chk",
-            "__builtin___vfprintf_chk" => "__vfprintf_chk",
-            "__builtin___mempcpy_chk" => "__mempcpy_chk",
-            "__builtin___stpcpy_chk" => "__stpcpy_chk",
-            "__builtin___stpncpy_chk" => "__stpncpy_chk",
-            _ => {
-                // Unknown _chk variant: lower all args for side effects, return 0
-                for arg in args {
-                    self.lower_expr(arg);
-                }
-                return Some(Operand::Const(IrConst::I64(0)));
-            }
-        };
-
-        // Only the non-v* printf-family _chk builtins are truly variadic (they take ...).
-        // The v* variants (vsprintf_chk, etc.) take a va_list argument instead, which is
-        // a regular pointer parameter, not variadic.
-        let is_variadic = matches!(
-            name,
-            "__builtin___sprintf_chk"
-                | "__builtin___snprintf_chk"
-                | "__builtin___dprintf_chk"
-                | "__builtin___printf_chk"
-                | "__builtin___fprintf_chk"
-        );
-
-        // Lower all arguments in order
-        let mut arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
-        let mut arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
-
-        let dest = self.fresh_value();
-        let return_type = self
-            .builtin_return_type(name)
-            .unwrap_or(crate::common::types::target_int_ir_type());
-        // The fortified printf family has a fixed prefix (flag/size/format
-        // operands) followed by `...`.  Everything past the prefix is a
-        // variadic argument and must receive the default argument
-        // promotions, exactly as for the unfortified builtin: glibc's
-        // <stdio.h> rewrites `printf("%g", f)` into
-        // `__builtin___printf_chk(1, "%g", f)` and a float passed as F32
-        // there was read by glibc as a double.  The count also matters for
-        // the SysV `%al` XMM-count and the i686 stack layout.
-        let n_fixed = if is_variadic {
-            builtin_variadic_fixed_arity(libc_chk_name).unwrap_or(arg_vals.len())
-        } else {
-            arg_vals.len()
-        };
-        if is_variadic {
-            self.promote_variadic_args(&mut arg_vals, &mut arg_types, n_fixed);
-        }
-        let struct_arg_sizes = vec![None; arg_vals.len()];
-        self.emit(Instruction::Call {
-            func: libc_chk_name.to_string(),
-            info: CallInfo {
-                dest: Some(dest),
-                args: arg_vals,
-                arg_types,
-                return_type,
-                is_variadic,
-                num_fixed_args: n_fixed,
-                struct_arg_sizes,
-                struct_arg_aligns: vec![],
-                struct_arg_classes: Vec::new(),
-                struct_arg_fp_agg_classes: Vec::new(),
-                struct_arg_is_f128_sse: Vec::new(),
-                is_sret: false,
-                calling_convention: crate::common::types::CallingConvention::Default,
-                is_fastcall: false,
-                regparm: None,
-                is_pure: false,
-                is_const: false,
-                memory: Default::default(),
-                // Spelled `__builtin___<name>_chk`: the fortified builtin by definition.
-                assume_library: true,
-                ret_eightbyte_classes: Vec::new(),
-                ret_is_f128_sse: false,
-                ret_is_vector128: false,
-                cold: false,
-            },
-        });
-        Some(Operand::Value(dest))
-    }
-
-    /// Apply the C11 6.5.2.2p6 default argument promotions to every argument at
-    /// index >= `n_fixed` of a variadic call: `float` -> `double`,
-    /// `char`/`short` (any signedness) -> `int`.  `arg_types` is rewritten in
-    /// lock-step so the backend classifies the promoted value (F64 travels in
-    /// an XMM register and is counted in `%al`; I32 is a GPR/stack slot).
-    /// `_Bool` is already materialised as an I8 0/1 and widens to `int` here as
-    /// well, which is what the C standard requires.
-    pub(super) fn promote_variadic_args(
-        &mut self,
-        arg_vals: &mut [Operand],
-        arg_types: &mut [IrType],
-        n_fixed: usize,
-    ) {
-        for i in n_fixed..arg_vals.len() {
-            let ty = arg_types[i];
-            let promoted = match ty {
-                IrType::F32 => IrType::F64,
-                IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => IrType::I32,
-                _ => continue,
-            };
-            let val = std::mem::replace(&mut arg_vals[i], Operand::Const(IrConst::I64(0)));
-            arg_vals[i] = self.emit_implicit_cast(val, ty, promoted);
-            arg_types[i] = promoted;
         }
     }
 
@@ -3548,7 +3377,12 @@ impl Lowerer {
         arg: &Expr,
         index: usize,
     ) -> Operand {
-        let target = match crate::common::x86_builtin_types::argument_scalar_types(name) {
+        let generated = crate::common::x86_builtin_types::argument_scalar_types(name);
+        let private = match generated {
+            Some(_) => None,
+            None => private_x86_argument_scalar_types(name),
+        };
+        let target = match generated.or(private) {
             Some(types) => types.get(index).copied().flatten(),
             None => self
                 .func_meta
@@ -3564,14 +3398,43 @@ impl Lowerer {
         // to instructions that only the optimizer folds. So at -O0 the lane
         // of `_mm_extract_epi8(v, -(-1))` reached the emitter as a value,
         // and the emitter wrote `pextrb $0`.
-        let constant = self.integer_constant_argument(arg);
+        //
+        // A floating constant read that way is the `int` the call converts
+        // it to, which a floating parameter does not do: there the
+        // expression is the operand. (An operand without a type here is an
+        // integer one the tables do not describe and keeps the integer
+        // reading.)
+        let floating = self.expr_ctype(arg).is_floating();
+        let constant = self
+            .integer_constant_argument(arg)
+            .filter(|_| !(floating && target.is_some_and(|target| target.is_float())));
+        // A constant operand of one of lccc's own builtins is handed over
+        // as its value. Their scalar operands are integers an instruction
+        // takes the low bits of (the element of PINSR), so the value is the
+        // operand at any width, and the emitter loads it in the shortest
+        // form the value has. Narrowed to the parameter's type first,
+        // `_mm_insert_epi32(v, 0xDEADBEEF, 1)` loaded its element with
+        // `movq $-559038737, %rcx` where it had `movl $3735928559, %ecx`.
+        if let (Some(_), Some(value)) = (private, constant) {
+            return Operand::Const(value);
+        }
         let lowered = |this: &mut Self| match constant {
             Some(value) => Operand::Const(value),
             None => this.lower_expr(arg),
         };
         match target {
             Some(target) => {
-                let source = self.get_expr_type(arg);
+                // What is left to convert when the constant was floating is
+                // the integer it has become, not the expression. Converted
+                // "from double" once more, the integer's bits were read as a
+                // double, which the optimizer folded by value and the code
+                // generator did not: at -O0 `_mm_set1_epi32(3.7)` was a
+                // vector of zeros, `_mm_slli_epi32(v, 2.9)` a shift by none.
+                let source = if floating && constant.is_some() {
+                    IrType::I64
+                } else {
+                    self.get_expr_type(arg)
+                };
                 let value = lowered(self);
                 // Preserve constant immediates even at O0: a numeric C
                 // conversion must not turn a valid immediate into an SSA value.
@@ -3796,6 +3659,21 @@ impl Lowerer {
                 Some(Operand::Const(IrConst::I64(0)))
             }
             X86IntrinsicKind::Vec128 | X86IntrinsicKind::Vec256 => {
+                let result_size = match x86_intrinsic_kind(intrinsic) {
+                    X86IntrinsicKind::Vec128 => 16,
+                    _ => 32,
+                };
+                if let Some(typed) = self.mistyped_x86_vector_call(name, result_size) {
+                    return self.reject_builtin_call(
+                        format!(
+                            "a call of '{name}' has type '{typed}' here, and its value is a \
+                             {result_size}-byte vector: no declaration of '{name}' is in scope \
+                             (include <immintrin.h>)"
+                        ),
+                        args,
+                        result_size,
+                    );
+                }
                 // GNU's byte-lane shift/align builtins take BIT counts;
                 // the instruction IR and public _mm APIs take byte counts.
                 let bit_count = name.starts_with("__builtin_ia32_")
@@ -3854,11 +3732,6 @@ impl Lowerer {
                 if let (Some(value), Some(last)) = (immediate_value, arg_ops.last_mut()) {
                     *last = Operand::Const(IrConst::I32(value as i32));
                 }
-                let result_size = match x86_intrinsic_kind(intrinsic) {
-                    X86IntrinsicKind::Vec128 => 16,
-                    X86IntrinsicKind::Vec256 => 32,
-                    _ => unreachable!(),
-                };
                 let result_alloca = self.fresh_value();
                 let align = match result_size {
                     32 => 32usize,
@@ -3925,32 +3798,6 @@ enum X86IntrinsicKind {
     Scalar,
     /// Free reinterpret cast: returns the (single) argument unchanged.
     CastReinterpret,
-}
-
-/// Map a BuiltinIntrinsic to its emission pattern.
-/// Number of fixed (non-variadic) parameters of the variadic libc / glibc
-/// fortification functions reachable through `__builtin_*`.  This is the
-/// builtin's own contract and is consulted when the translation unit never
-/// declared the libc symbol (or declared it without a prototype), so the
-/// trailing arguments still receive the default argument promotions and the
-/// SysV XMM count in `%al` is correct.
-fn builtin_variadic_fixed_arity(libc_name: &str) -> Option<usize> {
-    Some(match libc_name {
-        "printf" => 1,
-        "fprintf" | "sprintf" | "dprintf" => 2,
-        "snprintf" => 3,
-        // __printf_chk(flag, fmt, ...)
-        "__printf_chk" => 2,
-        // __fprintf_chk(fp, flag, fmt, ...)
-        "__fprintf_chk" => 3,
-        // __sprintf_chk(s, flag, slen, fmt, ...)
-        "__sprintf_chk" => 4,
-        // __snprintf_chk(s, maxlen, flag, slen, fmt, ...)
-        "__snprintf_chk" => 5,
-        // __dprintf_chk(fd, flag, fmt, ...)
-        "__dprintf_chk" => 3,
-        _ => return None,
-    })
 }
 
 /// One `__builtin_prefetch` hint argument after constant evaluation.
@@ -4227,6 +4074,61 @@ impl Lowerer {
 /// A floating value converted to `int` as C converts it (toward zero), where
 /// `int` holds the result; `None` for a value it does not hold, a NaN among
 /// them, which C leaves undefined and no immediate can be.
+/// The scalar value operands of the builtins the bundled headers call that
+/// the generated table has no row for: lccc's own names, mostly.
+///
+/// GCC has other names for these operations, so the generated table of GCC's
+/// builtins (`x86_builtin_types::argument_scalar_types`) does not list
+/// them, and no header declares them. A builtin without a row took a scalar
+/// argument as it was written: `_mm_insert_epi32(v, d, 1)` with a `double d`
+/// inserted the low half of the double, and `_mm_insert_epi64(v, i, 0)` with
+/// an `int i` inserted, without optimization, whatever stood above the `int`
+/// in its register. GCC converts both, to the `int` and the `long long` its
+/// macros cast to.
+///
+/// One entry per operand up to the last scalar value, `None` for a vector
+/// or an address. An immediate has no entry: `x86_immediate` checks it and
+/// hands the emitter the constant. Every `__builtin_ia32_*` name a bundled
+/// header calls is in the generated table or here
+/// (`every_builtin_the_headers_call_has_its_scalar_operands_typed`), so a
+/// new private builtin cannot be added without deciding this.
+pub(super) fn private_x86_argument_scalar_types(name: &str) -> Option<&'static [Option<IrType>]> {
+    const INT: Option<IrType> = Some(IrType::I32);
+    const LONG_LONG: Option<IrType> = Some(IrType::I64);
+    Some(match name {
+        // (vector, element, lane): the element is an `int`, of which the
+        // instruction takes the low 8, 16 or 32 bits; a `long long` for PINSRQ.
+        "__builtin_ia32_pinsrb128" | "__builtin_ia32_pinsrw128" | "__builtin_ia32_pinsrd128" => {
+            &[None, INT]
+        }
+        "__builtin_ia32_pinsrq128" => &[None, LONG_LONG],
+        "__builtin_ia32_cvtsi32si128" => &[INT],
+        // Vectors, addresses and immediates only.
+        "__builtin_ia32_aesdec256"
+        | "__builtin_ia32_aesdeclast256"
+        | "__builtin_ia32_aesenc256"
+        | "__builtin_ia32_aesenclast256"
+        | "__builtin_ia32_clflush"
+        | "__builtin_ia32_cvtsi128si32"
+        | "__builtin_ia32_cvtsi128si64"
+        | "__builtin_ia32_loadldi128"
+        | "__builtin_ia32_mfence"
+        | "__builtin_ia32_pand256"
+        | "__builtin_ia32_pextrb128"
+        | "__builtin_ia32_pextrd128"
+        | "__builtin_ia32_pextrq128"
+        | "__builtin_ia32_pextrw128"
+        | "__builtin_ia32_prefetch"
+        | "__builtin_ia32_pshufd128"
+        | "__builtin_ia32_pshufhw128"
+        | "__builtin_ia32_pshuflw128"
+        | "__builtin_ia32_storeldi128"
+        | "__builtin_ia32_vbroadcasti128"
+        | "__builtin_ia32_vpclmulqdq256" => &[],
+        _ => return None,
+    })
+}
+
 fn converted_to_int(value: f64) -> Option<i64> {
     let truncated = value.trunc();
     // False for a NaN, which compares with nothing.
@@ -5632,15 +5534,17 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
     }
 }
 
-/// The C library function a non-constant NaN builtin calls.
-fn nan_library_function(name: &str) -> Option<&'static str> {
-    Some(match name {
+/// The C library function a non-constant NaN builtin calls, and the
+/// builtin's prototype.
+fn nan_library_function(name: &str) -> Option<(&'static str, &'static builtins::LibcPrototype)> {
+    let library_name = match name {
         "__builtin_nan" => "nan",
         "__builtin_nanf" => "nanf",
         "__builtin_nanl" => "nanl",
         "__builtin_nanf128" | "__builtin_nanq" => "nanf128",
         _ => return None,
-    })
+    };
+    Some((library_name, builtins::libc_builtin_prototype(name)?))
 }
 
 #[cfg(test)]
@@ -5665,6 +5569,159 @@ mod x86_var_shift_arity_tests {
             assert_eq!(x86_var_shift_arity(&intrinsic), Some(2), "{intrinsic:?}");
         }
         assert_eq!(x86_var_shift_arity(&B::X86Pmulhw128), None);
+    }
+}
+
+#[cfg(test)]
+mod private_x86_argument_tests {
+    use super::private_x86_argument_scalar_types as private;
+    use crate::common::types::IrType;
+    use crate::common::x86_builtin_types::argument_scalar_types as generated;
+
+    /// The text of a header without its comments: a comment may name a
+    /// builtin of GCC's that lccc does not call.
+    fn code_of(text: &str) -> String {
+        let mut code = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find("/*") {
+            code.push_str(&rest[..start]);
+            code.push(' ');
+            rest = rest[start + 2..]
+                .split_once("*/")
+                .map_or("", |(_, after)| after);
+        }
+        code.push_str(rest);
+        code.lines()
+            .map(|line| line.split_once("//").map_or(line, |(before, _)| before))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn builtins_the_headers_call() -> std::collections::BTreeSet<String> {
+        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/include");
+        let mut names = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(directory).expect("the bundled headers") {
+            let path = entry.expect("a directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("h") {
+                continue;
+            }
+            let code = code_of(&std::fs::read_to_string(&path).expect("a header"));
+            let mut rest = code.as_str();
+            while let Some(at) = rest.find("__builtin_ia32_") {
+                let name: String = rest[at..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                rest = &rest[at + name.len()..];
+                // A name pasted together by a macro (`__builtin_ia32_##op`)
+                // is written out where the macro is used, not here.
+                if !name.ends_with('_') && !rest.trim_start().starts_with("##") {
+                    names.insert(name);
+                }
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn every_builtin_the_headers_call_has_its_scalar_operands_typed() {
+        let names = builtins_the_headers_call();
+        assert!(
+            names.len() > 200,
+            "the headers were not read: {} names",
+            names.len()
+        );
+        let untyped: Vec<_> = names
+            .iter()
+            .filter(|name| generated(name).is_none() && private(name).is_none())
+            .collect();
+        assert!(
+            untyped.is_empty(),
+            "builtins a header calls whose scalar operands nothing describes (a scalar \
+             argument of one is passed as written, unconverted): {untyped:?}"
+        );
+    }
+
+    #[test]
+    fn the_two_tables_share_no_name_and_the_private_one_has_no_stale_row() {
+        let names = builtins_the_headers_call();
+        for name in &names {
+            assert!(
+                generated(name).is_none() || private(name).is_none(),
+                "{name} is in the generated table and in the private one"
+            );
+        }
+        // Every row is for a builtin a header calls.
+        for name in [
+            "__builtin_ia32_pinsrb128",
+            "__builtin_ia32_pinsrw128",
+            "__builtin_ia32_pinsrd128",
+            "__builtin_ia32_pinsrq128",
+            "__builtin_ia32_cvtsi32si128",
+            "__builtin_ia32_aesdec256",
+            "__builtin_ia32_aesdeclast256",
+            "__builtin_ia32_aesenc256",
+            "__builtin_ia32_aesenclast256",
+            "__builtin_ia32_clflush",
+            "__builtin_ia32_cvtsi128si32",
+            "__builtin_ia32_cvtsi128si64",
+            "__builtin_ia32_loadldi128",
+            "__builtin_ia32_mfence",
+            "__builtin_ia32_pand256",
+            "__builtin_ia32_pextrb128",
+            "__builtin_ia32_pextrd128",
+            "__builtin_ia32_pextrq128",
+            "__builtin_ia32_pextrw128",
+            "__builtin_ia32_prefetch",
+            "__builtin_ia32_pshufd128",
+            "__builtin_ia32_pshufhw128",
+            "__builtin_ia32_pshuflw128",
+            "__builtin_ia32_storeldi128",
+            "__builtin_ia32_vbroadcasti128",
+            "__builtin_ia32_vpclmulqdq256",
+        ] {
+            assert!(private(name).is_some(), "{name} lost its row");
+            assert!(
+                names.contains(name),
+                "{name} has a row and no header calls it"
+            );
+        }
+        assert!(private("__builtin_ia32_paddd128").is_none());
+        assert!(private("_mm_insert_epi32").is_none());
+    }
+
+    #[test]
+    fn an_inserted_element_is_converted_to_the_type_gcc_casts_it_to() {
+        let int = Some(IrType::I32);
+        for name in [
+            "__builtin_ia32_pinsrb128",
+            "__builtin_ia32_pinsrw128",
+            "__builtin_ia32_pinsrd128",
+        ] {
+            let row = private(name).expect("a row");
+            // The vector is an object, the element an `int`, and the lane
+            // (an immediate) has no entry.
+            assert_eq!(row, &[None, int], "{name}");
+        }
+        assert_eq!(
+            private("__builtin_ia32_pinsrq128").expect("a row"),
+            &[None, Some(IrType::I64)]
+        );
+        assert_eq!(
+            private("__builtin_ia32_cvtsi32si128").expect("a row"),
+            &[int]
+        );
+        // An extraction's lane and a shuffle's selector are immediates.
+        for name in ["__builtin_ia32_pextrd128", "__builtin_ia32_pshufd128"] {
+            assert!(private(name).expect("a row").is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn comments_are_not_code() {
+        let code = code_of("a /* __builtin_ia32_x */ b // __builtin_ia32_y\nc /* open");
+        assert!(!code.contains("__builtin_ia32_"));
+        assert!(code.contains('a') && code.contains('b') && code.contains('c'));
     }
 }
 

@@ -28,6 +28,7 @@ pub(crate) mod bool_thread;
 pub(crate) mod builtin_policy;
 pub(crate) mod byte_load;
 pub(crate) mod byval_scalar;
+pub(crate) mod carry_chain;
 pub(crate) mod cfg_simplify;
 pub(crate) mod const_array_promote;
 pub(crate) mod constant_fold;
@@ -67,6 +68,7 @@ pub(crate) mod iv_widen;
 mod join_store_forward;
 pub(crate) mod jump_thread;
 pub(crate) mod licm;
+pub(crate) mod limb_unroll;
 pub(crate) mod live_range_shrinkage;
 pub(crate) mod load_forward;
 pub(crate) mod loop_align;
@@ -1876,6 +1878,18 @@ pub(crate) fn with_function_x86_vec_isa<R>(
     result
 }
 
+/// [`dse::close_volatile_objects`] once more, behind the passes and ahead of
+/// the backend.  [`run_passes`] closes every function before it runs
+/// anything, and a pass that re-points a store makes a plain one into a
+/// volatile object after that: `volatile _Complex double z = 1.0;` builds
+/// the constant in a temporary, the copy of the temporary into `z` is
+/// elided, and what was the temporary's store of 1.0 is `z`'s -- one the
+/// backend then wrote as two halves of a double.  Nothing is merged here:
+/// what is left is what the program wrote.
+pub(crate) fn close_volatile_objects(module: &mut IrModule) -> usize {
+    module.for_each_function(|func| dse::close_volatile_objects(func, false))
+}
+
 pub(crate) fn run_passes(
     module: &mut IrModule,
     opt_level: u32,
@@ -2180,6 +2194,15 @@ pub(crate) fn run_passes(
         lccc::cli::stderr_line(format_args!("{:#?}", module));
         lccc::cli::stderr_line(format_args!("==== END IR ===="));
     }
+    // The accesses of a C volatile object are volatile instructions from
+    // here on (`dse::close_volatile_objects`): its initializer is written
+    // and each of its reads is made, whatever runs below and at whatever
+    // level.  That is what the program says, not an optimization, so no
+    // switch turns it off; what `dse` (and `all`, and `-O0`) turns off is
+    // only the merge of what an initializer wrote twice.
+    let merge_initializers =
+        opt_level != 0 && !pass_disabled(&disabled, "all") && !pass_disabled(&disabled, "dse");
+    module.for_each_function(|func| dse::close_volatile_objects(func, merge_initializers));
     if pass_disabled(&disabled, "all") {
         return;
     }
@@ -4119,6 +4142,41 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += ipcp_changes + purity_changes;
         }
 
+        // Four limbs a trip (`limb_unroll`): a loop that hands a carry
+        // round its back edge is split by its trip count into a main loop
+        // of four bodies a trip and the loop as it was, so that the `adc`
+        // chain `carry_chain` forms behind this pipeline runs through four
+        // limbs before the carry leaves the flag. Once, at the end of the
+        // first round: the round has merged what the source and the
+        // inliner wrote twice (`_subborrow_u64` tests its carry in in two
+        // places), so the adder is the one the carry pass will see, and
+        // the rounds that follow fold the copies' addresses. Counted as a
+        // late change of the CFG, which is what it is, so that those rounds
+        // run. Only where the carry pass runs, which pays for the copies.
+        // Pass name for CCC_DISABLE_PASSES: "limb_unroll"
+        if iter == 0
+            && !optimize_for_size
+            && !dis.unroll
+            && matches!(target, crate::backend::Target::X86_64)
+            && !pass_disabled(&disabled, "carry")
+            && !pass_disabled(&disabled, "limb_unroll")
+        {
+            // Ahead of it, the borrows that a double-word difference is
+            // read for become the joins the matcher knows
+            // (`carry_chain::borrow_reads`): the loop is then one the split
+            // recognises, and its copies are ones the rounds that follow
+            // leave alone.
+            let n = timed_pass!(
+                "limb_unroll",
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    carry_chain::borrow_reads(func, !dis.dce) + limb_unroll::run(func)
+                })
+            );
+            cur_pass_changes[10] += n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         if iter == 0 {
             iter0_total_changes = total_changes_excl_dce;
         }
@@ -4169,6 +4227,35 @@ pub(crate) fn run_passes(
 
         // Prepare dirty set for next iteration: only re-visit functions that changed.
         std::mem::swap(&mut dirty, &mut changed);
+    }
+
+    // The branches a way in decides, behind the rounds: the threads of the
+    // late `jump_thread` position below (which stays for what the late passes
+    // expose and for the latch copies), taken where the late passes still
+    // follow, a level of nested conditions a round, and the set fold of the
+    // rounds once more on a function that took one. Threaded only at the end
+    // of the pipeline, `if (smaller(...)) j++` of zlib's sift loop kept
+    // 16.27 M of its 16.41 M instructions; here it keeps 14.03 M. See
+    // `jump_thread::thread_decided_and_fold`.
+    // CCC_DISABLE_PASSES=jump_thread disables both positions,
+    // jump_thread_early this one; range_fold and set_membership the folds.
+    if opt_level >= 2
+        && !optimize_for_size
+        && !pass_disabled(&disabled, "jump_thread")
+        && !pass_disabled(&disabled, "jump_thread_early")
+    {
+        if dump_each_pass {
+            dump_ir_filtered(module, "before jump_thread_early");
+        }
+        let fold_ranges = !pass_disabled(&disabled, "range_fold");
+        let fold_sets = !pass_disabled(&disabled, "set_membership");
+        module.for_each_function(|func| {
+            jump_thread::thread_decided_and_fold(func, fold_ranges, fold_sets)
+        });
+        verify::verify_after_pass(module, "jump_thread_early");
+        if dump_each_pass {
+            dump_ir_filtered(module, "after jump_thread_early");
+        }
     }
 
     // Loops the two late vectorizer entries below produced; both feed the
@@ -4978,6 +5065,29 @@ pub(crate) fn run_passes(
     // passes are function-local transforms with no reachability dependence,
     // so nothing between the old and new positions observes the move.
     dead_statics::eliminate_dead_static_functions(module);
+
+    // Full adders (`x + y + carry` and its carry out) as the two halves of
+    // `IntrinsicOp::Carry`, which the x86-64 backend emits as `adc`/`sbb`
+    // and `setc` (`carry_chain`). Here, behind the iterated pipeline, whose
+    // passes read the comparisons and the join the idiom is spelled with
+    // and do not know the intrinsic; and ahead of the latency-driven
+    // reassociation below, which rebuilds sums in order of availability
+    // and takes the idiom apart where the carries are joined by `+`: in a
+    // chain, `t = (c1 + c2) + s` became `t = (c1 + s) + c2`, and the adder
+    // behind the first one was not one any more (measured on the four
+    // limbs a trip `limb_unroll` makes of an `unsigned __int128` sum: one
+    // `adc` of four). Pass name for CCC_DISABLE_PASSES: "carry".
+    if matches!(target, crate::backend::Target::X86_64) && !pass_disabled(&disabled, "carry") {
+        let dce = !pass_disabled(&disabled, "dce");
+        if dump_each_pass {
+            dump_ir_filtered(module, "before carry");
+        }
+        module.for_each_function(|f| carry_chain::run(f, dce));
+        if dump_each_pass {
+            dump_ir_filtered(module, "after carry");
+        }
+        verify::verify_after_pass(module, "carry");
+    }
 
     // Phase 11g: Latency-driven reassociation of associative integer trees
     // inside loops (see reassoc_latency.rs): the operands of a single-use

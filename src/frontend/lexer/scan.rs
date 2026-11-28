@@ -2581,6 +2581,11 @@ impl Lexer {
             return Token::new(vis_tok, span);
         }
 
+        // ... and for the synthetic `#pragma GCC target` / `*_options` ones.
+        if let Some(options_tok) = Self::try_pragma_options_token(text) {
+            return Token::new(options_tok, span);
+        }
+
         if let Some(kw) = TokenKind::from_keyword(text, self.gnu_extensions, self.c23) {
             Token::new(kw, span)
         } else {
@@ -2639,6 +2644,19 @@ impl Lexer {
             }
         } else {
             None
+        }
+    }
+
+    /// Recognize the synthetic identifiers the preprocessor emits for
+    /// `#pragma GCC target`, `push_options`, `pop_options` and
+    /// `reset_options` (`preprocessor::pragmas::pragma_gcc_options_marker`).
+    fn try_pragma_options_token(text: &str) -> Option<TokenKind> {
+        match text.strip_prefix("__ccc_options_")? {
+            "target" => Some(TokenKind::PragmaOptionsTarget),
+            "push" => Some(TokenKind::PragmaOptionsPush),
+            "pop" => Some(TokenKind::PragmaOptionsPop),
+            "reset" => Some(TokenKind::PragmaOptionsReset),
+            _ => None,
         }
     }
 

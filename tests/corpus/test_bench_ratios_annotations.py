@@ -132,6 +132,33 @@ class BenchRatiosTest(unittest.TestCase):
         self.assertNotIn("\n", annotations[0])
         self.assertIn("%0A", annotations[0])
 
+    def test_the_table_names_the_host_it_was_measured_on(self) -> None:
+        # The same pair of binaries reads 1.13 on one hosted CPU model and
+        # 1.56 on another for one kernel: ratios without their host are not
+        # evidence about the compiler.
+        payload = report([entry("a", 1.0)])
+        payload["metadata"] = {"cpu_models": ["AMD EPYC 9V74 80-Core Processor"]}
+        result = run(["--report", self.write(payload), "--annotate"])
+        self.assertEqual(result.returncode, 0)
+        line = "host AMD EPYC 9V74 80-Core Processor (compare only with a run on the same CPU model)"
+        self.assertEqual(result.stdout.splitlines()[1], line)
+        annotation = [text for text in result.stdout.splitlines() if text.startswith("::warning")]
+        self.assertEqual(len(annotation), 1)
+        self.assertIn("host AMD EPYC 9V74 80-Core Processor", annotation[0])
+
+        hybrid = report([entry("a", 1.0)])
+        hybrid["metadata"] = {"cpu_models": ["P core", "E core"]}
+        self.assertIn("host P core; E core (compare", run(["--report", self.write(hybrid)]).stdout)
+
+        for metadata in ({}, {"cpu_models": []}, {"cpu_models": None}):
+            bare = report([entry("a", 1.0)])
+            bare["metadata"] = metadata
+            self.assertIn("host unknown (compare", run(["--report", self.write(bare)]).stdout)
+
+        empty = report([{"name": "broken", "ratios_to_gcc": {}, "warnings": []}])
+        empty["metadata"] = {"cpu_models": ["Some CPU"]}
+        self.assertIn("host Some CPU (compare", run(["--report", self.write(empty)]).stdout)
+
     def test_nothing_to_publish_when_no_ratio_survived(self) -> None:
         payload = report([{"name": "broken", "ratios_to_gcc": {}, "warnings": ["compile failure"]}])
         result = run(["--report", self.write(payload), "--annotate"])

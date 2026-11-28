@@ -708,11 +708,20 @@ fn collapse_superseded_cfa(
 /// reports.
 const FREE_SCRATCH: [RegId; 2] = [11, 10];
 
+/// One family [`rename_saved_values_into_free_scratch`] moved: its prologue
+/// save line, the family, the scratch family that took its value, and the
+/// lines that were rewritten.
+struct ScratchRename {
+    save: usize,
+    saved: RegId,
+    scratch: RegId,
+    lines: Vec<usize>,
+}
+
 /// What [`rename_saved_values_into_free_scratch`] rewrote, for the
-/// transactional revert: per renamed family, its prologue save line and the
-/// original text of every rewritten line.
+/// transactional revert.
 pub(super) struct ScratchRenames {
-    renames: Vec<(usize, Vec<(usize, String)>)>,
+    renames: Vec<ScratchRename>,
 }
 
 impl ScratchRenames {
@@ -720,19 +729,39 @@ impl ScratchRenames {
     /// elimination refuses): the rename pays only by deleting the save and
     /// its restores, so a surviving pair would just add REX prefixes.
     /// Returns how many renames were kept.
+    ///
+    /// A rename is undone by its inverse, on the text the line has now: the
+    /// scratch family was named nowhere in the function before the rename
+    /// and is the scratch of this rename alone, so every mention of it is
+    /// this rename's. Putting back the text the line had before would be
+    /// wrong as soon as two families share a line. `leaq 592(%rbx), %r12`
+    /// was remembered as that by the rename of `%rbx` and as
+    /// `leaq 592(%r11), %r12` by the rename of `%r12` behind it; with both
+    /// undone in this order the line ended as the second text, which reads
+    /// a register the function never writes.
     pub(super) fn revert_unprofitable(
         self,
         store: &mut LineStore,
         infos: &mut [LineInfo],
     ) -> usize {
         let mut kept = 0;
-        for (save, lines) in self.renames {
-            if infos[save].is_nop() {
+        for rename in self.renames {
+            if infos[rename.save].is_nop() {
                 kept += 1;
                 continue;
             }
-            for (k, old) in lines {
-                replace_line(store, &mut infos[k], k, old);
+            for k in rename.lines {
+                if infos[k].is_nop() {
+                    continue;
+                }
+                let text = store.get(k);
+                let body = text.trim_ascii_start();
+                let indent = &text[..text.len() - body.len()];
+                let restored = format!(
+                    "{indent}{}",
+                    replace_reg_family(body, rename.scratch, rename.saved)
+                );
+                replace_line(store, &mut infos[k], k, restored);
             }
         }
         kept
@@ -891,16 +920,21 @@ fn rename_in_function(
         if lv.live_after(save, fam) != Some(false) {
             continue;
         }
-        let mut undo: Vec<(usize, String)> = Vec::with_capacity(body.len());
         for &k in &body {
             let old = store.get(k).to_string();
+            let trimmed = old.trim_ascii_start();
+            let indent = &old[..old.len() - trimmed.len()];
             let renamed = replace_reg_family(infos[k].trimmed(&old), fam, scratch);
-            replace_line(store, &mut infos[k], k, format!("    {renamed}"));
-            undo.push((k, old));
+            replace_line(store, &mut infos[k], k, format!("{indent}{renamed}"));
         }
         lv.refresh_at(store, infos, save);
         named |= 1u16 << scratch;
-        out.renames.push((save, undo));
+        out.renames.push(ScratchRename {
+            save,
+            saved: fam,
+            scratch,
+            lines: body,
+        });
     }
 }
 
@@ -1072,6 +1106,75 @@ mod scratch_rename_tests {
         let (kept, out) = phase6(asm);
         assert_eq!(kept, 0, "{out}");
         assert_eq!(out, asm);
+    }
+
+    /// Two saved families on one line, and both saves survive: the line is
+    /// what it was. It used to end as `leaq 592(%r11), %r12`, the text
+    /// between the two renames, in a function that never writes `%r11`
+    /// (a generated program of `check_x86_zmm_homes.py` stored through it).
+    #[test]
+    fn two_renames_that_share_a_line_are_both_reverted() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    pushq %rbx\n",
+            "    pushq %r12\n",
+            "    leaq fout(%rip), %rbx\n",
+            "    leaq 592(%rbx), %r12\n",
+            "    movq %r12, -32(%rbp)\n",
+            "    movl %r12d, (%rbx)\n",
+            "    movq -32(%rbp), %rax\n",
+            "    popq %r12\n",
+            "    popq %rbx\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let (mut store, mut infos) = lines(asm);
+        let renames = rename_saved_values_into_free_scratch(&mut store, &mut infos);
+        assert_eq!(renames.renames.len(), 2, "both families are renamed");
+        let between = store.build_result(|i| infos[i].is_nop());
+        assert!(between.contains("leaq 592(%r11), %r10"), "{between}");
+        let (kept, out) = phase6(asm);
+        assert_eq!(kept, 0, "{out}");
+        assert_eq!(out, asm);
+    }
+
+    /// One of two renames that share a line is kept and the other undone,
+    /// either way round: the line has the kept register and the old one.
+    #[test]
+    fn one_of_two_renames_that_share_a_line_is_reverted() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %r12\n",
+            "    leaq fout(%rip), %rbx\n",
+            "    leaq 592(%rbx), %r12\n",
+            "    movl %r12d, (%rbx)\n",
+            "    popq %r12\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        for (gone, line, first) in [
+            (0, "leaq 592(%r11), %r12", "leaq fout(%rip), %r11"),
+            (1, "leaq 592(%rbx), %r10", "leaq fout(%rip), %rbx"),
+        ] {
+            let (mut store, mut infos) = lines(asm);
+            let renames = rename_saved_values_into_free_scratch(&mut store, &mut infos);
+            assert_eq!(renames.renames.len(), 2);
+            // The elimination deletes the save of one family only.
+            let save = renames.renames[gone].save;
+            mark_nop(&mut infos[save]);
+            assert_eq!(renames.revert_unprofitable(&mut store, &mut infos), 1);
+            let out = store.build_result(|i| infos[i].is_nop());
+            assert!(out.contains(line) && out.contains(first), "{out}");
+        }
     }
 
     /// One shape per legality rule; none may be renamed.

@@ -502,10 +502,11 @@ impl ParsedDeclAttrs {
     /// and its siblings. If the two flags ever disagree, that reader misses
     /// a `volatile`; no access is affected.
     ///
-    /// What this does not give is the atomicity of the operators: `x += 1`
-    /// on an atomic `x` is one read and one write, not a `lock`ed update,
-    /// and converting `_Atomic int *` to `int *` is accepted where GCC 16
-    /// and Clang 23 reject it. Both need a type that says atomic.
+    /// The flag is also what the type itself is told: the qualifier records
+    /// carry `_Atomic` as a bit of its own (`PtrQuals::ATOMIC`, from
+    /// `written_cvr`), which is what makes `x += 1` on an atomic `x` a
+    /// `lock`ed update and `_Atomic int *` to `int *` the error GCC 16 and
+    /// Clang 23 give (see `ir::lowering::atomic_access`).
     #[inline]
     pub fn set_atomic(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::ATOMIC, v)
@@ -695,6 +696,12 @@ impl ParsedDeclAttrs {
         // What says where the qualifier came from goes when it goes; who
         // sets it again says so again (`set_typedef_object_atomic`).
         self.set_flag(parsed_attr_flag::TYPEDEF_OBJECT_ATOMIC, false);
+    }
+    /// A `volatile` written behind the typedef name: the object is volatile
+    /// whatever the typedef says, and what it says of `_Atomic` stands.
+    #[inline]
+    pub fn mark_typedef_object_volatile(&mut self) {
+        self.set_flag(parsed_attr_flag::TYPEDEF_OBJECT_VOLATILE, true);
     }
     /// Call after [`Self::set_typedef_object_volatile`]; holds only while
     /// that flag does.
@@ -923,6 +930,15 @@ pub struct Parser {
     /// Stack for #pragma GCC visibility push/pop.
     /// Each entry is the visibility string (e.g., "hidden", "default").
     pub(super) pragma_visibility_stack: Vec<String>,
+    /// The strings of the `#pragma GCC target`s in force, in the order
+    /// written: every function declared from here on is compiled as if its
+    /// `target` attribute began with them.
+    pub(super) pragma_targets: Vec<String>,
+    /// What `#pragma GCC push_options` saved of [`Self::pragma_targets`].
+    pub(super) pragma_options_stack: Vec<Vec<String>>,
+    /// Every `#pragma GCC target` read so far, for
+    /// `TranslationUnit::pragma_target_sites`.
+    pub(super) pragma_target_sites: Vec<(String, Span)>,
     /// Current default visibility from #pragma GCC visibility push(...).
     /// None means default visibility (no pragma active).
     pub(super) pragma_default_visibility: Option<String>,
@@ -1032,6 +1048,11 @@ pub struct Parser {
     /// carries `unused`, or names such a record or typedef directly. Scoped
     /// with the other typedef state.
     pub(super) typedef_unused: FxHashSet<String>,
+    /// Typedef names of function types (`typedef int fn(void);`, and a
+    /// typedef of such a name without a derivation in between). A plain
+    /// declarator of one declares a function (`fn f;`), which is what the
+    /// function-only attributes ask about. Scoped like `typedef_unused`.
+    pub(super) typedef_function: FxHashSet<String>,
     /// Undo records for block/for-scope typedef declarations. Names and their
     /// parser-side qualifiers are restored in reverse declaration order.
     pub(super) typedef_scope_log: Vec<TypedefScopeUndo>,
@@ -1051,6 +1072,7 @@ pub(super) struct TypedefScopeUndo {
     base_atomic: bool,
     object_atomic: bool,
     unused: bool,
+    function: bool,
 }
 
 impl Parser {
@@ -1148,6 +1170,7 @@ impl Parser {
             base_atomic: self.typedef_base_atomic.remove(name),
             object_atomic: self.typedef_object_atomic.remove(name),
             unused: self.typedef_unused.remove(name),
+            function: self.typedef_function.remove(name),
         };
         self.typedef_scope_log.push(undo);
     }
@@ -1169,6 +1192,10 @@ impl Parser {
             self.typedef_unused.remove(&undo.name);
             if undo.unused {
                 self.typedef_unused.insert(undo.name.clone());
+            }
+            self.typedef_function.remove(&undo.name);
+            if undo.function {
+                self.typedef_function.insert(undo.name.clone());
             }
             if undo.was_typedef {
                 self.typedefs.insert(undo.name.clone());
@@ -1220,6 +1247,9 @@ impl Parser {
             pack_struct_cap: None,
             pack_struct_all: false,
             pragma_visibility_stack: Vec::with_capacity(4),
+            pragma_targets: Vec::new(),
+            pragma_options_stack: Vec::new(),
+            pragma_target_sites: Vec::new(),
             pragma_default_visibility: None,
             func_decl_no_instrument: FxHashSet::default(),
             func_decl_stack_protect: FxHashSet::default(),
@@ -1243,6 +1273,7 @@ impl Parser {
             unused_record_tags: FxHashSet::default(),
             record_has_enum_cache: FxHashMap::default(),
             typedef_unused: FxHashSet::default(),
+            typedef_function: FxHashSet::default(),
         }
     }
 
@@ -1640,7 +1671,11 @@ impl Parser {
             })
         {
             self.emit_error("named address spaces require an x86 target", span);
-            return TranslationUnit { decls: Vec::new() };
+            return TranslationUnit {
+                decls: Vec::new(),
+                pragma_target_sites: Vec::new(),
+                uses_atomic: false,
+            };
         }
         let mut decls = Vec::with_capacity(16);
         while !self.at_eof() {
@@ -1666,7 +1701,15 @@ impl Parser {
                 self.advance();
             }
         }
-        TranslationUnit { decls }
+        let uses_atomic = self
+            .tokens
+            .iter()
+            .any(|tok| matches!(tok.kind, TokenKind::Atomic));
+        TranslationUnit {
+            decls,
+            pragma_target_sites: std::mem::take(&mut self.pragma_target_sites),
+            uses_atomic,
+        }
     }
 
     // === Token access helpers ===
@@ -1752,9 +1795,7 @@ impl Parser {
         // semicolon (Clang PR28094). Its synthetic marker carries its own
         // semicolon; consume that one before looking for the source delimiter.
         if matches!(expected, TokenKind::Semicolon) {
-            while self.handle_pragma_pack_token() {
-                self.consume_if(&TokenKind::Semicolon);
-            }
+            self.take_pragma_markers();
         }
         if std::mem::discriminant(self.peek()) == std::mem::discriminant(expected) {
             let span = self.peek_span();
@@ -1992,7 +2033,8 @@ impl Parser {
                 TokenKind::Const => CVR_CONST,
                 TokenKind::Volatile => CVR_VOLATILE,
                 TokenKind::Restrict => CVR_RESTRICT,
-                TokenKind::Static | TokenKind::Atomic => 0,
+                TokenKind::Atomic => CVR_ATOMIC,
+                TokenKind::Static => 0,
                 _ => return cvr,
             };
             self.advance();
@@ -2659,15 +2701,24 @@ impl Parser {
                         ),
                         span,
                     );
-                    self.diagnostics.note(
+                    let note = if spelling == "interrupt" {
+                        // No other object is involved: the other party is
+                        // the CPU, and no build option makes an ordinary
+                        // function a handler.
+                        "the CPU enters the handler with an interrupt frame on the stack and \
+                         expects every register preserved and a return through `iret`; \
+                         compiled as an ordinary function it would fault the first time \
+                         the interrupt fires"
+                            .to_string()
+                    } else {
                         format!(
                             "emitting {target}'s default convention under a foreign-ABI \
                              declaration would link and then disagree about the arguments; \
                              define CCC_ALLOW_UNSUPPORTED_ABI only if every object in the \
                              program is built by this compiler"
-                        ),
-                        span,
-                    );
+                        )
+                    };
+                    self.diagnostics.note(note, span);
                 }
             }
         }
@@ -2894,7 +2945,14 @@ impl Parser {
             }
             let ok = match target {
                 AttributeTarget::Any => true,
-                AttributeTarget::Function => is_function,
+                // `typedef int fn(void); __attribute__((target("avx2"))) fn f;`
+                // declares a function too.
+                AttributeTarget::Function => {
+                    is_function
+                        || (derived.is_empty()
+                            && matches!(type_spec, TypeSpecifier::TypedefName(name)
+                                if self.typedef_function.contains(name)))
+                }
                 AttributeTarget::Object => !is_function,
                 AttributeTarget::Record => is_record || is_typedef,
             };
@@ -3126,7 +3184,9 @@ impl Parser {
             // ISA-subset rule and the x86-64 emitter's per-function ISA.
             "target" | "__target__" => {
                 self.advance();
-                self.attrs.parsing_target = self.parse_target_attr_arg();
+                // As written: GCC reads a blank as part of the name, and
+                // `target(" avx2")` is its "argument ' avx2' is unknown".
+                self.attrs.parsing_target = self.parse_string_list_attr_arg(false);
             }
             "target_clones" | "__target_clones__" => {
                 self.advance();
@@ -3402,6 +3462,12 @@ impl Parser {
     /// `target("bmi", "bmi2")` and `target("bmi,bmi2")` are identical.
     /// Malformed contents are skipped to the matching paren.
     fn parse_target_attr_arg(&mut self) -> Option<String> {
+        self.parse_string_list_attr_arg(true)
+    }
+
+    /// [`Self::parse_target_attr_arg`]; `trim` strips the blanks around each
+    /// argument. An empty argument is dropped either way.
+    fn parse_string_list_attr_arg(&mut self, trim: bool) -> Option<String> {
         if !matches!(self.peek(), TokenKind::LParen) {
             return None;
         }
@@ -3442,7 +3508,7 @@ impl Parser {
         parts.push(cur);
         let joined = parts
             .iter()
-            .map(|p| p.trim())
+            .map(|p| if trim { p.trim() } else { p.as_str() })
             .filter(|p| !p.is_empty())
             .collect::<Vec<_>>()
             .join(",");
@@ -3978,6 +4044,83 @@ impl Parser {
             }
             _ => false,
         }
+    }
+
+    /// Handle the synthetic tokens of `#pragma GCC target`, `push_options`,
+    /// `pop_options` and `reset_options`. Returns true if one was consumed.
+    ///
+    /// A `target` pragma adds its string to the ones in force (GCC chains
+    /// each onto the previous, so two in a row accumulate); `push_options`
+    /// saves them, `pop_options` restores what the matching push saved (a
+    /// pop without one changes nothing, where GCC warns), and
+    /// `reset_options` returns to the command line.
+    ///
+    /// Inside a function body GCC refuses the `target` pragma with these
+    /// words ("option" is what its message calls the pragma) and performs
+    /// the three stack pragmas like anywhere else.
+    pub(super) fn handle_pragma_options_token(&mut self) -> bool {
+        match self.peek() {
+            TokenKind::PragmaOptionsTarget => {
+                let span = self.peek_span();
+                self.advance();
+                let options = match self.peek() {
+                    TokenKind::StringLiteral(options) => Some(options.clone()),
+                    _ => None,
+                };
+                if options.is_some() {
+                    self.advance();
+                }
+                if self.block_depth > 0 {
+                    self.emit_error("'#pragma GCC option' is not allowed inside functions", span);
+                } else if let Some(options) = options.filter(|o| !o.is_empty()) {
+                    self.pragma_target_sites.push((options.clone(), span));
+                    self.pragma_targets.push(options);
+                }
+                true
+            }
+            TokenKind::PragmaOptionsPush => {
+                self.advance();
+                self.pragma_options_stack.push(self.pragma_targets.clone());
+                true
+            }
+            TokenKind::PragmaOptionsPop => {
+                self.advance();
+                if let Some(saved) = self.pragma_options_stack.pop() {
+                    self.pragma_targets = saved;
+                }
+                true
+            }
+            TokenKind::PragmaOptionsReset => {
+                self.advance();
+                self.pragma_targets.clear();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Take the pragma markers at the cursor: every kind, in the order the
+    /// pragmas were written. Each marker brings its own `;`.
+    ///
+    /// One loop for all kinds, and it is the only way callers take markers.
+    /// Three loops in a row, one a kind, took `pack` pragmas, then
+    /// `visibility` pragmas, then stopped: `#pragma GCC visibility
+    /// push(hidden)` followed by `#pragma pack(push, 1)` left the second
+    /// marker to the declaration parser, which refused the unit ("expected
+    /// declaration before '#pragma pack'").
+    pub(super) fn take_pragma_markers(&mut self) {
+        while self.handle_pragma_pack_token()
+            || self.handle_pragma_visibility_token()
+            || self.handle_pragma_options_token()
+        {
+            self.consume_if(&TokenKind::Semicolon);
+        }
+    }
+
+    /// The `#pragma GCC target` strings in force, one pragma a line, as a
+    /// declaration records them (`DeclAttributes::pragma_target`).
+    pub(super) fn active_pragma_target(&self) -> Option<String> {
+        (!self.pragma_targets.is_empty()).then(|| self.pragma_targets.join("\n"))
     }
 
     /// Handle #pragma GCC visibility push/pop synthetic tokens.

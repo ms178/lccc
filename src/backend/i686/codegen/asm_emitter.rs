@@ -129,6 +129,20 @@ impl InlineAsmEmitter for I686Codegen {
             && self.state.get_slot(ptr.0).is_some()
     }
 
+    /// A statement that takes `%ebx` in a function that keeps the GOT
+    /// pointer there: the pointer is reloaded from its frame home behind
+    /// the statement (`allocate_got_home`).
+    fn begin_inline_asm(
+        &mut self,
+        outputs: &[(String, Value, Option<String>)],
+        inputs: &[(String, Operand, Option<String>)],
+        clobbers: &[String],
+    ) -> Option<String> {
+        self.asm_takes_ebx = self.asm_statement_takes_ebx(outputs, inputs, clobbers);
+        let home = self.got_home_slot.filter(|_| self.asm_takes_ebx)?;
+        Some(format!("movl {}, %ebx", self.slot_ref(home)))
+    }
+
     fn setup_operand_metadata(&self, op: &mut AsmOperand, val: &Operand, _is_output: bool) {
         if op
             .constraint
@@ -175,10 +189,6 @@ impl InlineAsmEmitter for I686Codegen {
         if !op.mem_addr.is_empty() {
             return None;
         }
-        if let Some(ref sym) = op.imm_symbol {
-            op.mem_addr = sym.clone();
-            return None;
-        }
         let alloc_gp_tmp = |this: &mut Self| -> String {
             let mut r = this.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
             if r.is_empty() {
@@ -189,6 +199,77 @@ impl InlineAsmEmitter for I686Codegen {
             }
             r
         };
+        let symbol = op.imm_symbol.clone().filter(|sym| {
+            // A thread-local object is no address the linker knows: `incl
+            // tls_var` incremented the initialisation image every later
+            // thread is copied from. The operand is the object itself where
+            // the offset is known when the program starts, as GCC writes
+            // it; the dynamic models call for the address, and the pointer
+            // the operand carries is that address (the path below).
+            use crate::common::tls::TlsModel;
+            let (name, _) = crate::backend::inline_asm::split_symbol_addend(sym);
+            !(self.state.tls_symbols.contains(name)
+                && matches!(
+                    self.state.tls_model(name),
+                    TlsModel::GlobalDynamic | TlsModel::LocalDynamic
+                ))
+        });
+        if let Some(sym) = symbol {
+            let (name, addend) = crate::backend::inline_asm::split_symbol_addend(&sym);
+            if self.state.tls_symbols.contains(name) {
+                if self.state.tls_model(name) == crate::common::tls::TlsModel::LocalExec {
+                    op.mem_addr = format!("%gs:{}@NTPOFF{}", name, addend);
+                    return None;
+                }
+                // Initial-exec: the offset is read from the GOT.
+                let tmp = alloc_gp_tmp(self);
+                if self.state.pic_mode {
+                    emit!(self.state, "    movl {}@GOTNTPOFF(%ebx), %{}", name, tmp);
+                } else {
+                    emit!(self.state, "    movl {}@INDNTPOFF, %{}", name, tmp);
+                }
+                op.mem_addr = format!("%gs:{}(%{})", addend.trim_start_matches('+'), tmp);
+                return Some(tmp);
+            }
+            if !self.state.pic_mode {
+                // The address is a link-time constant.
+                op.mem_addr = sym;
+                return None;
+            }
+            debug_assert!(
+                self.pic_got_live,
+                "a PIC function with an assembler statement keeps the GOT pointer"
+            );
+            // Position-independent code has no absolute address to print.
+            // `movl counter, %eax` put an `R_386_32` into the text of a
+            // shared object (a text relocation: "creating DT_TEXTREL"), where
+            // GCC addresses the symbol through the GOT pointer.
+            if self.state.needs_got(name) {
+                // Preemptible: the address is in the GOT, and the operand is
+                // what it points at.
+                let tmp = alloc_gp_tmp(self);
+                emit!(self.state, "    movl {}@GOT(%ebx), %{}", name, tmp);
+                op.mem_addr = format!("{}(%{})", addend.trim_start_matches('+'), tmp);
+                return Some(tmp);
+            }
+            if self.asm_takes_ebx {
+                // Local, but the statement takes the GOT pointer's register
+                // before the template runs: the address goes to a register
+                // of its own while the pointer is still there.
+                let tmp = alloc_gp_tmp(self);
+                emit!(
+                    self.state,
+                    "    leal {}@GOTOFF{}(%ebx), %{}",
+                    name,
+                    addend,
+                    tmp
+                );
+                op.mem_addr = format!("(%{})", tmp);
+                return Some(tmp);
+            }
+            op.mem_addr = format!("{}@GOTOFF{}(%ebx)", name, addend);
+            return None;
+        }
         match val {
             Operand::Value(v) => {
                 if let Some(slot) = self.state.get_slot(v.0) {
@@ -899,9 +980,11 @@ impl InlineAsmEmitter for I686Codegen {
                 // wrote 16 bytes over its neighbours.
                 let mut gp = op.clone();
                 gp.kind = AsmOperandKind::GpReg;
+                // Not the GOT pointer's register: with every other one an
+                // output, `%ecx` is taken and preserved around the bridge.
                 gp.reg = ["ecx", "edx", "esi", "edi", "eax", "ebx"]
                     .into_iter()
-                    .find(|r| !all_output_regs.contains(r))
+                    .find(|r| !all_output_regs.contains(r) && !(self.pic_got_live && *r == "ebx"))
                     .unwrap_or("ecx")
                     .to_string();
                 let preserve = all_output_regs.contains(&gp.reg.as_str());
@@ -1033,6 +1116,34 @@ impl InlineAsmEmitter for I686Codegen {
     }
 }
 
+impl I686Codegen {
+    /// Does the statement write `%ebx`: an operand the emitter puts there
+    /// (`"b"`, a register variable), or a clobber of it in any spelling?
+    ///
+    /// The classifier that assigns the registers answers, so that this and
+    /// the assignment cannot disagree. Scratch registers are no part of the
+    /// question: the allocator does not hand out `%ebx` in a function that
+    /// keeps the GOT pointer there.
+    pub(super) fn asm_statement_takes_ebx(
+        &self,
+        outputs: &[(String, Value, Option<String>)],
+        inputs: &[(String, Operand, Option<String>)],
+        clobbers: &[String],
+    ) -> bool {
+        let is_ebx =
+            |name: &str| crate::backend::inline_asm::x86_gpr32_of_name(name) == Some("ebx");
+        clobbers.iter().any(|clobber| is_ebx(clobber))
+            || outputs
+                .iter()
+                .map(|(constraint, ..)| constraint)
+                .chain(inputs.iter().map(|(constraint, ..)| constraint))
+                .any(|constraint| {
+                    matches!(self.classify_constraint(constraint),
+                        AsmOperandKind::Specific(register) if is_ebx(&register))
+                })
+    }
+}
+
 // Helper methods for i686 inline asm register formatting.
 // Register conversion and condition code mapping delegate to the shared
 // `x86_common` module to avoid duplication with the x86-64 backend.
@@ -1135,6 +1246,86 @@ impl I686Codegen {
             IrType::I16 | IrType::U16 => Self::reg_to_16(reg),
             _ => Self::reg_to_32(reg),
         }
+    }
+}
+
+#[cfg(test)]
+mod got_pointer_tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+
+    fn statement(
+        cg: &mut I686Codegen,
+        outputs: &[&str],
+        inputs: &[&str],
+        clobbers: &[&str],
+    ) -> (bool, Option<String>) {
+        let outputs: Vec<_> = outputs
+            .iter()
+            .map(|c| (c.to_string(), Value(0), None))
+            .collect();
+        let inputs: Vec<_> = inputs
+            .iter()
+            .map(|c| (c.to_string(), Operand::Const(IrConst::I64(0)), None))
+            .collect();
+        let clobbers: Vec<String> = clobbers.iter().map(|c| c.to_string()).collect();
+        let takes = cg.asm_statement_takes_ebx(&outputs, &inputs, &clobbers);
+        let repair = cg.begin_inline_asm(&outputs, &inputs, &clobbers);
+        assert_eq!(
+            cg.asm_takes_ebx, takes,
+            "the statement's flag is its answer"
+        );
+        (takes, repair)
+    }
+
+    /// Which statements take `%ebx`: an operand the classifier puts there,
+    /// or a clobber of it in any spelling.
+    #[test]
+    fn statements_that_take_ebx() {
+        let mut cg = I686Codegen::new();
+        for (outputs, inputs, clobbers, takes) in [
+            (&[][..], &["b"][..], &[][..], true),
+            (&["=b"], &[], &[], true),
+            (&["+b"], &[], &[], true),
+            (&["=&b"], &["r"], &[], true),
+            (&["=a", "=b", "=c", "=d"], &["a", "c"], &[], true),
+            (&["={ebx}"], &[], &[], true),
+            (&[], &["{bl}"], &[], true),
+            (&[], &[], &["ebx"], true),
+            (&[], &[], &["%ebx"], true),
+            (&[], &[], &["bx"], true),
+            (&[], &[], &["bl"], true),
+            (&[], &[], &["bh"], true),
+            (&[], &[], &["rbx"], true),
+            (&["=r"], &["r", "m"], &["cc", "memory"], false),
+            (&["=a", "=c", "=d"], &["S", "D"], &["esi"], false),
+            (&["=A"], &["0"], &[], false),
+            (&[], &[], &[], false),
+        ] {
+            let (got, _) = statement(&mut cg, outputs, inputs, clobbers);
+            assert_eq!(got, takes, "{outputs:?} {inputs:?} {clobbers:?}");
+        }
+    }
+
+    /// The reload exists exactly where the function has a home for the GOT
+    /// pointer and the statement took the register.
+    #[test]
+    fn the_reload_needs_a_home_and_a_statement_that_took_the_register() {
+        let mut cg = I686Codegen::new();
+        cg.omit_frame_pointer = false;
+        // No home: the function does not keep the GOT pointer in %ebx.
+        assert_eq!(statement(&mut cg, &[], &["b"], &[]), (true, None));
+        cg.got_home_slot = Some(StackSlot(-12));
+        assert_eq!(
+            statement(&mut cg, &[], &["b"], &[]),
+            (true, Some("movl -12(%ebp), %ebx".to_string()))
+        );
+        assert_eq!(
+            statement(&mut cg, &[], &[], &["bl"]),
+            (true, Some("movl -12(%ebp), %ebx".to_string()))
+        );
+        // A statement that leaves the register alone needs nothing.
+        assert_eq!(statement(&mut cg, &["=r"], &["r"], &["cc"]), (false, None));
     }
 }
 

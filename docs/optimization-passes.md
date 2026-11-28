@@ -39,12 +39,60 @@ passes; the backend peepholes are documented per backend
   private arms; measured rejections are listed in
   `engineering/subsystems/optimizer.md`. Disable: `CCC_DISABLE_PASSES=jump_thread`
   (not the x86 peephole of the same name, `CCC_PEEPHOLE_SKIP=jump_thread`).
+- **Decided branches behind the rounds**
+  (`jump_thread::thread_decided_and_fold`, same levels) -- the threads of
+  the pass above without its latch copies, taken once more between the
+  optimizer's rounds and the late passes, for the branch on a merge that one
+  way in brings a constant to: `if (smaller(...)) j++;` with `smaller` an
+  inlined `a < b || (a == b && c <= d)`. Four parts. If-conversion leaves
+  such a branch (`if_convert::branch_is_decided_on_entry`: a phi of the
+  block with a constant arm, read directly or through casts and compares
+  against constants; a select would write the constant, test it and compute
+  both arms on the way in that knew). One kind of such a branch is converted
+  all the same (`if_convert::resolves_on_every_entry`): the ways in that
+  decide it decide it the same, and on every other way -- there is one --
+  both arms give every phi the same constant, so the value is one arm's on
+  every way in and nothing is left to choose. `if (!arg) { ...; ok = names
+  != 0; p = 0; } else { ok = 1; p = saved; } return ok && p != 0;` is
+  `p != 0`, and the load of `names` is dead
+  (`tests/regression/check_llvm_guarded_folds.py`, `gf_phi`: 13 instructions
+  against 21); threaded, the way that tests kept the load and a branch
+  between two ways to the same answer. A branch every way in decides, and
+  ways in that decide it differently, stay the threader's. The threader
+  sends a deciding way in to its
+  arm; a function that took a thread is cleaned up and asked again, up to
+  four rounds, a level of nested conditions a round. The constant is read
+  through what the helper's return type puts between the merge and its
+  branch (`jump_thread::constant_on_entry` folds the block for the one way
+  in: nothing for `int`, `!= 0` for `_Bool`, a narrowing cast for `unsigned
+  char`, and 256 as a byte is 0), and `simplify` reads the comparison
+  through the same links (`truth_base`: a branch on an integer conversion of
+  a truth value is a branch on the truth value). `range_fold` and
+  `set_membership` then run once more on that function, because the hits of
+  `while (i < n && separator(s[i])) i++` are at the loop's step only now and
+  the set fold takes a chain of tests of a `char` only where its hits meet
+  without a value: 32 instructions and nine branches a character before, 15
+  and four with one bit test after (GCC 16.2: 14), whatever the helpers
+  return. Measured (Cachegrind, instructions): `zlib_ng_huffman_heap`
+  16,406,812 -> 14,027,589, `expat_xml_scan` 1,529,625 -> 1,428,038 (GCC
+  16.2: 1,460,771). Gate: `tests/regression/check_boolean_merge_threads.py`.
+  Disable: `CCC_DISABLE_PASSES=jump_thread_early` (this position),
+  `jump_thread` (both).
 - **Join store forwarding** (`join_store_forward.rs`) -- a reload after a
   join whose predecessors all store to the same pointer becomes a phi of the
   stored values (list_sort's `tail->next`). `join_store_forward`.
 - **Phi relay folding** (`phi_relay_fold.rs`, `>= -O2`, right before phi
   elimination) -- phi-only latch relays fold into the header so each edge
   gets one parallel copy. `phi_relay_fold`.
+- **512-bit objects in registers** (`backend/x86_zmm_homes.rs`, x86-64,
+  `>= -O1`, behind the last pass that can add a call or a use of an
+  object) -- a 64-byte vector object that is only read and written whole
+  lives in one of `zmm16`..`zmm31`; the names of one value share a
+  register, so the copies of inlined intrinsics are no instructions. A loop
+  of six 512-bit operations: 2.57 s -> 0.060 s (GCC 16.2: 0.061 s, Clang
+  23.1.5: 0.060 s; medians of seven runs). See
+  `docs/x86-isa-permissions-and-simd-abi.md` §2.2. Gate:
+  `tests/regression/check_x86_zmm_homes.py`. `zmmhome`.
 - **Phi webs** (`ir/mem2reg/phi_webs.rs`) -- acyclic phi webs inside one
   innermost loop share one name (class cap 32, pass-through pairs first);
   cross-loop unions are refused because they spill. `CCC_NO_PHI_WEB_COALESCE`.
@@ -97,7 +145,21 @@ passes; the backend peepholes are documented per backend
   contract for what it is — see `check_loop_store_motion.sh`'s `UNROLLED` arm
   and `check_seg_gs_runtime.sh`'s `CCC_DISABLE_PASSES=ipcp` shape build).
 - **DSE** (`dse.rs`) — same-block dead-store elimination with closed-alloca
-  escape analysis and byte-range kills (`CCC_NO_DSE`).
+  escape analysis and byte-range kills (`CCC_NO_DSE`). In a C volatile
+  object a volatile store is an event like a read: it hides nothing and ends
+  what the stores behind it can hide, so the initializer of `volatile struct
+  s v = {1, 2}; v.a = 3;` is written (GCC 16.2 and Clang 23.1 write it).
+- **Volatile objects** (`dse::close_volatile_objects`; no switch: it is what
+  the program says, at every level and with every pass disabled) — before
+  any pass, and once more behind the passes ahead of the backend, every load
+  and store whose address is in a C volatile object becomes a volatile
+  instruction, whatever the lowering wrote it as: the stores of an
+  initializer, the parts of a `_Complex`, a store a pass re-pointed from a
+  temporary. Where optimizing, what an initializer wrote twice (the zero
+  fill under the member stores) is first written once. From there on no
+  pass has to ask what an address is an address of, and the backends emit
+  each access in place and whole. Gate:
+  `tests/regression/check_volatile_access_semantics.sh`, items 7 and 8.
 - **Backedge PRE** — integer recurrences default-on (1.14x measured);
   FP variants gated (`CCC_BEPRE_FP=1` research).
 - **GlobalAddr CSE** (`global_addr_cse.rs`) — oracle-derived placement:
@@ -385,7 +447,7 @@ passes; the backend peepholes are documented per backend
   the per-iteration skip count on its `phase1 iteration` lines.
 
   The same step's trigger-presence rule gates the audited FP/vector pass
-  family (28 pass names, 44 call sites across all phases) on one entry
+  family (28 pass names, 48 call sites across all phases) on one entry
   probe: a function whose text never names `%xmm`/`%ymm`/`%zmm` or
   `vzeroupper` cannot be mutated by passes whose rewrites are anchored on a
   parsed vector operand, so they are not invoked at all. The probe is
@@ -394,6 +456,48 @@ passes; the backend peepholes are documented per backend
   spent scanning the all-integer 40-function TU. `CCC_PEEPHOLE_NO_VEC_GATE=1`
   disables the gate for bisection; the equality oracle covers both
   directions in `dirty_ticks_tests.rs`.
+
+- **Vector copies behind store forwarding** (x86-64) — the four vector
+  copy passes (`retarget_vex_result`, `coalesce_vector_brackets`,
+  `propagate_vector_copies`, `eliminate_dead_vector_copies`) run in phase 1
+  and again in phase 3's loop. A vector operation whose operand goes through
+  a pointer (`pmovmskb`, `movd`, `movmskps` behind a compare or an add) has
+  the operand stored and loaded; phase 2 forwards the pair into a register
+  copy, which no phase-1 pass can have seen. The rerun sits under the same
+  vector trigger and the same `CCC_PEEPHOLE_SKIP` names as the first turn.
+  The producer retarget of the same phase (`retarget_producer_into_copy`)
+  also takes a value out of a vector or mask register straight into the
+  register that wants it. Measured and gated in
+  [x86-isa-permissions-and-simd-abi.md](x86-isa-permissions-and-simd-abi.md)
+  §2.3.
+
+- **Store forwarding of 32-byte slots** (x86-64, `global_store_forwarding`)
+  — a store from `%ymm0`..`%ymm15` maps its slot to the register, and a
+  32-byte reload of the slot is the 256-bit register move of the load's own
+  spelling (`vmovdqu %ymm4, 8(%rsp); vmovaps 8(%rsp), %ymm0` becomes
+  `vmovaps %ymm4, %ymm0`): both copy 256 bits and zero bits 256 and up.
+  Reloaded into the register that wrote the slot, only that zeroing is left;
+  the reload goes when the `zmm` upper half is dead
+  (`FpLiveness::zmm_high_dead_after`) and stays, with its mapping, otherwise.
+  A reload of sixteen bytes or fewer at the slot's offset reads the low half
+  of the register. The mapping ends at any write of the register (at any
+  width, legacy or VEX, masked or not), any write into the slot's 32 bytes,
+  `vzeroupper`, a call, and a stack adjustment. `movupd`/`vmovupd` are slot
+  moves like the other five packed spellings (they were the one that was
+  not, so a `__m128d`/`__m256d` home kept its store and reload). The
+  whole-vector store gate (`check_vector_store_forward.sh`) holds its shapes
+  to their budgets with the IR pass, without it, and with neither stage.
+
+- **Alignment of a home beside a call** (x86-64, `vecabialign`) — a home
+  that a call marshals (a register-passed vector argument, the buffer of a
+  `%ymm0`/`%zmm0` result) and an explicit-SIMD intrinsic fills or drains
+  (`Loadu256`, `Storeu256`, any operand `pointer_vector_arg_width` lists) is
+  relaxed to sixteen bytes when every use tolerates it: the intrinsic uses
+  are answered by the table `downgrade_nonescaping_vector_align` relaxes
+  by. A 32-byte contract (`Store256`, `Load256`, the streaming forms) and
+  an unlisted position keep the alignment. See
+  [x86-isa-permissions-and-simd-abi.md](x86-isa-permissions-and-simd-abi.md)
+  §2.4.
 
 - **Identical basic-block merging** (`merge_identical_blocks`) — a block is
   deleted and its predecessors retargeted when its instruction text matches
@@ -498,11 +602,46 @@ such an access volatile and records that nobody wrote `volatile`, so the
 qualifier-conversion diagnostics stay those of GCC (`void *p = &atomic_obj`
 is silent). A cast through a typedef of a volatile type, `*(vu32 *)REG`,
 keeps the typedef's qualifier as well. Gate:
-`tests/regression/check_volatile_access_semantics.sh`, section 6b. Not
-implemented: atomicity of the *operators*. `x++`, `x += v` and `x = v` on an
-atomic object are one load, the operation and one store; the `<stdatomic.h>`
-functions and the `__atomic_*` builtins are the atomic operations (`lock
-xadd`, `xchg`, `lock cmpxchg`).
+`tests/regression/check_volatile_access_semantics.sh`, section 6b.
+
+The *operators* on an atomic object are atomic operations too (C11
+6.5.2.4p2, 6.5.16.2p3, 6.2.6.1p9). They used to be the three steps of a
+volatile object's update, and `refs++` from two threads lost counts
+(`tests/regression/atomic_operators.c`: 229,349 of 400,000 increments
+survived). `_Atomic` is now part of what a type records (`PtrQuals::ATOMIC`),
+sema tells the lowering which lvalues designate an atomic object
+(`SemaResult::atomic_lvalues`), and `src/ir/lowering/atomic_access.rs`
+chooses the operation:
+
+| Source | IR | x86-64 at `-O2` |
+|---|---|---|
+| a read of `x` | `AtomicLoad` | `mov` (AArch64 `ldar`) |
+| `x = v` | `AtomicStore` | `xchg` (AArch64 `stlr`) |
+| `x++;` `x -= v;` `x \|= v;`, result unused | `AtomicRmw` | `lock add` / `lock sub` / `lock or` |
+| `++x`, `x += v`, result used | `AtomicRmw` | `lock xadd` |
+| `x *= v`, `x <<= v`, `d += v` on a `double`, a `_Bool`, `-ftrapv` | load + `AtomicCmpxchg` loop | `lock cmpxchg; jne` |
+
+The retry branch of the loop reads ZF from `lock cmpxchg` itself, and an
+`AtomicRmw` whose result nobody reads -- `atomic_fetch_or` with its value
+dropped included -- is one locked ALU instruction instead of `lock xadd` or a
+five-instruction loop. Covered: integers and pointers on every target
+(sixteen bytes through libatomic's `_16` entry points, as GCC does, so
+`-latomic` at the link), `float` and `double` on x86. Not covered: `long
+double`, complex and structure objects, which keep a volatile object's
+accesses where GCC calls libatomic's generic `__atomic_load`,
+`__atomic_store` and `__atomic_compare_exchange`; and a floating update does
+not save and restore the floating-point environment around its loop (Clang
+does not either; GCC does). Gate: `tests/regression/check_atomic_operators.sh`.
+
+Because the type says atomic, the frontend also follows GCC and Clang where
+it used to be silent: a pointer to an atomic object does not convert to a
+pointer to the plain type or back (an error), `_Generic` tells `_Atomic int
+*` from `int *` and `volatile int *` (it took the first association of the
+right shape), and an atomic bit-field is refused. One spelling is still read
+short: `volatile` written beside `_Atomic` on the same object is not
+recorded as written, so `_Generic(&v, volatile _Atomic int *: ...)` selects
+the `_Atomic int *` association and `void *p = &v;` does not report the
+discarded `volatile`.
 
 ### IPCP (Interprocedural Constant Propagation)
 
@@ -521,7 +660,7 @@ CCC_DISABLE_PASSES="gvn,licm" ./target/fastbuild/lccc input.c -o output
 CCC_DISABLE_PASSES="all"      ./target/fastbuild/lccc input.c -o output
 ```
 
-Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `sccp`, `jump_thread`, `join_store_forward`, `phi_relay_fold`, `ret_dup`, `loop_memset`, `vector_fill`, `tce`, `tce_acc`, `rec2iter`, `self_inline`, `boolthread`.
+Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `sccp`, `jump_thread`, `jump_thread_early`, `join_store_forward`, `phi_relay_fold`, `ret_dup`, `loop_memset`, `vector_fill`, `tce`, `tce_acc`, `rec2iter`, `self_inline`, `boolthread`, `zmmhome`.
 
 Timing data is available via:
 
@@ -594,6 +733,15 @@ no longer a predecessor still "works" whenever that block happens to dominate. A
 predecessor list and prunes operands on edges it proves dead — deleted an induction
 variable's initialisation. See
 `../engineering/journal/2026-08.md`.
+
+A stage that is handed IR which no longer meets what an earlier stage decided
+about it takes its safe path and says nothing: the code is right, and the
+optimisation is gone without a trace. Under `CCC_VERIFY_IR` it says so, as
+`[stage] function: what`, and `abort` stops there. The 512-bit register homes
+are the first such decision (`[zmmhome] f: the homes do not hold; the function
+is compiled without them`, when a pass behind `zmmhome` added a use of an
+object that a register cannot serve); `check_x86_zmm_homes.py` requires that
+no such line appears.
 
 When a violation names a stage, the *producer* is not always that stage: the
 pipeline tail after the last checkpoint (live-range splitting, entry-parameter

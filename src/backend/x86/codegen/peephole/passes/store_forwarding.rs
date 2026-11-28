@@ -564,10 +564,11 @@ fn line_mnemonic(text: &str) -> &str {
 /// spellings alias one physical register bank, so they share the family).
 /// Lines classified as `StoreXmmRbp`/`LoadXmmRbp` carry exactly one vector
 /// operand by construction (the other end of the move is the frame slot),
-/// so "first" is also "the". The wider spellings matter for INVALIDATION:
-/// a `%ymm` slot load rewrites the family's register, so every mapping
-/// backed by it must die even though no forwarding is attempted
-/// (`MoveSize::QQ` is screened out of the mapping paths).
+/// so "first" is also "the". The wider spellings matter for INVALIDATION
+/// too: a `%ymm` slot load rewrites the family's register, so every mapping
+/// backed by it must die whether or not the load itself was forwarded.
+/// `%xmm16..31` and their wider spellings have no family id and yield
+/// `None`: such a move makes no mapping and is served by none.
 fn parse_xmm_family(text: &str) -> Option<RegId> {
     let bytes = text.as_bytes();
     let mut rest = 0usize;
@@ -1166,6 +1167,77 @@ fn try_pair_fuse_gp_to_xmm_relay(
 /// merge instead. Forward with an exact zeroing bit move, preserving the
 /// original legacy/VEX upper-vector behavior. This also avoids an artificial
 /// dependency on the old destination. No scalar floating arithmetic is used.
+/// A 32-byte reload of a slot that a 32-byte store filled is the register
+/// move at the same width:
+///
+/// ```text
+///     vmovdqu %ymm4, 8(%rsp)          vmovdqu %ymm4, 8(%rsp)
+///     vmovdqu 8(%rsp), %ymm0    =>    vmovdqu %ymm4, %ymm0
+/// ```
+///
+/// Both forms copy 256 bits and, being VEX.256, zero bits 256..MAXVL of the
+/// destination, so the register form is the load in every bit of the
+/// architectural state; an aligned load (`vmovdqa`, `vmovaps`) only loses
+/// the fault it could not have had on a slot the frame aligned. The load's
+/// own mnemonic is kept: each of the six packed spellings classified as a
+/// 32-byte slot move (`parse_fp_slot_move`) has a register form.
+///
+/// Into the register that wrote the slot the reload changes one thing, bits
+/// 256..511, which it zeroes: it goes when those are dead and stays
+/// otherwise. Either way the register still holds the slot's bytes, so its
+/// mapping stays.
+///
+/// Only a 32-byte mapping serves: a 16-byte one says nothing about the upper
+/// half of the slot. (The other direction, a narrower reload of a 32-byte
+/// mapping, is `gsf_handle_load_xmm`'s: `%xmmN` is the low half of `%ymmN`,
+/// and the 16-, 8- and 4-byte register forms there read no more than that.)
+#[allow(clippy::too_many_arguments)]
+fn gsf_forward_ymm_reload(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    i: usize,
+    load_offset: i32,
+    dst: RegId,
+    slot_entries: &mut [SlotEntry],
+    reg_offsets: &mut RegHomes,
+    lv: &mut FileLiveness,
+    fp: &mut FpLiveness,
+) -> bool {
+    let backing = slot_entries
+        .iter()
+        .rev()
+        .find(|e| e.active && e.offset == load_offset)
+        .map(|e| e.mapping)
+        .filter(|m| m.size == MoveSize::QQ && is_xmm_family(m.reg_id))
+        .map(|m| m.reg_id);
+    let Some(src) = backing else {
+        // Not forwarded, and the destination is rewritten: every mapping it
+        // backs is stale from here on.
+        invalidate_reg_flat(slot_entries, reg_offsets, dst);
+        return false;
+    };
+    if src == dst {
+        if !fp.zmm_high_dead_after(i, (dst - 24) as u32) {
+            return false;
+        }
+        mark_nop(&mut infos[i]);
+    } else {
+        let text = format!(
+            "    {} %ymm{}, %ymm{}",
+            line_mnemonic(infos[i].trimmed(store.get(i))),
+            src - 24,
+            dst - 24
+        );
+        replace_line(store, &mut infos[i], i, text);
+        invalidate_reg_flat(slot_entries, reg_offsets, dst);
+    }
+    // Forwarding adds a read of the backing register (or removes a write);
+    // later proofs must see it.
+    lv.refresh_at(store, infos, i);
+    fp.refresh_at(store, infos, i);
+    true
+}
+
 fn gsf_handle_load_xmm(
     store: &mut LineStore,
     infos: &mut [LineInfo],
@@ -1182,13 +1254,18 @@ fn gsf_handle_load_xmm(
     let Some(dst) = parse_xmm_family(infos[i].trimmed(store.get(i))) else {
         return false;
     };
-    // A 32-byte reload is never forwarded (no register form we emit
-    // reproduces both the 32 copied bytes and the VEX upper-zeroing of
-    // bits 256..MAXVL), but it DOES rewrite the destination family: every
-    // mapping backed by that register is stale from here on.
     if load_size == MoveSize::QQ {
-        invalidate_reg_flat(slot_entries, reg_offsets, dst);
-        return false;
+        return gsf_forward_ymm_reload(
+            store,
+            infos,
+            i,
+            load_offset,
+            dst,
+            slot_entries,
+            reg_offsets,
+            lv,
+            fp,
+        );
     }
     let mapping = slot_entries
         .iter()
@@ -1356,10 +1433,16 @@ fn gsf_handle_other(
         invalidate_reg_flat(slot_entries, reg_offsets, reg);
         writes &= writes - 1;
     }
-    // Scalar homes represent only low XMM bits, preserved by VZEROUPPER.
-    if has_implicit_vector_effects_line(text)
-        && text.split_whitespace().next() != Some("vzeroupper")
-    {
+    // `vzeroupper` keeps the low 128 bits of every register, which is all a
+    // mapping of 16 bytes or fewer speaks of. A 32-byte mapping says the
+    // register's low 256 bits are the slot's, and that ends here.
+    if text.split_whitespace().next() == Some("vzeroupper") {
+        for entry in slot_entries.iter_mut() {
+            if entry.active && entry.mapping.size == MoveSize::QQ {
+                deactivate_entry(entry, reg_offsets);
+            }
+        }
+    } else if has_implicit_vector_effects_line(text) {
         // Mask results and unknown vector writes need not name their outputs.
         // A hidden reader alone would not invalidate equality, but refusing
         // across unmodelled effects is conservative and shares the copy proof.
@@ -1796,18 +1879,6 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
             LineKind::StoreXmmRbp { offset, size } => {
                 if !rbp_is_frame && infos[i].reg_refs & (1u16 << REG_RBP) != 0 {
                     invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
-                } else if size == MoveSize::QQ {
-                    // 32-byte stores never create a mapping (fail closed: a
-                    // narrower reload served from the register would need
-                    // the ymm→xmm low-lane equivalence proven path by path,
-                    // and a full 32-byte forward would have to reproduce the
-                    // VEX upper-zeroing). Range-invalidate exactly.
-                    invalidate_slots_at(
-                        &mut slot_entries,
-                        &mut reg_offsets,
-                        offset,
-                        size.byte_size(),
-                    );
                 } else if xmm_forward_ok
                     && (rbp_is_frame || !line_base_is_rbp(infos[i].trimmed(store.get(i))))
                 {
@@ -2775,6 +2846,223 @@ mod tests {
             !out.contains("movdqu 72(%rsp), %xmm0"),
             "the slot read must be gone: {out}"
         );
+    }
+
+    /// The fixture of the 32-byte tests: `body` between a label and `ret`.
+    fn forward_body(body: &[&str]) -> String {
+        let mut asm = String::from("f:\n.cfi_startproc\n");
+        for line in body {
+            asm.push_str("    ");
+            asm.push_str(line);
+            asm.push('\n');
+        }
+        asm.push_str("    ret\n.cfi_endproc\n");
+        forward_only(&asm).0
+    }
+
+    #[test]
+    fn qq_store_load_forwards_through_the_register() {
+        // An `__m256` leaves its register for a frame slot and comes straight
+        // back: the reload is the 256-bit register move, which zeroes bits
+        // 256..MAXVL of its destination exactly as the load does. The load's
+        // own spelling is kept, aligned or not, integer or float.
+        for mnemonic in [
+            "vmovdqu", "vmovdqa", "vmovups", "vmovaps", "vmovupd", "vmovapd",
+        ] {
+            let out = forward_body(&[
+                "vmovdqu %ymm4, 8(%rsp)",
+                "movq %rcx, %r10",
+                &format!("{mnemonic} 8(%rsp), %ymm0"),
+                "vpmovmskb %ymm0, %eax",
+            ]);
+            assert!(
+                out.contains(&format!("{mnemonic} %ymm4, %ymm0")),
+                "{mnemonic}: {out}"
+            );
+            assert!(!out.contains("8(%rsp), %ymm0"), "{mnemonic}: {out}");
+        }
+        // `%rbp` as the frame pointer names a slot the same way.
+        let out = forward_body(&[
+            "pushq %rbp",
+            "movq %rsp, %rbp",
+            "vmovups %ymm7, -64(%rbp)",
+            "vmovups -64(%rbp), %ymm2",
+            "vmovups %ymm2, (%rdi)",
+            "popq %rbp",
+        ]);
+        assert!(out.contains("vmovups %ymm7, %ymm2"), "{out}");
+        // An EVEX spelling is no slot move to the classifier (an `Other`
+        // line): it is left as it is, and as a write of `%ymm0` it ends what
+        // `%ymm0` backed.
+        let out = forward_body(&[
+            "vmovdqu %ymm0, 72(%rsp)",
+            "vmovdqu %ymm4, 8(%rsp)",
+            "vmovdqu64 8(%rsp), %ymm0",
+            "vmovdqu 72(%rsp), %ymm1",
+            "vpaddq %ymm1, %ymm0, %ymm0",
+        ]);
+        assert!(out.contains("vmovdqu64 8(%rsp), %ymm0"), "{out}");
+        assert!(out.contains("vmovdqu 72(%rsp), %ymm1"), "{out}");
+    }
+
+    #[test]
+    fn qq_self_reload_goes_only_when_the_zmm_upper_half_is_dead() {
+        // Into the register that wrote the slot the reload rewrites 256 bits
+        // with what they hold and zeroes bits 256..511. Nothing reads those
+        // here: the reload is nothing.
+        let out = forward_body(&[
+            "vmovdqu %ymm6, 72(%rsp)",
+            "movq %rcx, %r10",
+            "vmovdqu 72(%rsp), %ymm6",
+            "vmovdqu %ymm6, (%rdi)",
+        ]);
+        assert!(!out.contains("72(%rsp), %ymm6"), "{out}");
+        // A 512-bit read behind it observes the zeroing: the reload stays,
+        // and so does the mapping (a second reload still forwards).
+        let out = forward_body(&[
+            "vmovdqu %ymm6, 72(%rsp)",
+            "vmovdqu 72(%rsp), %ymm6",
+            "vmovdqu 72(%rsp), %ymm1",
+            "vmovdqu64 %zmm6, 128(%rdi)",
+            "vmovdqu %ymm1, (%rdi)",
+        ]);
+        assert!(out.contains("vmovdqu 72(%rsp), %ymm6"), "{out}");
+        assert!(out.contains("vmovdqu %ymm6, %ymm1"), "{out}");
+    }
+
+    #[test]
+    fn qq_mapping_serves_the_narrower_reloads_of_its_low_half() {
+        // `%xmm4` is the low half of `%ymm4`: a 16-byte or an 8-byte reload
+        // at the slot's own offset reads bytes the register holds.
+        let out = forward_body(&[
+            "vmovdqu %ymm4, 32(%rsp)",
+            "vmovdqu 32(%rsp), %xmm0",
+            "vmovsd 32(%rsp), %xmm1",
+            "vpaddq %xmm1, %xmm0, %xmm0",
+        ]);
+        assert!(out.contains("vmovdqu %xmm4, %xmm0"), "{out}");
+        assert!(out.contains("vmovq %xmm4, %xmm1"), "{out}");
+        // Four bytes: `vinsertps` takes lane 0 and zeroes the rest, as the
+        // load does.
+        let out = forward_body(&[
+            "vmovdqu %ymm4, 32(%rsp)",
+            "vmovss 32(%rsp), %xmm1",
+            "vaddss %xmm1, %xmm0, %xmm0",
+        ]);
+        assert!(out.contains("vinsertps $14, %xmm4, %xmm4, %xmm1"), "{out}");
+        // The upper half of the slot has no mapping of its own.
+        let out = forward_body(&[
+            "vmovdqu %ymm4, 32(%rsp)",
+            "vmovdqu 48(%rsp), %xmm0",
+            "vmovdqu %xmm0, (%rdi)",
+        ]);
+        assert!(out.contains("vmovdqu 48(%rsp), %xmm0"), "{out}");
+    }
+
+    #[test]
+    fn qq_forwarding_refuses_what_ends_the_equality() {
+        let reload = "vmovdqu 32(%rsp), %ymm0";
+        for (why, between) in [
+            // The register's upper half is zeroed, the slot's is not.
+            ("vzeroupper", vec!["vzeroupper"]),
+            // Any write of the family, at any width: a VEX-128 write zeroes
+            // the upper half, a legacy one keeps it and changes the low.
+            ("a 128-bit VEX write", vec!["vpaddd %xmm1, %xmm2, %xmm4"]),
+            ("a legacy write", vec!["paddd %xmm1, %xmm4"]),
+            ("a 256-bit write", vec!["vpaddd %ymm1, %ymm2, %ymm4"]),
+            ("a 512-bit write", vec!["vpaddd %zmm1, %zmm2, %zmm4"]),
+            ("a masked write", vec!["vmovdqa32 %ymm1, %ymm4{%k1}"]),
+            // Any write into the slot's 32 bytes, at its start, inside, at its
+            // last byte, and one that reaches in from below.
+            ("a store at the start", vec!["movq %rax, 32(%rsp)"]),
+            ("a store inside", vec!["movl %eax, 44(%rsp)"]),
+            ("a store at the last byte", vec!["movb %al, 63(%rsp)"]),
+            ("a store from below", vec!["movq %rax, 28(%rsp)"]),
+            (
+                "a 16-byte store over the upper half",
+                vec!["vmovdqu %xmm1, 48(%rsp)"],
+            ),
+            // A 64-byte store that starts below the slot and covers it.
+            (
+                "a 64-byte store across it",
+                vec!["vmovdqu64 %zmm1, 0(%rsp)"],
+            ),
+            (
+                "a masked store into it",
+                vec!["vmovdqu8 %ymm1, 32(%rsp){%k1}"],
+            ),
+            // An EVEX spelling is an `Other` line: its store is known by
+            // its extent.
+            (
+                "an unclassified store over it",
+                vec!["vmovdqu32 %ymm1, 32(%rsp)"],
+            ),
+            (
+                "an unclassified store from below",
+                vec!["vmovdqu32 %ymm1, 16(%rsp)"],
+            ),
+            (
+                "a classified store from below",
+                vec!["vmovupd %ymm1, 16(%rsp)"],
+            ),
+            ("a store through a pointer", vec!["movq %rax, (%rdi)"]),
+            ("a call", vec!["call g"]),
+            ("a stack adjustment", vec!["subq $8, %rsp"]),
+        ] {
+            let mut body = vec!["vmovdqu %ymm4, 32(%rsp)"];
+            body.extend(between);
+            body.extend([reload, "vmovdqu %ymm0, (%rsi)"]);
+            let out = forward_body(&body);
+            assert!(out.contains(reload), "{why}: {out}");
+        }
+        // What does not end it: a store beside the slot, a read through a
+        // pointer, a write of another register.
+        for between in [
+            "movq %rax, 24(%rsp)",
+            "movq %rax, 64(%rsp)",
+            "movq (%rdi), %rax",
+            "vpaddd %ymm1, %ymm2, %ymm5",
+        ] {
+            let out = forward_body(&[
+                "vmovdqu %ymm4, 32(%rsp)",
+                between,
+                reload,
+                "vmovdqu %ymm0, (%rsi)",
+            ]);
+            assert!(out.contains("vmovdqu %ymm4, %ymm0"), "{between}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_32_byte_reload_is_not_served_by_a_16_byte_mapping() {
+        // A 16-byte store says nothing about the slot's upper half.
+        let out = forward_body(&[
+            "vmovdqu %xmm4, 32(%rsp)",
+            "vmovdqu 32(%rsp), %ymm0",
+            "vmovdqu %ymm0, (%rsi)",
+        ]);
+        assert!(out.contains("vmovdqu 32(%rsp), %ymm0"), "{out}");
+        // And the reload rewrote `%ymm0`: a mapping it backed is gone.
+        let out = forward_body(&[
+            "vmovdqu %ymm0, 96(%rsp)",
+            "vmovdqu %xmm4, 32(%rsp)",
+            "vmovdqu 32(%rsp), %ymm0",
+            "vmovdqu 96(%rsp), %ymm1",
+            "vpaddd %ymm1, %ymm0, %ymm0",
+        ]);
+        assert!(out.contains("vmovdqu 96(%rsp), %ymm1"), "{out}");
+    }
+
+    #[test]
+    fn a_register_above_15_makes_no_32_byte_mapping() {
+        // `%ymm16..31` have no family id here: the store only invalidates.
+        let out = forward_body(&[
+            "vmovdqu %ymm4, 32(%rsp)",
+            "vmovdqu64 %ymm16, 32(%rsp)",
+            "vmovdqu 32(%rsp), %ymm0",
+            "vmovdqu %ymm0, (%rsi)",
+        ]);
+        assert!(out.contains("vmovdqu 32(%rsp), %ymm0"), "{out}");
     }
 
     #[test]

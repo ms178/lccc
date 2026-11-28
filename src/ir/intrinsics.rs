@@ -16,6 +16,70 @@
 /// - Scalar math (SqrtF32, SqrtF64, FabsF32, FabsF64)
 /// - Frame/return address builtins
 
+/// Which half of which full adder an [`IntrinsicOp::Carry`] is.
+///
+/// With `x`, `y` unsigned words of 32 or 64 bits and `c` 0 or 1:
+///
+/// | `borrow` | `out` | result |
+/// |---|---|---|
+/// | no  | no  | `x + y + c`, wrapping (the word) |
+/// | no  | yes | the carry out of that sum, 0 or 1 (`I8`) |
+/// | yes | no  | `x - y - c`, wrapping |
+/// | yes | yes | the borrow out of that difference, 0 or 1 |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CarryOp {
+    /// Subtract with borrow instead of add with carry.
+    pub borrow: bool,
+    /// The carry (or borrow) out instead of the word.
+    pub out: bool,
+    /// 64-bit operands instead of 32-bit ones.
+    pub wide: bool,
+}
+
+impl CarryOp {
+    /// The other half of the same adder.
+    pub const fn partner(self) -> Self {
+        Self {
+            out: !self.out,
+            ..self
+        }
+    }
+
+    /// The type of the word: `U64` or `U32`.
+    pub const fn word_type(self) -> crate::common::types::IrType {
+        if self.wide {
+            crate::common::types::IrType::U64
+        } else {
+            crate::common::types::IrType::U32
+        }
+    }
+
+    /// The type of this half's result.
+    pub const fn result_type(self) -> crate::common::types::IrType {
+        if self.out {
+            crate::common::types::IrType::I8
+        } else {
+            self.word_type()
+        }
+    }
+
+    /// What the two halves compute, for a constant folder or a test: the
+    /// word and the carry (or borrow) out.
+    pub const fn evaluate(self, x: u64, y: u64, c: bool) -> (u64, bool) {
+        let mask = if self.wide { u64::MAX } else { u32::MAX as u64 };
+        let (x, y, c) = (x & mask, y & mask, c as u64);
+        if self.borrow {
+            let word = x.wrapping_sub(y).wrapping_sub(c) & mask;
+            // A borrow is taken when y + c exceeds x (y + c cannot wrap:
+            // both are at most the mask, and it is compared in 128 bits).
+            (word, (y as u128 + c as u128) > x as u128)
+        } else {
+            let wide = x as u128 + y as u128 + c as u128;
+            ((wide as u64) & mask, wide > mask as u128)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntrinsicOp {
     AvxWiden(crate::common::avx_widen::AvxWiden),
@@ -140,6 +204,12 @@ pub enum IntrinsicOp {
     /// Late canonicalization uses this for exact select/compare/subtract
     /// graphs after vectorization; both x86 backends lower it without SIMD.
     UsubSat32,
+    /// One half of a full adder or subtractor (`args`: `x`, `y`, `c`, with
+    /// `c` proven 0 or 1): see [`CarryOp`]. Created late by
+    /// `passes::carry_chain` on x86-64, as a pair on the same operands, the
+    /// sum directly followed by the carry out; the backend emits the pair
+    /// as one `adc`/`sbb` and a `setc`.
+    Carry(CarryOp),
     /// BMI2 parallel bit deposit/extract (`args`: source, mask). The x86-64
     /// backend emits `pdep`/`pext` only where the function may use BMI2 and
     /// an exact portable loop elsewhere, so the op is legal in any function.
@@ -2554,6 +2624,19 @@ impl IntrinsicOp {
             | DpPs256 | RcpPs256 | RsqrtPs256
             | RoundPs256 | RoundPd256 | VpermilPs256 | VpermilPd256
             | VpermilvarPs256 | VpermilvarPd256 | BlendPs256 | BlendPd256
+            // The variable blends, the FMA3 forms and the rest of the VNNI
+            // dot products write a 32-byte result like every row above; the
+            // list had the immediate blends, no FMA and three of the
+            // fourteen dot products, so the results of the others stayed
+            // homes no pass could reason about.
+            | BlendvPs256 | BlendvPd256
+            | FmaPs132v256 | FmaPs213v256 | FmaPs231v256
+            | FmaPd132v256 | FmaPd213v256 | FmaPd231v256
+            | FmsubPs132v256 | FmsubPd132v256 | FnmaddPs132v256 | FnmaddPd132v256
+            | FnmsubPs132v256 | FnmsubPd132v256 | FmaddsubPs132v256 | FmaddsubPd132v256
+            | FmsubaddPs132v256 | FmsubaddPd132v256
+            | Dpbusds256 | Dpwusd256 | Dpwusds256 | Dpbssds256 | Dpbsud256 | Dpbsuds256
+            | Dpbuud256 | Dpbuuds256 | Dpwuuds256 | Dpwssd256 | Dpwssds256
             | LoaduPs256 | StoreuPs256 | LoaduPd256
             | StoreuPd256 | Permute2x128 | Permute4x64 | Permutevar8x32 | Pshufd256
             | Punpcklbw256 | Punpckhbw256 | Punpcklwd256 | Punpckhwd256
@@ -2746,6 +2829,9 @@ impl IntrinsicOp {
             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
             IntrinsicOp::F16ToF32 | IntrinsicOp::F32ToF16 |
             IntrinsicOp::UsubSat32 |
+            // A function of its three operands: no memory, no flags that
+            // outlive it.
+            IntrinsicOp::Carry(_) |
             // `Setzero512` is one EVEX `vpxorq`: no memory operand, no
             // input dependence. Classifying it pure lets IR DCE remove a
             // dead all-off masked-load replacement instead of rooting it.

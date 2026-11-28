@@ -61,6 +61,7 @@
 //! - select Const(0), a, b => b (constant false condition)
 //! - select Const(nonzero), a, b => a (constant true condition)
 
+use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
 use crate::ir::instruction::Terminator;
 use crate::ir::reexports::{
@@ -525,7 +526,19 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
     // 32/64-bit temporary.  The helper rejects truncations (e.g. 0x100 -> u8
     // is zero) and float/pointer conversions with target-specific exceptional
     // semantics.
+    //
+    // A truth value survives EVERY integer conversion, the narrowing ones
+    // too: 0 stays 0 and 1 stays 1 at any width, and `b != 0` is `b`.  So a
+    // branch on a conversion of a comparison is a branch on the comparison
+    // ([`converted_truth_conditions`]).  That is what a condition inlined
+    // from a helper that returns `unsigned char`, `short` or `_Bool` leaves
+    // once its merge is threaded -- the comparison widened to the helper's
+    // `int` arithmetic and narrowed to its return type, or asked `!= 0` --
+    // and the links stood between the test and the passes that read a block
+    // as `Cmp; CondBranch`.
     if !simplify_skip("widened_cond") && std::env::var_os("CCC_NO_WIDENED_COND").is_none() {
+        let converted =
+            converted_truth_conditions(func, &cast_defs, &cmp_defs, &is_boolean, &def_counts);
         for block in &mut func.blocks {
             let Terminator::CondBranch { cond, .. } = &mut block.terminator else {
                 continue;
@@ -535,10 +548,114 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
             {
                 *cond = narrow;
                 total += 1;
+            } else if let Operand::Value(v) = cond
+                && let Some(&truth) = converted.get(&v.0)
+            {
+                *cond = Operand::Value(truth);
+                total += 1;
             }
         }
     }
     total
+}
+
+/// The truth value `v` stands for, read through what keeps one: `Some(b)`
+/// with `b` exactly 0 or 1 and `v == b`, or `None` when `v` is no truth
+/// value.
+///
+/// A truth value is a comparison, a bit test or a bitwise combination of
+/// such (`is_boolean`).  Two things keep it: an integer cast, of any width
+/// either way (0 stays 0 and 1 stays 1), and `!= 0` asked of one (`(b !=
+/// 0) == b`).  The answer is the innermost truth value reached; `v` itself
+/// when it is one and stands for nothing further.  Every link is defined
+/// once, so the chain names one value, and the walk is bounded.
+fn truth_base(
+    v: Value,
+    cast_defs: &[Option<CastDef>],
+    cmp_defs: &[Option<CmpDef>],
+    is_boolean: &[bool],
+    def_counts: &[u8],
+    depth: usize,
+) -> Option<Value> {
+    let idx = v.0 as usize;
+    if depth > MAX_BOOL_CAST_PEEL || def_counts.get(idx).copied() != Some(1) {
+        return None;
+    }
+    let under = |x: Operand| match x {
+        Operand::Value(x) => truth_base(x, cast_defs, cmp_defs, is_boolean, def_counts, depth + 1),
+        Operand::Const(_) => None,
+    };
+    if let Some(Some(cast)) = cast_defs.get(idx) {
+        // A cast of a truth value is that truth value; a cast of anything
+        // else is no truth value (256 narrows to 0).
+        return (cast.from_ty.is_integer() && cast.to_ty.is_integer())
+            .then(|| under(cast.src))
+            .flatten();
+    }
+    if is_boolean.get(idx).copied() != Some(true) {
+        return None;
+    }
+    if let Some(Some(cmp)) = cmp_defs.get(idx)
+        && cmp.op == IrCmpOp::Ne
+        && cmp.ty.is_integer()
+    {
+        let asked = match (cmp.lhs, cmp.rhs) {
+            (x, Operand::Const(zero)) | (Operand::Const(zero), x) if zero.is_zero() => under(x),
+            _ => None,
+        };
+        if asked.is_some() {
+            return asked;
+        }
+    }
+    Some(v)
+}
+
+/// For each `CondBranch` condition that stands for another truth value
+/// ([`truth_base`]) and is read by nothing but its branch: that truth value.
+///
+/// The one reader is what makes the rewrite a deletion: the outermost link
+/// dies with it, and the links under it die where the branch was their only
+/// reader too.  A conversion something else reads stays, and its branch
+/// with it (the test of a value that is in a register anyway).
+///
+/// Most functions have no such branch, and for them this is one walk over
+/// the terminators; the use counts are taken only when there is a candidate.
+fn converted_truth_conditions(
+    func: &IrFunction,
+    cast_defs: &[Option<CastDef>],
+    cmp_defs: &[Option<CmpDef>],
+    is_boolean: &[bool],
+    def_counts: &[u8],
+) -> FxHashMap<u32, Value> {
+    let mut found: FxHashMap<u32, Value> = FxHashMap::default();
+    for block in &func.blocks {
+        if let Terminator::CondBranch {
+            cond: Operand::Value(v),
+            ..
+        } = &block.terminator
+            && let Some(truth) = truth_base(*v, cast_defs, cmp_defs, is_boolean, def_counts, 0)
+            && truth != *v
+        {
+            found.insert(v.0, truth);
+        }
+    }
+    if found.is_empty() {
+        return found;
+    }
+    let mut readers: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut read = |id: u32| {
+        if found.contains_key(&id) {
+            *readers.entry(id).or_default() += 1;
+        }
+    };
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(&mut read);
+        }
+        block.terminator.for_each_used_value(&mut read);
+    }
+    found.retain(|id, _| readers.get(id).copied() == Some(1));
+    found
 }
 
 /// Readers of value operands for the reassociation profitability guard.
@@ -9730,6 +9847,241 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// `b0: x = param; t = (x == 13); w = zext t; n = (u8)w; u = n ...;
+    /// br cond ? b1 : b2` -- the comparison widened and narrowed again, as a
+    /// helper that returns `unsigned char` leaves it.
+    fn converted_truth_branch(extra_reader: bool, base_is_truth: bool) -> IrFunction {
+        let mut f = IrFunction::new("f".to_string(), IrType::I32, vec![], false);
+        let v = |id: u32| Operand::Value(Value(id));
+        let mut insts = vec![
+            Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::I32,
+            },
+            if base_is_truth {
+                Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Eq,
+                    lhs: v(0),
+                    rhs: Operand::Const(IrConst::I32(13)),
+                    ty: IrType::I32,
+                }
+            } else {
+                // Any integer: 256 narrows to 0.
+                Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Add,
+                    lhs: v(0),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }
+            },
+            Instruction::Cast {
+                dest: Value(2),
+                src: v(1),
+                from_ty: IrType::U8,
+                to_ty: IrType::I64,
+            },
+            Instruction::Cast {
+                dest: Value(3),
+                src: v(2),
+                from_ty: IrType::I32,
+                to_ty: IrType::U8,
+            },
+        ];
+        if extra_reader {
+            insts.push(Instruction::BinOp {
+                dest: Value(4),
+                op: IrBinOp::Add,
+                lhs: v(3),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            });
+        }
+        let ret = |x: i32| BasicBlock {
+            label: BlockId(if x == 10 { 1 } else { 2 }),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(x)))),
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        };
+        f.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: insts,
+                terminator: Terminator::CondBranch {
+                    cond: v(3),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+            ret(10),
+            ret(20),
+        ];
+        f.next_value_id = 5;
+        f
+    }
+
+    fn branch_condition(f: &IrFunction) -> Operand {
+        match &f.blocks[0].terminator {
+            Terminator::CondBranch { cond, .. } => *cond,
+            other => panic!("no branch: {other:?}"),
+        }
+    }
+
+    /// A truth value survives every integer conversion, so a branch on a
+    /// conversion of a comparison is a branch on the comparison -- when the
+    /// branch is the conversion's one reader, and only for a truth value.
+    #[test]
+    fn a_branch_on_a_conversion_of_a_truth_value_tests_the_truth_value() {
+        let mut f = converted_truth_branch(false, true);
+        assert!(simplify_function(&mut f) > 0);
+        assert_eq!(branch_condition(&f), Operand::Value(Value(1)));
+
+        // Something else reads the narrowed value: it stays, and so does
+        // its branch.
+        let mut f = converted_truth_branch(true, true);
+        simplify_function(&mut f);
+        assert_eq!(branch_condition(&f), Operand::Value(Value(3)));
+
+        // Not a truth value: 255 + 1 narrows to 0, and the branch on the
+        // narrowed value is the only one that knows.
+        let mut f = converted_truth_branch(false, false);
+        simplify_function(&mut f);
+        assert_eq!(branch_condition(&f), Operand::Value(Value(3)));
+
+        // What a helper that returns `_Bool` leaves: the comparison widened,
+        // asked `!= 0`, and that widened and narrowed again.
+        let mut f = converted_truth_branch(false, true);
+        let v = |id: u32| Operand::Value(Value(id));
+        f.blocks[0].instructions.extend([
+            Instruction::Cmp {
+                dest: Value(5),
+                op: IrCmpOp::Ne,
+                lhs: v(2),
+                rhs: Operand::Const(IrConst::I64(0)),
+                ty: IrType::I32,
+            },
+            Instruction::Cast {
+                dest: Value(6),
+                src: v(5),
+                from_ty: IrType::I32,
+                to_ty: IrType::U8,
+            },
+        ]);
+        f.blocks[0].terminator = Terminator::CondBranch {
+            cond: v(6),
+            true_label: BlockId(1),
+            false_label: BlockId(2),
+        };
+        f.next_value_id = 7;
+        assert!(simplify_function(&mut f) > 0);
+        assert_eq!(branch_condition(&f), Operand::Value(Value(1)));
+    }
+
+    #[test]
+    fn the_truth_value_a_chain_of_conversions_stands_for() {
+        let cast = |src: u32, from_ty, to_ty| {
+            Some(CastDef {
+                src: Operand::Value(Value(src)),
+                from_ty,
+                to_ty,
+            })
+        };
+        let ne_zero = |x: u32, zero_first: bool| {
+            let (x, zero) = (Operand::Value(Value(x)), Operand::Const(IrConst::I32(0)));
+            Some(CmpDef {
+                op: IrCmpOp::Ne,
+                lhs: if zero_first { zero } else { x },
+                rhs: if zero_first { x } else { zero },
+                ty: IrType::I32,
+            })
+        };
+        // v1 a comparison of two values; v2 = zext v1; v3 = trunc v2;
+        // v4 = (double)v3; v5 = (int)v4; v6 = trunc of v7, which is no truth
+        // value; v8 = zext of a constant; v9 = (v2 != 0); v10 = zext v9;
+        // v11 = (0 != v10); v12 = (v7 != 0), a truth value of its own;
+        // v13 = (v2 == 0).
+        let mut casts: Vec<Option<CastDef>> = vec![None; 16];
+        casts[2] = cast(1, IrType::U8, IrType::I64);
+        casts[3] = cast(2, IrType::I32, IrType::U8);
+        casts[4] = cast(3, IrType::U8, IrType::F64);
+        casts[5] = cast(4, IrType::F64, IrType::I32);
+        casts[6] = cast(7, IrType::I32, IrType::U8);
+        casts[8] = Some(CastDef {
+            src: Operand::Const(IrConst::I32(1)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        casts[10] = cast(9, IrType::U8, IrType::I64);
+        let mut cmps: Vec<Option<CmpDef>> = vec![None; 16];
+        cmps[1] = Some(CmpDef {
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(14)),
+            rhs: Operand::Value(Value(15)),
+            ty: IrType::I32,
+        });
+        cmps[9] = ne_zero(2, false);
+        cmps[11] = ne_zero(10, true);
+        cmps[12] = ne_zero(7, false);
+        cmps[13] = Some(CmpDef {
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        });
+        let mut truth = vec![false; 16];
+        for id in [1, 9, 11, 12, 13] {
+            truth[id] = true;
+        }
+        let once = vec![1u8; 16];
+        let base = |v: u32, defs: &[u8]| truth_base(Value(v), &casts, &cmps, &truth, defs, 0);
+        // Conversions, either way, and `!= 0` with the zero on either side.
+        assert_eq!(base(2, &once), Some(Value(1)));
+        assert_eq!(base(3, &once), Some(Value(1)));
+        assert_eq!(base(9, &once), Some(Value(1)));
+        assert_eq!(base(10, &once), Some(Value(1)));
+        assert_eq!(base(11, &once), Some(Value(1)));
+        // A truth value that stands for nothing further is itself: the
+        // comparison of two values, `x != 0` of an integer, and `== 0`,
+        // which is the negation and no link.
+        assert_eq!(base(1, &once), Some(Value(1)));
+        assert_eq!(base(12, &once), Some(Value(12)));
+        assert_eq!(base(13, &once), Some(Value(13)));
+        // Through a float the value is not followed.
+        assert_eq!(base(5, &once), None);
+        assert_eq!(base(4, &once), None);
+        // A narrowed integer, a converted constant, a value of no kind.
+        assert_eq!(base(6, &once), None);
+        assert_eq!(base(8, &once), None);
+        assert_eq!(base(7, &once), None);
+        // A link defined twice names no one value.
+        let mut twice = once.clone();
+        twice[2] = 2;
+        assert_eq!(base(3, &twice), None);
+        assert_eq!(
+            base(9, &twice),
+            Some(Value(9)),
+            "the test of it still is one"
+        );
+        // A chain longer than the bound is not walked to its end.
+        let long = MAX_BOOL_CAST_PEEL + 4;
+        let mut chain: Vec<Option<CastDef>> = vec![None; long + 1];
+        for (id, slot) in chain.iter_mut().enumerate().skip(1) {
+            *slot = cast(id as u32 - 1, IrType::I32, IrType::I64);
+        }
+        let none: Vec<Option<CmpDef>> = vec![None; long + 1];
+        let mut bottom = vec![false; long + 1];
+        bottom[0] = true;
+        let ones = vec![1u8; long + 1];
+        let reach = |from: usize| truth_base(Value(from as u32), &chain, &none, &bottom, &ones, 0);
+        assert_eq!(reach(MAX_BOOL_CAST_PEEL), Some(Value(0)));
+        assert_eq!(reach(MAX_BOOL_CAST_PEEL + 1), None);
     }
 
     #[test]

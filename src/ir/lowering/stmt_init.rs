@@ -579,7 +579,10 @@ impl Lowerer {
             }
         };
         self.emit(Instruction::Store {
-            volatile: false,
+            // The initializer of a volatile object is a write of it, like
+            // any other (`volatile int x = 1; x = 2;` writes twice, and the
+            // first read of `int *volatile p = q;` reads what was written).
+            volatile: da.object_is_volatile(),
             val,
             ptr: alloca,
             ty: da.var_ty,

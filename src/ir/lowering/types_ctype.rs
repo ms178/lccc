@@ -15,6 +15,35 @@ use crate::frontend::parser::ast::{
 };
 
 impl Lowerer {
+    /// A parameter of type `type_spec` and nothing else: no name, no
+    /// qualifier, no attribute. The parameters of a function type rebuilt
+    /// from a `CType`, and those of a library builtin's prototype.
+    pub(super) fn unnamed_param_decl(type_spec: TypeSpecifier) -> ParamDecl {
+        ParamDecl {
+            type_spec,
+            name: None,
+            alignment: None,
+            alignas_type: None,
+            fptr_params: None,
+            fptr_variadic: false,
+            fptr_has_prototype: false,
+            fptr_calling_convention: crate::common::types::CallingConvention::Default,
+            is_const: false,
+            is_volatile: false,
+            is_atomic: false,
+            is_restrict: false,
+            vla_size_exprs: Vec::new(),
+            decayed_array: false,
+            fptr_inner_ptr_depth: 0,
+            pointer_depth: 0,
+            pointer_const: false,
+            pointer_quals: Vec::new(),
+            base_restrict: false,
+            paren_star_quals: Vec::new(),
+            adjusted_cvr: 0,
+        }
+    }
+
     /// Convert a CType back to a TypeSpecifier (for typeof and __auto_type resolution).
     pub(super) fn ctype_to_type_spec(ctype: &CType) -> TypeSpecifier {
         match ctype {
@@ -59,28 +88,8 @@ impl Lowerer {
                         .params
                         .iter()
                         .map(|(cty, name)| ParamDecl {
-                            type_spec: Self::ctype_to_type_spec(cty),
                             name: name.clone(),
-                            alignment: None,
-                            alignas_type: None,
-                            fptr_params: None,
-                            fptr_variadic: false,
-                            fptr_has_prototype: false,
-                            fptr_calling_convention:
-                                crate::common::types::CallingConvention::Default,
-                            is_const: false,
-                            is_volatile: false,
-                            is_atomic: false,
-                            is_restrict: false,
-                            vla_size_exprs: Vec::new(),
-                            decayed_array: false,
-                            fptr_inner_ptr_depth: 0,
-                            pointer_depth: 0,
-                            pointer_const: false,
-                            pointer_quals: Vec::new(),
-                            base_restrict: false,
-                            paren_star_quals: Vec::new(),
-                            adjusted_cvr: 0,
+                            ..Self::unnamed_param_decl(Self::ctype_to_type_spec(cty))
                         })
                         .collect();
                     TypeSpecifier::FunctionPointer(
@@ -178,27 +187,8 @@ impl Lowerer {
                     .params
                     .iter()
                     .map(|(cty, name)| ParamDecl {
-                        type_spec: Self::ctype_to_type_spec(cty),
                         name: name.clone(),
-                        alignment: None,
-                        alignas_type: None,
-                        fptr_params: None,
-                        fptr_variadic: false,
-                        fptr_has_prototype: false,
-                        fptr_calling_convention: crate::common::types::CallingConvention::Default,
-                        is_const: false,
-                        is_volatile: false,
-                        is_atomic: false,
-                        is_restrict: false,
-                        vla_size_exprs: Vec::new(),
-                        decayed_array: false,
-                        fptr_inner_ptr_depth: 0,
-                        pointer_depth: 0,
-                        pointer_const: false,
-                        pointer_quals: Vec::new(),
-                        base_restrict: false,
-                        paren_star_quals: Vec::new(),
-                        adjusted_cvr: 0,
+                        ..Self::unnamed_param_decl(Self::ctype_to_type_spec(cty))
                     })
                     .collect();
                 TypeSpecifier::BareFunction(

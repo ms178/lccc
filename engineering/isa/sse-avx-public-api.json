@@ -2106,7 +2106,9 @@
       "generic_helpers": [],
       "header": "emmintrin.h",
       "name": "_mm_cmplt_epi32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_pcmpgtd128"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -11639,6 +11641,414 @@
         "macro"
       ],
       "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpge_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpge_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpge_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpge_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpge_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpge_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpge_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpge_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpgt_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpgt_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpgt_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpgt_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpgt_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpgt_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpgt_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpgt_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmple_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmple_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmple_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmple_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmple_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmple_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmple_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmple_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
         "__lccc_simd256_ps_vcmppd256"
       ],
       "header": "lcccsimd.h",
@@ -11673,6 +12083,142 @@
         "macro"
       ],
       "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmplt_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmplt_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmplt_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmplt_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmplt_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmplt_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmplt_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmplt_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
         "__lccc_simd256_ps_vcmppd256"
       ],
       "header": "lcccsimd.h",
@@ -11694,6 +12240,142 @@
       ],
       "header": "lcccsimd.h",
       "name": "_mm256_cmplt_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpneq_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpneq_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpneq_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpneq_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpneq_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpneq_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpneq_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_cmpneq_epu8_mask",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -12391,6 +13073,958 @@
       ],
       "header": "lcccsimd.h",
       "name": "_mm256_insertf128_si256",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmp_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmp_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmp_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmp_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmp_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmp_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmp_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmp_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpeq_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpeq_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpeq_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpeq_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpeq_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpeq_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpeq_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpeq_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpge_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpge_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpge_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpge_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpge_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpge_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpge_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpge_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpgt_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpgt_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpgt_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpgt_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpgt_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpgt_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpgt_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpgt_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmple_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmple_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmple_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmple_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmple_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmple_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmple_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmple_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmplt_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmplt_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmplt_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmplt_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmplt_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmplt_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmplt_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmplt_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpneq_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpneq_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpneq_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpneq_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpneq_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpneq_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpneq_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_mask_cmpneq_epu8_mask",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -13726,6 +15360,142 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpge_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpge_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpge_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpge_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpge_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpge_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpge_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpge_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
         "function"
       ],
       "generic_helpers": [
@@ -13733,6 +15503,23 @@
       ],
       "header": "lcccsimd.h",
       "name": "_mm512_cmpgt_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpgt_epi16_mask",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -13760,6 +15547,23 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpgt_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
         "function"
       ],
       "generic_helpers": [
@@ -13777,6 +15581,23 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpgt_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
         "function"
       ],
       "generic_helpers": [
@@ -13784,6 +15605,499 @@
       ],
       "header": "lcccsimd.h",
       "name": "_mm512_cmpgt_epi8",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpgt_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpgt_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpgt_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpgt_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpgt_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmple_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmple_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmple_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmple_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmple_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmple_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmple_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmple_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmplt_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmplt_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmplt_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmplt_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmplt_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmplt_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmplt_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmplt_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpneq_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpneq_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpneq_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpneq_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpneq_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpneq_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpneq_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_cmpneq_epu8_mask",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -14345,6 +16659,958 @@
       ],
       "header": "lcccsimd.h",
       "name": "_mm512_maddubs_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmp_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmp_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmp_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmp_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmp_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmp_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmp_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmp_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpeq_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpeq_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpeq_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpeq_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpeq_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpeq_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpeq_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpeq_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpge_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpge_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpge_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpge_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpge_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpge_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpge_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpge_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpgt_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpgt_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpgt_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpgt_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpgt_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpgt_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpgt_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpgt_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmple_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmple_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmple_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmple_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmple_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmple_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmple_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmple_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmplt_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmplt_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmplt_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmplt_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmplt_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmplt_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmplt_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmplt_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpneq_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpneq_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpneq_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpneq_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpneq_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpneq_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpneq_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub512"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm512_mask_cmpneq_epu8_mask",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -16417,6 +19683,414 @@
         "macro"
       ],
       "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpge_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpge_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpge_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpge_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpge_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpge_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpge_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpge_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpgt_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpgt_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpgt_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpgt_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpgt_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpgt_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpgt_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpgt_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmple_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmple_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmple_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmple_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmple_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmple_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmple_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmple_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
         "__lccc_simd128_ps_cmppd128"
       ],
       "header": "lcccsimd.h",
@@ -16451,6 +20125,142 @@
         "macro"
       ],
       "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmplt_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmplt_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmplt_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmplt_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmplt_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmplt_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmplt_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmplt_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
         "__lccc_simd128_ps_cmppd128"
       ],
       "header": "lcccsimd.h",
@@ -16472,6 +20282,142 @@
       ],
       "header": "lcccsimd.h",
       "name": "_mm_cmplt_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpneq_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpneq_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpneq_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpneq_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpneq_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpneq_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpneq_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_cmpneq_epu8_mask",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -17497,6 +21443,958 @@
     },
     {
       "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmp_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmp_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmp_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmp_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmp_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmp_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmp_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmp_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpeq_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpeq_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpeq_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpeq_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpeq_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpeq_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpeq_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpeq_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpge_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpge_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpge_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpge_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpge_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpge_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpge_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpge_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpgt_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpgt_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpgt_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpgt_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpgt_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpgt_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpgt_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpgt_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmple_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmple_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmple_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmple_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmple_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmple_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmple_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmple_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmplt_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmplt_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmplt_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmplt_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmplt_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmplt_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmplt_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmplt_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpneq_epi16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpneq_epi32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpneq_epi64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpb128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpneq_epi8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuw128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpneq_epu16_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpud128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpneq_epu32_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpuq128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpneq_epu64_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vpcmpub128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_mask_cmpneq_epu8_mask",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
         3
       ],
       "canonical_override": false,
@@ -18407,7 +23305,7 @@
     "_mm_move_epi32",
     "_mm_mwait"
   ],
-  "declarations": 1111,
+  "declarations": 1399,
   "missing_reference_names": [
     "_mm128_bitrev_epi8",
     "_mm128_mask_bitrev_epi8",
@@ -18475,47 +23373,7 @@
     "_mm256_cmp_pd_mask",
     "_mm256_cmp_ph_mask",
     "_mm256_cmp_ps_mask",
-    "_mm256_cmpge_epi16_mask",
-    "_mm256_cmpge_epi32_mask",
-    "_mm256_cmpge_epi64_mask",
-    "_mm256_cmpge_epi8_mask",
-    "_mm256_cmpge_epu16_mask",
-    "_mm256_cmpge_epu32_mask",
-    "_mm256_cmpge_epu64_mask",
-    "_mm256_cmpge_epu8_mask",
-    "_mm256_cmpgt_epi16_mask",
-    "_mm256_cmpgt_epi32_mask",
-    "_mm256_cmpgt_epi64_mask",
     "_mm256_cmpgt_epi8",
-    "_mm256_cmpgt_epi8_mask",
-    "_mm256_cmpgt_epu16_mask",
-    "_mm256_cmpgt_epu32_mask",
-    "_mm256_cmpgt_epu64_mask",
-    "_mm256_cmpgt_epu8_mask",
-    "_mm256_cmple_epi16_mask",
-    "_mm256_cmple_epi32_mask",
-    "_mm256_cmple_epi64_mask",
-    "_mm256_cmple_epi8_mask",
-    "_mm256_cmple_epu16_mask",
-    "_mm256_cmple_epu32_mask",
-    "_mm256_cmple_epu64_mask",
-    "_mm256_cmple_epu8_mask",
-    "_mm256_cmplt_epi16_mask",
-    "_mm256_cmplt_epi32_mask",
-    "_mm256_cmplt_epi64_mask",
-    "_mm256_cmplt_epi8_mask",
-    "_mm256_cmplt_epu16_mask",
-    "_mm256_cmplt_epu32_mask",
-    "_mm256_cmplt_epu64_mask",
-    "_mm256_cmplt_epu8_mask",
-    "_mm256_cmpneq_epi16_mask",
-    "_mm256_cmpneq_epi32_mask",
-    "_mm256_cmpneq_epi64_mask",
-    "_mm256_cmpneq_epi8_mask",
-    "_mm256_cmpneq_epu16_mask",
-    "_mm256_cmpneq_epu32_mask",
-    "_mm256_cmpneq_epu64_mask",
-    "_mm256_cmpneq_epu8_mask",
     "_mm256_cmul_pch",
     "_mm256_conflict_epi32",
     "_mm256_conflict_epi64",
@@ -18747,65 +23605,9 @@
     "_mm256_mask_broadcastsd_pd",
     "_mm256_mask_broadcastss_ps",
     "_mm256_mask_broadcastw_epi16",
-    "_mm256_mask_cmp_epi16_mask",
-    "_mm256_mask_cmp_epi32_mask",
-    "_mm256_mask_cmp_epi64_mask",
-    "_mm256_mask_cmp_epi8_mask",
-    "_mm256_mask_cmp_epu16_mask",
-    "_mm256_mask_cmp_epu32_mask",
-    "_mm256_mask_cmp_epu64_mask",
-    "_mm256_mask_cmp_epu8_mask",
     "_mm256_mask_cmp_pd_mask",
     "_mm256_mask_cmp_ph_mask",
     "_mm256_mask_cmp_ps_mask",
-    "_mm256_mask_cmpeq_epi16_mask",
-    "_mm256_mask_cmpeq_epi32_mask",
-    "_mm256_mask_cmpeq_epi64_mask",
-    "_mm256_mask_cmpeq_epi8_mask",
-    "_mm256_mask_cmpeq_epu16_mask",
-    "_mm256_mask_cmpeq_epu32_mask",
-    "_mm256_mask_cmpeq_epu64_mask",
-    "_mm256_mask_cmpeq_epu8_mask",
-    "_mm256_mask_cmpge_epi16_mask",
-    "_mm256_mask_cmpge_epi32_mask",
-    "_mm256_mask_cmpge_epi64_mask",
-    "_mm256_mask_cmpge_epi8_mask",
-    "_mm256_mask_cmpge_epu16_mask",
-    "_mm256_mask_cmpge_epu32_mask",
-    "_mm256_mask_cmpge_epu64_mask",
-    "_mm256_mask_cmpge_epu8_mask",
-    "_mm256_mask_cmpgt_epi16_mask",
-    "_mm256_mask_cmpgt_epi32_mask",
-    "_mm256_mask_cmpgt_epi64_mask",
-    "_mm256_mask_cmpgt_epi8_mask",
-    "_mm256_mask_cmpgt_epu16_mask",
-    "_mm256_mask_cmpgt_epu32_mask",
-    "_mm256_mask_cmpgt_epu64_mask",
-    "_mm256_mask_cmpgt_epu8_mask",
-    "_mm256_mask_cmple_epi16_mask",
-    "_mm256_mask_cmple_epi32_mask",
-    "_mm256_mask_cmple_epi64_mask",
-    "_mm256_mask_cmple_epi8_mask",
-    "_mm256_mask_cmple_epu16_mask",
-    "_mm256_mask_cmple_epu32_mask",
-    "_mm256_mask_cmple_epu64_mask",
-    "_mm256_mask_cmple_epu8_mask",
-    "_mm256_mask_cmplt_epi16_mask",
-    "_mm256_mask_cmplt_epi32_mask",
-    "_mm256_mask_cmplt_epi64_mask",
-    "_mm256_mask_cmplt_epi8_mask",
-    "_mm256_mask_cmplt_epu16_mask",
-    "_mm256_mask_cmplt_epu32_mask",
-    "_mm256_mask_cmplt_epu64_mask",
-    "_mm256_mask_cmplt_epu8_mask",
-    "_mm256_mask_cmpneq_epi16_mask",
-    "_mm256_mask_cmpneq_epi32_mask",
-    "_mm256_mask_cmpneq_epi64_mask",
-    "_mm256_mask_cmpneq_epi8_mask",
-    "_mm256_mask_cmpneq_epu16_mask",
-    "_mm256_mask_cmpneq_epu32_mask",
-    "_mm256_mask_cmpneq_epu64_mask",
-    "_mm256_mask_cmpneq_epu8_mask",
     "_mm256_mask_cmul_pch",
     "_mm256_mask_compress_epi16",
     "_mm256_mask_compress_epi32",
@@ -19875,50 +24677,10 @@
     "_mm512_cmp_round_ps_mask",
     "_mm512_cmpeq_pd_mask",
     "_mm512_cmpeq_ps_mask",
-    "_mm512_cmpge_epi16_mask",
-    "_mm512_cmpge_epi32_mask",
-    "_mm512_cmpge_epi64_mask",
-    "_mm512_cmpge_epi8_mask",
-    "_mm512_cmpge_epu16_mask",
-    "_mm512_cmpge_epu32_mask",
-    "_mm512_cmpge_epu64_mask",
-    "_mm512_cmpge_epu8_mask",
-    "_mm512_cmpgt_epi16_mask",
-    "_mm512_cmpgt_epi32_mask",
-    "_mm512_cmpgt_epi64_mask",
-    "_mm512_cmpgt_epi8_mask",
-    "_mm512_cmpgt_epu16_mask",
-    "_mm512_cmpgt_epu32_mask",
-    "_mm512_cmpgt_epu64_mask",
-    "_mm512_cmpgt_epu8_mask",
-    "_mm512_cmple_epi16_mask",
-    "_mm512_cmple_epi32_mask",
-    "_mm512_cmple_epi64_mask",
-    "_mm512_cmple_epi8_mask",
-    "_mm512_cmple_epu16_mask",
-    "_mm512_cmple_epu32_mask",
-    "_mm512_cmple_epu64_mask",
-    "_mm512_cmple_epu8_mask",
     "_mm512_cmple_pd_mask",
     "_mm512_cmple_ps_mask",
-    "_mm512_cmplt_epi16_mask",
-    "_mm512_cmplt_epi32_mask",
-    "_mm512_cmplt_epi64_mask",
-    "_mm512_cmplt_epi8_mask",
-    "_mm512_cmplt_epu16_mask",
-    "_mm512_cmplt_epu32_mask",
-    "_mm512_cmplt_epu64_mask",
-    "_mm512_cmplt_epu8_mask",
     "_mm512_cmplt_pd_mask",
     "_mm512_cmplt_ps_mask",
-    "_mm512_cmpneq_epi16_mask",
-    "_mm512_cmpneq_epi32_mask",
-    "_mm512_cmpneq_epi64_mask",
-    "_mm512_cmpneq_epi8_mask",
-    "_mm512_cmpneq_epu16_mask",
-    "_mm512_cmpneq_epu32_mask",
-    "_mm512_cmpneq_epu64_mask",
-    "_mm512_cmpneq_epu8_mask",
     "_mm512_cmpneq_pd_mask",
     "_mm512_cmpneq_ps_mask",
     "_mm512_cmpnle_pd_mask",
@@ -20272,74 +25034,18 @@
     "_mm512_mask_broadcastw_epi16",
     "_mm512_mask_ceil_pd",
     "_mm512_mask_ceil_ps",
-    "_mm512_mask_cmp_epi16_mask",
-    "_mm512_mask_cmp_epi32_mask",
-    "_mm512_mask_cmp_epi64_mask",
-    "_mm512_mask_cmp_epi8_mask",
-    "_mm512_mask_cmp_epu16_mask",
-    "_mm512_mask_cmp_epu32_mask",
-    "_mm512_mask_cmp_epu64_mask",
-    "_mm512_mask_cmp_epu8_mask",
     "_mm512_mask_cmp_pd_mask",
     "_mm512_mask_cmp_ph_mask",
     "_mm512_mask_cmp_ps_mask",
     "_mm512_mask_cmp_round_pd_mask",
     "_mm512_mask_cmp_round_ph_mask",
     "_mm512_mask_cmp_round_ps_mask",
-    "_mm512_mask_cmpeq_epi16_mask",
-    "_mm512_mask_cmpeq_epi32_mask",
-    "_mm512_mask_cmpeq_epi64_mask",
-    "_mm512_mask_cmpeq_epi8_mask",
-    "_mm512_mask_cmpeq_epu16_mask",
-    "_mm512_mask_cmpeq_epu32_mask",
-    "_mm512_mask_cmpeq_epu64_mask",
-    "_mm512_mask_cmpeq_epu8_mask",
     "_mm512_mask_cmpeq_pd_mask",
     "_mm512_mask_cmpeq_ps_mask",
-    "_mm512_mask_cmpge_epi16_mask",
-    "_mm512_mask_cmpge_epi32_mask",
-    "_mm512_mask_cmpge_epi64_mask",
-    "_mm512_mask_cmpge_epi8_mask",
-    "_mm512_mask_cmpge_epu16_mask",
-    "_mm512_mask_cmpge_epu32_mask",
-    "_mm512_mask_cmpge_epu64_mask",
-    "_mm512_mask_cmpge_epu8_mask",
-    "_mm512_mask_cmpgt_epi16_mask",
-    "_mm512_mask_cmpgt_epi32_mask",
-    "_mm512_mask_cmpgt_epi64_mask",
-    "_mm512_mask_cmpgt_epi8_mask",
-    "_mm512_mask_cmpgt_epu16_mask",
-    "_mm512_mask_cmpgt_epu32_mask",
-    "_mm512_mask_cmpgt_epu64_mask",
-    "_mm512_mask_cmpgt_epu8_mask",
-    "_mm512_mask_cmple_epi16_mask",
-    "_mm512_mask_cmple_epi32_mask",
-    "_mm512_mask_cmple_epi64_mask",
-    "_mm512_mask_cmple_epi8_mask",
-    "_mm512_mask_cmple_epu16_mask",
-    "_mm512_mask_cmple_epu32_mask",
-    "_mm512_mask_cmple_epu64_mask",
-    "_mm512_mask_cmple_epu8_mask",
     "_mm512_mask_cmple_pd_mask",
     "_mm512_mask_cmple_ps_mask",
-    "_mm512_mask_cmplt_epi16_mask",
-    "_mm512_mask_cmplt_epi32_mask",
-    "_mm512_mask_cmplt_epi64_mask",
-    "_mm512_mask_cmplt_epi8_mask",
-    "_mm512_mask_cmplt_epu16_mask",
-    "_mm512_mask_cmplt_epu32_mask",
-    "_mm512_mask_cmplt_epu64_mask",
-    "_mm512_mask_cmplt_epu8_mask",
     "_mm512_mask_cmplt_pd_mask",
     "_mm512_mask_cmplt_ps_mask",
-    "_mm512_mask_cmpneq_epi16_mask",
-    "_mm512_mask_cmpneq_epi32_mask",
-    "_mm512_mask_cmpneq_epi64_mask",
-    "_mm512_mask_cmpneq_epi8_mask",
-    "_mm512_mask_cmpneq_epu16_mask",
-    "_mm512_mask_cmpneq_epu32_mask",
-    "_mm512_mask_cmpneq_epu64_mask",
-    "_mm512_mask_cmpneq_epu8_mask",
     "_mm512_mask_cmpneq_pd_mask",
     "_mm512_mask_cmpneq_ps_mask",
     "_mm512_mask_cmpnle_pd_mask",
@@ -21713,22 +26419,6 @@
     "_mm_cmpestro",
     "_mm_cmpestrs",
     "_mm_cmpestrz",
-    "_mm_cmpge_epi16_mask",
-    "_mm_cmpge_epi32_mask",
-    "_mm_cmpge_epi64_mask",
-    "_mm_cmpge_epi8_mask",
-    "_mm_cmpge_epu16_mask",
-    "_mm_cmpge_epu32_mask",
-    "_mm_cmpge_epu64_mask",
-    "_mm_cmpge_epu8_mask",
-    "_mm_cmpgt_epi16_mask",
-    "_mm_cmpgt_epi32_mask",
-    "_mm_cmpgt_epi64_mask",
-    "_mm_cmpgt_epi8_mask",
-    "_mm_cmpgt_epu16_mask",
-    "_mm_cmpgt_epu32_mask",
-    "_mm_cmpgt_epu64_mask",
-    "_mm_cmpgt_epu8_mask",
     "_mm_cmpistra",
     "_mm_cmpistrc",
     "_mm_cmpistri",
@@ -21736,30 +26426,6 @@
     "_mm_cmpistro",
     "_mm_cmpistrs",
     "_mm_cmpistrz",
-    "_mm_cmple_epi16_mask",
-    "_mm_cmple_epi32_mask",
-    "_mm_cmple_epi64_mask",
-    "_mm_cmple_epi8_mask",
-    "_mm_cmple_epu16_mask",
-    "_mm_cmple_epu32_mask",
-    "_mm_cmple_epu64_mask",
-    "_mm_cmple_epu8_mask",
-    "_mm_cmplt_epi16_mask",
-    "_mm_cmplt_epi32_mask",
-    "_mm_cmplt_epi64_mask",
-    "_mm_cmplt_epi8_mask",
-    "_mm_cmplt_epu16_mask",
-    "_mm_cmplt_epu32_mask",
-    "_mm_cmplt_epu64_mask",
-    "_mm_cmplt_epu8_mask",
-    "_mm_cmpneq_epi16_mask",
-    "_mm_cmpneq_epi32_mask",
-    "_mm_cmpneq_epi64_mask",
-    "_mm_cmpneq_epi8_mask",
-    "_mm_cmpneq_epu16_mask",
-    "_mm_cmpneq_epu32_mask",
-    "_mm_cmpneq_epu64_mask",
-    "_mm_cmpneq_epu8_mask",
     "_mm_cmul_pch",
     "_mm_cmul_round_sch",
     "_mm_cmul_sch",
@@ -22164,14 +26830,6 @@
     "_mm_mask_broadcastq_epi64",
     "_mm_mask_broadcastss_ps",
     "_mm_mask_broadcastw_epi16",
-    "_mm_mask_cmp_epi16_mask",
-    "_mm_mask_cmp_epi32_mask",
-    "_mm_mask_cmp_epi64_mask",
-    "_mm_mask_cmp_epi8_mask",
-    "_mm_mask_cmp_epu16_mask",
-    "_mm_mask_cmp_epu32_mask",
-    "_mm_mask_cmp_epu64_mask",
-    "_mm_mask_cmp_epu8_mask",
     "_mm_mask_cmp_pd_mask",
     "_mm_mask_cmp_ph_mask",
     "_mm_mask_cmp_ps_mask",
@@ -22181,54 +26839,6 @@
     "_mm_mask_cmp_sd_mask",
     "_mm_mask_cmp_sh_mask",
     "_mm_mask_cmp_ss_mask",
-    "_mm_mask_cmpeq_epi16_mask",
-    "_mm_mask_cmpeq_epi32_mask",
-    "_mm_mask_cmpeq_epi64_mask",
-    "_mm_mask_cmpeq_epi8_mask",
-    "_mm_mask_cmpeq_epu16_mask",
-    "_mm_mask_cmpeq_epu32_mask",
-    "_mm_mask_cmpeq_epu64_mask",
-    "_mm_mask_cmpeq_epu8_mask",
-    "_mm_mask_cmpge_epi16_mask",
-    "_mm_mask_cmpge_epi32_mask",
-    "_mm_mask_cmpge_epi64_mask",
-    "_mm_mask_cmpge_epi8_mask",
-    "_mm_mask_cmpge_epu16_mask",
-    "_mm_mask_cmpge_epu32_mask",
-    "_mm_mask_cmpge_epu64_mask",
-    "_mm_mask_cmpge_epu8_mask",
-    "_mm_mask_cmpgt_epi16_mask",
-    "_mm_mask_cmpgt_epi32_mask",
-    "_mm_mask_cmpgt_epi64_mask",
-    "_mm_mask_cmpgt_epi8_mask",
-    "_mm_mask_cmpgt_epu16_mask",
-    "_mm_mask_cmpgt_epu32_mask",
-    "_mm_mask_cmpgt_epu64_mask",
-    "_mm_mask_cmpgt_epu8_mask",
-    "_mm_mask_cmple_epi16_mask",
-    "_mm_mask_cmple_epi32_mask",
-    "_mm_mask_cmple_epi64_mask",
-    "_mm_mask_cmple_epi8_mask",
-    "_mm_mask_cmple_epu16_mask",
-    "_mm_mask_cmple_epu32_mask",
-    "_mm_mask_cmple_epu64_mask",
-    "_mm_mask_cmple_epu8_mask",
-    "_mm_mask_cmplt_epi16_mask",
-    "_mm_mask_cmplt_epi32_mask",
-    "_mm_mask_cmplt_epi64_mask",
-    "_mm_mask_cmplt_epi8_mask",
-    "_mm_mask_cmplt_epu16_mask",
-    "_mm_mask_cmplt_epu32_mask",
-    "_mm_mask_cmplt_epu64_mask",
-    "_mm_mask_cmplt_epu8_mask",
-    "_mm_mask_cmpneq_epi16_mask",
-    "_mm_mask_cmpneq_epi32_mask",
-    "_mm_mask_cmpneq_epi64_mask",
-    "_mm_mask_cmpneq_epi8_mask",
-    "_mm_mask_cmpneq_epu16_mask",
-    "_mm_mask_cmpneq_epu32_mask",
-    "_mm_mask_cmpneq_epu64_mask",
-    "_mm_mask_cmpneq_epu8_mask",
     "_mm_mask_cmul_pch",
     "_mm_mask_cmul_round_sch",
     "_mm_mask_cmul_sch",
@@ -23524,5 +28134,5 @@
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 1111
+  "unique_names": 1399
 }

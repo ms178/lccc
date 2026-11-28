@@ -33,6 +33,30 @@
 #     The cast cells hold one more form of plain `volatile` to the same
 #     rule: a cast to a pointer to a typedef name that is volatile, the
 #     register idiom `*(vu32 *)ADDR`, whose object used to be read once.
+#  7. a pointer object that is itself volatile -- `T *volatile p`, a function
+#     pointer `int (*volatile f)(int)`, `volatile fn_t f` with `fn_t` a typedef
+#     of a pointer -- is stored and loaded where the program says.  The slot
+#     of such a local was an ordinary one (only a volatile POINTEE was looked
+#     at when the slot was made), so its initializer was forwarded to its
+#     first read, and a function pointer never reached memory at all: with
+#     `static int h(int a) { return a + 1; }`, `int (*volatile f)(int) = h;
+#     return f(1);` was `movl $2, %eax`, where GCC 16.2 stores `h`, loads it
+#     back and jumps through what it loaded.
+#     Each cell must write the slot and read it back, the calls must go
+#     through what was read, and the same code with a plain pointer is the
+#     control: there no slot is left.
+#  8. the initializer of a volatile object is written, whatever is assigned
+#     next.  Its stores were plain ones, and a plain store is dead under a
+#     later store of the same bytes: `volatile struct s v = {1, 2}; v.a = 3;`
+#     never wrote the 1, `volatile char c[8] = "abcdefg"; c[0] = 'x';` never
+#     the 'a', `volatile int x = 1; x = 2;` (before item 7's change) never
+#     the 1.  GCC 16.2 and Clang 23.1 write the initializer and then the
+#     assignment.  Each cell must store every constant its initializer and
+#     its assignments name, a zero fill for what a partial initializer leaves
+#     out, and -- a volatile `_Complex double` initialized with 1.0 and then
+#     `__real__ z = 3.0` -- no half of a double into the object's slot, where
+#     its real part used to be two `movl`.  The control is the same code
+#     without `volatile`: there the initializer's store is gone.
 set -euo pipefail
 
 CCC=${CCC:-./target/fastbuild/lccc}
@@ -171,7 +195,15 @@ for fn in atomic_acc vol_acc; do
     tail_lbl=$(echo "$body" | sed -n "${tail_ln}p" | grep -oE '\.[A-Za-z][A-Za-z0-9_]*' | tail -1)
     head_ln=$(echo "$body" | grep -n "^${tail_lbl}:" | sed -n '1,1p' | cut -d: -f1)
     loop=$(echo "$body" | sed -n "${head_ln},${tail_ln}p")
-    n_ref=$(echo "$loop" | grep -c "$obj" || true)
+    # The volatile object is named by the access itself. The atomic one is
+    # updated by a locked instruction through a register the loop has no
+    # reason to reload (`lock addl $3, (%rsi)`, the `leaq` above the loop):
+    # what must stay inside is that instruction.
+    if [ "$fn" = atomic_acc ]; then
+        n_ref=$(echo "$loop" | grep -cE '^[[:space:]]*lock ' || true)
+    else
+        n_ref=$(echo "$loop" | grep -c "$obj" || true)
+    fi
     case $n_ref in ''|*[!0-9]*) n_ref=0 ;; esac
     # Here-string, not `echo | grep -q`: under `set -o pipefail` the early-exiting
 # consumer SIGPIPEs the producer and the pipeline reports failure even when the
@@ -405,6 +437,132 @@ if [[ -x "$i686_cc" ]]; then
 else
     echo "SKIP: i686 volatile codegen ($i686_cc not built)"
 fi
+
+# 7. volatile pointer objects.
+cat >"$td/ptr.c" <<'EOF'
+static int h(int a) { return a + 1; }
+typedef int (*fn_t)(int);
+int ptr_init(int *v) { int *volatile p = v; return *p; }
+int ptr_assign(int *v) { int *volatile p; p = v; return *p; }
+void *void_ptr_assign(void *v) { void *volatile p; p = v; return p; }
+int fn_init(void) { int (*volatile f)(int) = h; return f(1); }
+int fn_typedef(fn_t v) { volatile fn_t f = v; return f(2); }
+int fn_assign(fn_t v) { fn_t volatile f; f = v; return f(3); }
+int plain_ptr(int *v) { int *p = v; return *p; }
+int plain_fn(void) { int (*f)(int) = h; return f(1); }
+EOF
+frame_store='mov[a-z]* +[^,(]+, *-?[0-9]*\(%(rsp|rbp)\)'
+frame_load='(mov[a-z]* +-?[0-9]*\(%(rsp|rbp)\), *%|(call|jmp)q? +\*-?[0-9]*\(%(rsp|rbp)\))'
+for lvl in O1 O2 O3 Os; do
+    echo "== volatile pointer objects, $lvl"
+    "$CCC" -$lvl -S "$td/ptr.c" -o "$td/ptr.s" || { echo "FAIL: compile ptr.c at -$lvl"; rc=1; continue; }
+    for fn in ptr_init ptr_assign void_ptr_assign fn_init fn_typedef fn_assign; do
+        body=$(awk -v f="$fn" '$0==f":"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/ptr.s")
+        stores=$(echo "$body" | grep -Ec "$frame_store" || true)
+        loads=$(echo "$body" | grep -Ec "$frame_load" || true)
+        if [ "$stores" -ge 1 ] && [ "$loads" -ge 1 ]; then
+            echo "ok: $fn writes its volatile pointer and reads it back"
+        else
+            echo "FAIL: $fn: $stores store(s) and $loads load(s) of the volatile pointer's slot"
+            echo "$body" | sed 's/^/      /'
+            rc=1
+        fi
+        case $fn in fn_*)
+            if grep -Eq '(call|jmp)q? +\*' <<<"$body"; then
+                echo "ok: $fn calls through the pointer it read"
+            else
+                echo "FAIL: $fn does not call through its volatile pointer"
+                echo "$body" | sed 's/^/      /'
+                rc=1
+            fi ;;
+        esac
+    done
+    # The control: the same code with a plain pointer leaves no slot, so the
+    # accesses counted above are the volatile object's.
+    for fn in plain_ptr plain_fn; do
+        body=$(awk -v f="$fn" '$0==f":"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/ptr.s")
+        if grep -Eq "$frame_store|$frame_load" <<<"$body"; then
+            echo "FAIL: $fn (plain pointer, the control) touches the frame at -$lvl"
+            echo "$body" | sed 's/^/      /'
+            rc=1
+        else
+            echo "ok: $fn, the control, keeps its pointer out of memory"
+        fi
+    done
+done
+
+# 8. initializers of volatile objects.
+cat >"$td/init.c" <<'EOF'
+struct s { int a, b; };
+int scalar_init(void) { volatile int x = 41; x = 42; return x; }
+int struct_init(void) { volatile struct s v = {41, 42}; v.a = 43; return v.b; }
+int array_init(void) { volatile int a[2] = {41, 42}; a[0] = 43; return a[1]; }
+int partial_init(void) { volatile struct s v = {41}; v.a = 43; v.b = 44; return v.b; }
+int string_init(void) { volatile char c[8] = "ABCDEFG"; c[0] = 'x'; return c[1]; }
+int complex_init(void) { volatile _Complex double z = 1.0; __real__ z = 3.0; return (int)__imag__ z; }
+int plain_struct(void) { struct s v = {41, 42}; v.a = 43; return v.a + v.b; }
+EOF
+# An immediate stored into the frame: `movl $41, 4(%rsp)`.
+stored() { grep -Ec "mov[bwlq] +\\\$$2, *-?[0-9]*\\(%(rsp|rbp)\\)" <<<"$1" || true; }
+for lvl in O1 O2 O3 Os; do
+    echo "== initializers of volatile objects, $lvl"
+    "$CCC" -$lvl -S "$td/init.c" -o "$td/init.s" || { echo "FAIL: compile init.c at -$lvl"; rc=1; continue; }
+    # function:the constants it must store, each at least once.
+    for probe in scalar_init:41,42 struct_init:41,42,43 array_init:41,42,43 partial_init:0,41,43,44 \
+        string_init:65,66,67,68,69,70,71,120; do
+        fn=${probe%%:*}
+        body=$(awk -v f="$fn" '$0==f":"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/init.s")
+        missing=""
+        for value in $(tr ',' ' ' <<<"${probe##*:}"); do
+            [ "$(stored "$body" "$value")" -ge 1 ] || missing="$missing $value"
+        done
+        if [ -z "$missing" ]; then
+            echo "ok: $fn stores what its initializer and its assignments name"
+        else
+            echo "FAIL: $fn at -$lvl never stores:$missing"
+            echo "$body" | sed 's/^/      /'
+            rc=1
+        fi
+    done
+    # A double is one object: no store of half of one into `z`, whose slot
+    # the code generator names (`# LCCC_VOLATILE_SLOT 8(%rsp)`, 16 bytes
+    # from there).  The assigned 3.0 is one 8-byte store at its start; the
+    # initializer is the same, or a copy of all 16 bytes from a temporary
+    # that is no volatile object and may be written as it comes.
+    body=$(awk '$0=="complex_init:"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/init.s")
+    marker=$(sed -n 's/^ *# LCCC_VOLATILE_SLOT \(-\{0,1\}[0-9]*\)(%\(r[sb]p\))$/\1 \2/p' <<<"$body")
+    marker=${marker%%$'\n'*}
+    if [ -z "$marker" ]; then
+        echo "FAIL: complex_init at -$lvl names no volatile slot"
+        echo "$body" | sed 's/^/      /'
+        rc=1
+    else
+        off=${marker%% *}
+        base=${marker##* }
+        halves=0
+        for d in 0 4 8 12; do
+            n=$(grep -Ec "movl +[^,]+, *$((off + d))\\(%$base\\)" <<<"$body" || true)
+            halves=$((halves + n))
+        done
+        wide=$(grep -Ec "(movq|movsd|movlps) +[^,]+, *$off\\(%$base\\)" <<<"$body" || true)
+        if [ "$halves" -eq 0 ] && [ "$wide" -ge 1 ]; then
+            echo "ok: complex_init stores each double of its volatile object whole"
+        else
+            echo "FAIL: complex_init at -$lvl: $halves store(s) of half a double into the volatile slot, $wide whole at its start"
+            echo "$body" | sed 's/^/      /'
+            rc=1
+        fi
+    fi
+    # The control: without `volatile` the 41 is dead under the 43.
+    body=$(awk '$0=="plain_struct:"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/init.s")
+    if [ "$(stored "$body" 41)" -eq 0 ]; then
+        echo "ok: plain_struct, the control, drops the store its assignment covers"
+    else
+        echo "FAIL: plain_struct (the control) at -$lvl still stores the 41 it overwrites"
+        echo "$body" | sed 's/^/      /'
+        rc=1
+    fi
+done
 
 riscv_cc=${CCC_RISCV:-"$(dirname "$CCC")/lccc-riscv"}
 if [[ -x "$riscv_cc" ]]; then

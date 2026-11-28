@@ -11,7 +11,9 @@ use super::lower::Lowerer;
 use super::structs::ExtVectorSelection;
 use crate::common::types::{AddressSpace, CType, IrType, SsoMode, widened_op_type};
 use crate::frontend::parser::ast::{BinOp, Expr};
-use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Value};
+use crate::ir::reexports::{
+    AtomicRmwOp, Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Value,
+};
 
 impl Lowerer {
     /// `v.yz = w` / `p->xy = w` / `n.wzyx.zw = w`: a multi-lane ext-vector
@@ -1145,6 +1147,17 @@ impl Lowerer {
     // -----------------------------------------------------------------------
 
     pub(super) fn lower_compound_assign(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Operand {
+        // `%=`, the shifts and the bitwise forms with a floating operand:
+        // refused here as their binary operators are, before any of the
+        // paths below picks a floating operation there is no code for.
+        if crate::frontend::sema::integer_operands_only(*op) {
+            let (lhs_ty, rhs_ty) = (self.get_expr_type(lhs), self.get_expr_type(rhs));
+            if let Some(rejected) =
+                self.reject_floating_operand_of_integer_operator(op, lhs, rhs, lhs_ty, rhs_ty)
+            {
+                return rejected;
+            }
+        }
         // Vector compound assignment (element-wise)
         let lhs_ct = self.expr_ctype(lhs);
         if lhs_ct.is_vector() {
@@ -1341,10 +1354,6 @@ impl Lowerer {
             self.lower_expr_with_type(rhs, op_ty)
         };
         if let Some(lv) = self.lower_lvalue_for_mutation(lhs) {
-            let loaded = self.load_lvalue_typed(&lv, ty);
-            let loaded_promoted =
-                self.promote_for_op(loaded, ty, lhs_ir_ty, op_ty, common_ty, is_shift);
-
             let is_unsigned = if is_shift {
                 Self::integer_promote(lhs_ir_ty).is_unsigned()
             } else {
@@ -1378,6 +1387,51 @@ impl Lowerer {
                 rhs_val
             };
 
+            let traps = self.signed_overflow_traps()
+                && !self.is_bool_lvalue(lhs)
+                && ty != IrType::Ptr
+                && !is_unsigned
+                && common_ty.is_signed()
+                && matches!(ir_op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul);
+
+            // The object's current value. For an `_Atomic` object this opens
+            // the read-modify-write (see `atomic_access`): one instruction
+            // where the operator is one the low bits of the operands decide
+            // -- so that narrowing the other operand first changes nothing
+            // -- and a compare-exchange loop around the computation below
+            // otherwise.
+            let atomic = self.atomic_target(&lv, ty).map(|ptr| {
+                let rmw = match ir_op {
+                    IrBinOp::Add => Some(AtomicRmwOp::Add),
+                    IrBinOp::Sub => Some(AtomicRmwOp::Sub),
+                    IrBinOp::And => Some(AtomicRmwOp::And),
+                    IrBinOp::Or => Some(AtomicRmwOp::Or),
+                    IrBinOp::Xor => Some(AtomicRmwOp::Xor),
+                    _ => None,
+                }
+                .filter(|_| {
+                    !traps
+                        && !op_ty.is_float()
+                        && (ty == IrType::Ptr || ty.is_integer())
+                        && !self.is_bool_lvalue(lhs)
+                })
+                .map(|rmw| {
+                    let operand = if ty == IrType::Ptr {
+                        actual_rhs
+                    } else {
+                        self.narrow_from_op(actual_rhs, ty, lhs_ir_ty, op_ty)
+                    };
+                    (rmw, operand)
+                });
+                self.begin_atomic_update(ptr, ty, rmw)
+            });
+            let loaded = match &atomic {
+                Some((_, old)) => *old,
+                None => self.load_lvalue_typed(&lv, ty),
+            };
+            let loaded_promoted =
+                self.promote_for_op(loaded, ty, lhs_ir_ty, op_ty, common_ty, is_shift);
+
             if let Some((full_val, full_ty)) = rhs_full_for_shift {
                 let promoted_lhs = Self::integer_promote(lhs_ir_ty);
                 let rhs_prom = if full_ty != rhs_promoted_ty {
@@ -1407,13 +1461,7 @@ impl Lowerer {
                 }
             }
 
-            let result = if self.signed_overflow_traps()
-                && !self.is_bool_lvalue(lhs)
-                && ty != IrType::Ptr
-                && !is_unsigned
-                && common_ty.is_signed()
-                && matches!(ir_op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul)
-            {
+            let result = if traps {
                 self.emit_trapv_signed_binop(ir_op, loaded_promoted, actual_rhs, common_ty, op_ty)
             } else {
                 self.emit_binop_val(ir_op, loaded_promoted, actual_rhs, op_ty)
@@ -1428,7 +1476,10 @@ impl Lowerer {
             } else {
                 self.narrow_from_op(Operand::Value(result), ty, lhs_ir_ty, op_ty)
             };
-            self.store_lvalue_typed(&lv, store_val, ty);
+            match atomic {
+                Some((update, old)) => self.finish_atomic_update(update, old, store_val),
+                None => self.store_lvalue_typed(&lv, store_val, ty),
+            }
             return store_val;
         }
         rhs_val

@@ -64,6 +64,20 @@ use for would compute something for them, and a program GCC and Clang
 refuse would compile here and nowhere else; an assembler that stops at the
 operand has no line of the program to name.
 
+An argument is converted to its parameter's type, and in the tests above no
+argument needs it: each is an object of exactly that type. So every
+intrinsic with a scalar parameter is called twice more with its scalar
+arguments in objects of another arithmetic type. `_mm_insert_epi32@` passes
+a `double` where the element is an `int` (the value with three quarters
+beside it, which the conversion truncates away) and a `long long` where a
+parameter is floating; `_mm_insert_epi32&` passes an integer of another
+width: a `long long` whose upper half the conversion has to drop where the
+parameter is narrower, an `int` or a `signed char` it has to extend where
+the parameter is 64 bits. Both compilers read the same line, and the hash
+is GCC's. (lccc's headers wrote some intrinsics as macros over a builtin
+without a prototype, and what was passed was what was written: the element
+of `_mm_insert_epi32(v, d, 1)` was the low half of the double.)
+
 `--also clang-23` adds a second reference: a test the references do not
 agree on is reported as theirs, not as lccc's. `--as AS` (GNU as 2.47) holds
 what `lccc -S` writes for the tests to the assembler everybody else uses.
@@ -102,6 +116,12 @@ from scripts import x86_intrinsic_census as census  # noqa: E402
 
 ROUNDS = 48
 BUFFER = 256
+# What FXSAVE and the XSAVE family write is the state the processor has, not
+# an operand's width: 512 bytes for FXSAVE, and for XSAVE whatever the mask
+# selects of what CPUID leaf 0DH counts (2,696 bytes with AVX-512, 10,944
+# with AMX tiles). Their buffer is larger than any of that.
+STATE_AREA = re.compile(r"^_f?x(save|rstor)")
+STATE_BUFFER = 16384
 TARGET = ["-march=native", "-ffp-contract=off"]
 HEAD = ("#include <immintrin.h>\n#include <x86intrin.h>\n"
         "void lv_begin(const char *, const char *); void lv_end(void);\n"
@@ -120,6 +140,33 @@ SCALES = [1, 2, 4, 8]
 MOST_VARIANTS = 40
 # How many of them are also written with the immediates as expressions.
 EXPRESSION_TWINS = 3
+# How a scalar argument is written when it is not an object of its
+# parameter's type (the two conversion twins of a test, in this order).
+CONVERSIONS = ("@", "&")
+# Integer parameter types, each with the cast under which every value is one
+# a `double` holds exactly with three quarters beside it and that the type
+# holds again once the fraction is truncated away.
+CARRIED_INTEGERS = {
+    "char": "", "short": "", "int": "", "unsigned char": "", "unsigned short": "",
+    "unsigned int": "", "unsigned": "", "__mmask8": "", "__mmask16": "", "__mmask32": "",
+    "long long": "(int)", "long long int": "(int)",
+    "unsigned long long": "(unsigned)", "__mmask64": "(unsigned)",
+}
+# The same types by what an integer of another width is for each: the
+# unsigned type of its own width for the narrow ones (a `long long` carries
+# the value under an upper half the conversion drops), and a narrower signed
+# type for the 64-bit ones (the conversion extends its sign).
+CARRIED_NARROW = {
+    "char": "unsigned char", "short": "unsigned short", "int": "unsigned",
+    "unsigned char": "unsigned char", "unsigned short": "unsigned short",
+    "unsigned int": "unsigned", "unsigned": "unsigned", "__mmask8": "unsigned char",
+    "__mmask16": "unsigned short", "__mmask32": "unsigned",
+}
+CARRIED_WIDE = {
+    "long long": "int", "long long int": "int",
+    "unsigned long long": "signed char", "__mmask64": "signed char",
+}
+CARRIED_FLOATS = ("float", "double")
 # Constants far from every range: of the choices GCC refuses, the ones with
 # these are asked of lccc, beside the one next to the range.
 FAR = (256, -1)
@@ -377,20 +424,28 @@ class Test:
         self.name, self.returns, self.parameters, self.constants = (
             name, returns, parameters, constants)
         # How the immediates are written: "" the literal, "~" the expression
-        # `-(-N)`, "?" an object the running program reads N from.
+        # `-(-N)`, "?" an object the running program reads N from. Or how the
+        # scalar arguments are: "@" and "&", objects of another type
+        # (`carrier_of`), beside literal immediates.
         self.spelling = spelling
 
     @property
     def label(self) -> str:
         if not self.constants:
-            return self.name
+            return self.name + self.spelling
         return (self.name + "#" + ",".join(str(self.constants[i]) for i in sorted(self.constants))
                 + self.spelling)
 
     @property
     def seed(self) -> str:
         """What the arguments are drawn from: the label without the spelling."""
-        return self.label.rstrip("~?")
+        return self.label.rstrip("~?@&")
+
+    def carried(self) -> list[int]:
+        """The positions whose argument this spelling passes in another type."""
+        return [position for position, (kind, _) in enumerate(self.parameters)
+                if position not in self.constants and "*" not in kind
+                and carrier_of(kind, position, self.spelling) is not None]
 
     def line(self, index: int) -> str:
         """The test as one line of C: a compiler's line number names the test."""
@@ -407,12 +462,13 @@ class Test:
                     passed.append(f"-(-{value})" if self.spelling == "~" else str(value))
             elif "*" in kind:
                 offset = 1 if re.search(r"loadu|storeu|lddqu", name) else 0
-                statics.append(f"static unsigned char b{position}[{BUFFER}] "
+                size = buffer_of(name)
+                statics.append(f"static unsigned char b{position}[{size}] "
                                f"__attribute__((aligned(64)));")
-                setup.append(f"lv_fill(b{position}, {BUFFER}, {fill_kind(kind)});")
+                setup.append(f"lv_fill(b{position}, {size}, {fill_kind(kind)});")
                 passed.append(f"({kind})(void *)(b{position} + {offset})")
                 if not re.search(r"\bconst\b", kind):
-                    after.append(f"lv_mix(b{position}, {BUFFER});")
+                    after.append(f"lv_mix(b{position}, {size});")
             else:
                 plain = re.sub(r"\bconst\b", "", kind).strip()
                 fill = 3 if spelled == "__index" else fill_kind(plain)
@@ -422,7 +478,14 @@ class Test:
                     setup.append(f"a{position} |= 1;")
                 if name in ARGUMENT_RULES and position == 0:
                     setup.append(ARGUMENT_RULES[name])
-                passed.append(f"a{position}")
+                # The argument as the rules above left it, in an object of
+                # another type: the call has to convert it back.
+                carrier = carrier_of(plain, position, self.spelling)
+                if carrier is None:
+                    passed.append(f"a{position}")
+                else:
+                    setup.append(carrier)
+                    passed.append(f"x{position}")
         call = f"{name}({', '.join(passed)})"
         returns = re.sub(r"\bconst\b", "", self.returns).strip()
         if returns == "void":
@@ -438,6 +501,50 @@ class Test:
                 f"\"{self.seed}\"); "
                 f"for (unsigned q = 0; q < {ROUNDS}; q++) {{ {' '.join(setup)} {body} "
                 f"{' '.join(after)} }} lv_end(); }}")
+
+
+def buffer_of(name: str) -> int:
+    """The bytes behind a pointer argument of `name`."""
+    return STATE_BUFFER if STATE_AREA.match(name) else BUFFER
+
+
+def carrier_of(kind: str, position: int, spelling: str) -> str | None:
+    """The statement that puts argument `a<position>` of type `kind` into an
+    object `x<position>` of another arithmetic type, or None where the
+    spelling has no other type for the parameter.
+
+    "@": an integer in a `double`, three quarters past it away from zero, so
+    that only a conversion toward zero gives it back (a 64-bit one by its low
+    half, which a `double` holds exactly); a floating value as a `long long`
+    (an integer of its own, drawn here: an integer cannot carry a NaN).
+    "&": an integer in an integer of another width. A narrow one in a `long
+    long` under an upper half of alternating bits, which the conversion
+    drops; a 64-bit one as an `int` or a `signed char`, which it extends.
+    """
+    kind = " ".join(re.sub(r"\bconst\b", " ", kind).split())
+    a, x = f"a{position}", f"x{position}"
+    if spelling == "@":
+        if kind in CARRIED_INTEGERS:
+            return (f"double {x} = (double){CARRIED_INTEGERS[kind]}{a}; "
+                    f"{x} += {x} < 0 ? -0.75 : 0.75;")
+        if kind in CARRIED_FLOATS:
+            return (f"short s{position}; lv_fill(&s{position}, sizeof s{position}, 0); "
+                    f"long long {x} = s{position};")
+    elif spelling == "&":
+        if kind in CARRIED_NARROW:
+            return (f"long long {x} = (long long)((unsigned long long)({CARRIED_NARROW[kind]}){a}"
+                    f" | 0x5a5a5a5a5a5a5a5aull << 8 * sizeof {a});")
+        if kind in CARRIED_WIDE:
+            return f"{CARRIED_WIDE[kind]} {x} = ({CARRIED_WIDE[kind]}){a};"
+    return None
+
+
+def conversion_twins(test: Test) -> list[Test]:
+    """`test` once per way of passing its scalar arguments in another type,
+    for the ways that change an argument of it."""
+    twins = [Test(test.name, test.returns, test.parameters, dict(test.constants), spelling)
+             for spelling in CONVERSIONS]
+    return [twin for twin in twins if twin.carried()]
 
 
 def fill_kind(kind: str) -> int:
@@ -669,7 +776,8 @@ def combination(choices: list[list[int]], index: int) -> tuple[int, ...]:
 def variants_of(name: str, returns: str, shape: list[tuple[str, str]],
                 positions: list[int]) -> list[Test]:
     if not positions:
-        return [Test(name, returns, shape, {})]
+        plain = Test(name, returns, shape, {})
+        return [plain] + conversion_twins(plain)
     choices = [candidates_for(name, shape[p][1]) for p in positions]
     count = math.prod(len(choice) for choice in choices)
     picked = range(count)
@@ -680,9 +788,11 @@ def variants_of(name: str, returns: str, shape: list[tuple[str, str]],
     tests = [Test(name, returns, shape, dict(zip(positions, combination(choices, index))))
              for index in picked]
     # One twin per choice: where the literal is not valid for the intrinsic,
-    # GCC drops the twin with it.
-    return tests + [Test(name, returns, shape, dict(test.constants), "~")
-                    for test in tests[:EXPRESSION_TWINS]]
+    # GCC drops the twin with it. The conversion twins go with the same
+    # choices, so that one of them survives where an expression twin does.
+    return (tests + [Test(name, returns, shape, dict(test.constants), "~")
+                     for test in tests[:EXPRESSION_TWINS]]
+            + [twin for test in tests[:EXPRESSION_TWINS] for twin in conversion_twins(test)])
 
 
 def refused_constants(tests: list[Test], invalid: set[int]) -> list[Test]:

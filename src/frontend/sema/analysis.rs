@@ -243,6 +243,28 @@ pub struct SemaResult {
     /// Every object declared at file scope, in declaration order, for the debug
     /// information's `DW_TAG_variable` set (see [`FileScopeObject`]).
     pub file_scope_objects: Vec<FileScopeObject>,
+    /// The association each `_Generic` selects, keyed by its controlling
+    /// operand, for every selection sema decided on an operand type it knew.
+    /// The qualifiers that tell `volatile int *` from `int *` and `_Atomic
+    /// int *` live in sema's records (`PtrQuals`, the symbol table's object
+    /// qualifiers), which the lowerer does not have: left to its own
+    /// qualifier-blind match it took the first association of the right
+    /// shape. It reads the verdict here and keeps its own rule for what
+    /// sema never visited.
+    pub generic_choices: FxHashMap<ExprId, (Span, u32)>,
+    /// The lvalue expressions whose object is `_Atomic`-qualified (C11
+    /// 6.2.5p27), recorded where sema met them as the operand of an
+    /// assignment, a compound assignment, `++`/`--`, or an lvalue
+    /// conversion. Reading, writing and updating such an object is an atomic
+    /// operation (6.5.2.4p2, 6.5.16.2p3: "a read-modify-write operation with
+    /// memory_order_seq_cst"), and whether an lvalue designates one is a
+    /// question about qualifiers, which only sema records. Empty in a
+    /// translation unit that never says `_Atomic`.
+    ///
+    /// Both maps carry the expression's span beside its identity: an
+    /// `ExprId` is the node's address, and a reader that finds a span other
+    /// than its own node's is looking at a stale address, not at this node.
+    pub atomic_lvalues: FxHashMap<ExprId, Span>,
 }
 
 impl Default for SemaResult {
@@ -256,6 +278,8 @@ impl Default for SemaResult {
             enumerator_refs: FxHashMap::default(),
             local_address_returns: FxHashSet::default(),
             file_scope_objects: Vec::new(),
+            generic_choices: FxHashMap::default(),
+            atomic_lvalues: FxHashMap::default(),
         }
     }
 }
@@ -306,6 +330,8 @@ pub struct SemanticAnalyzer {
     /// Association indices resolved before a _Generic's tag/typedef scope
     /// disappears. None records an unresolved selection, not a cache miss.
     generic_selections: FxHashMap<ExprId, Option<usize>>,
+    /// `TranslationUnit::uses_atomic` of the unit being analyzed.
+    unit_uses_atomic: bool,
     /// Identifier callees bound to objects, not same-named noreturn functions.
     /// Retain the binding kind after its block scope disappears.
     object_call_bindings: FxHashSet<ExprId>,
@@ -468,6 +494,7 @@ impl SemanticAnalyzer {
             current_return_type: None,
             condition_truth: FxHashMap::default(),
             generic_selections: FxHashMap::default(),
+            unit_uses_atomic: false,
             object_call_bindings: FxHashSet::default(),
             function_nesting_stack: Vec::new(),
             prior_file_function_decls: FxHashMap::default(),
@@ -498,6 +525,7 @@ impl SemanticAnalyzer {
     /// Returns Ok(()) on success, or an error count on failure.
     /// All errors are emitted through the DiagnosticEngine with source spans.
     pub fn analyze(&mut self, tu: &TranslationUnit) -> Result<(), usize> {
+        self.unit_uses_atomic = tu.uses_atomic;
         for decl in &tu.decls {
             match decl {
                 ExternalDecl::FunctionDef(func) => {
@@ -1536,6 +1564,7 @@ impl SemanticAnalyzer {
                         decl.is_const(),
                         declarator.attrs.base_volatile_written(),
                         declarator.attrs.base_restrict,
+                        declarator.attrs.base_atomic,
                     ),
                 );
                 let mut resolved_ctype = if declarator.derived.is_empty() {
@@ -1720,6 +1749,7 @@ impl SemanticAnalyzer {
                     decl.is_const(),
                     init_decl.attrs.base_volatile_written(),
                     init_decl.attrs.base_restrict,
+                    init_decl.attrs.base_atomic,
                 );
                 type_builder::build_qualified_ctype_with_base(
                     self,
@@ -2106,6 +2136,7 @@ impl SemanticAnalyzer {
                         decl.is_const(),
                         init_decl.attrs.base_volatile_written(),
                         init_decl.attrs.base_restrict,
+                        init_decl.attrs.base_atomic,
                     ),
                 )
             });
@@ -3712,50 +3743,27 @@ impl SemanticAnalyzer {
                     discarded && matches!(op, UnaryOp::PreInc | UnaryOp::PreDec),
                     2,
                 );
-                if let Some(ty) = self.constraint_operand(operand) {
-                    let message = match op {
-                        UnaryOp::PreInc => operand_constraints::increment(true, &ty),
-                        UnaryOp::PreDec => operand_constraints::increment(false, &ty),
-                        _ => operand_constraints::unary(*op, &ty),
-                    };
-                    self.constraint_error(message, *span);
-                }
-                if matches!(op, UnaryOp::PreInc | UnaryOp::PreDec) {
-                    // `p++` on a pointer to an undefined record type steps by a
-                    // size that is not known: gcc-16.2's own wording, at the
-                    // operator.
-                    self.check_incomplete_pointer_step(operand, *span, *op == UnaryOp::PreInc);
-                    if !self.check_ext_vector_assignable(operand, *span)
-                        && !self.check_ext_vector_step(operand, *op == UnaryOp::PreInc, *span)
-                    {
-                        self.check_lvalue_operand(operand, *span);
-                        let verb = if *op == UnaryOp::PreInc {
-                            "increment"
-                        } else {
-                            "decrement"
-                        };
-                        self.check_readonly_mutation(operand, *span, verb);
+                match op {
+                    UnaryOp::PreInc => self.check_step_operand(operand, true, *span),
+                    UnaryOp::PreDec => self.check_step_operand(operand, false, *span),
+                    _ => {
+                        // `~` of a builtin's floating result
+                        // (`~__builtin_sqrt(x)`) is judged as `~` of any
+                        // floating value is.
+                        let operand_type = self.constraint_operand(operand).or_else(|| {
+                            (*op == UnaryOp::BitNot)
+                                .then(|| self.floating_builtin_operand(operand))
+                                .flatten()
+                        });
+                        if let Some(ty) = operand_type {
+                            self.constraint_error(operand_constraints::unary(*op, &ty), *span);
+                        }
                     }
                 }
             }
             Expr::PostfixOp(op, operand, span) => {
                 self.analyze_write_operand(operand, discarded, 2);
-                if let Some(ty) = self.constraint_operand(operand) {
-                    let message = operand_constraints::increment(*op == PostfixOp::PostInc, &ty);
-                    self.constraint_error(message, *span);
-                }
-                self.check_incomplete_pointer_step(operand, *span, *op == PostfixOp::PostInc);
-                if !self.check_ext_vector_assignable(operand, *span)
-                    && !self.check_ext_vector_step(operand, *op == PostfixOp::PostInc, *span)
-                {
-                    self.check_lvalue_operand(operand, *span);
-                    let verb = if *op == PostfixOp::PostInc {
-                        "increment"
-                    } else {
-                        "decrement"
-                    };
-                    self.check_readonly_mutation(operand, *span, verb);
-                }
+                self.check_step_operand(operand, *op == PostfixOp::PostInc, *span);
             }
             Expr::Assign(lhs, rhs, span) => {
                 self.analyze_write_operand(lhs, discarded, 1);
@@ -4165,6 +4173,20 @@ impl SemanticAnalyzer {
             .expr_type_checker()
             .generic_selection_index(controlling, associations);
         self.generic_selections.insert(expr.id(), selected);
+        // The verdict for the lowerer, when it rests on a known operand type
+        // (a type operand always is one).
+        if let Some(index) = selected {
+            let known = matches!(controlling, Expr::TypeOperand(..))
+                || self
+                    .expr_type_checker()
+                    .infer_expr_ctype(controlling)
+                    .is_some();
+            if known {
+                self.result
+                    .generic_choices
+                    .insert(controlling.id(), (controlling.span(), index as u32));
+            }
+        }
     }
 
     /// A call: builtin argument rules, implicit declarations, noreturn
@@ -4815,6 +4837,25 @@ impl SemanticAnalyzer {
         if let Some(ctype) = checker.infer_expr_ctype(expr) {
             self.result.expr_types.insert(expr.id(), ctype);
         }
+        // An lvalue that designates an `_Atomic` object, for the lowerer
+        // (`SemaResult::atomic_lvalues`). Only the forms that can designate
+        // an object are asked, and none in a unit without the keyword.
+        if self.unit_uses_atomic
+            && matches!(
+                expr,
+                Expr::Identifier(..)
+                    | Expr::Deref(..)
+                    | Expr::ArraySubscript(..)
+                    | Expr::MemberAccess(..)
+                    | Expr::PointerMemberAccess(..)
+            )
+            && self
+                .expr_type_checker()
+                .lvalue_object_cvr(expr)
+                .is_some_and(|cvr| cvr & PtrQuals::ATOMIC != 0)
+        {
+            self.result.atomic_lvalues.insert(expr.id(), expr.span());
+        }
     }
 
     /// Try to evaluate an expression as a compile-time constant using
@@ -4862,9 +4903,10 @@ impl SemanticAnalyzer {
 
     /// The type of `expr` as the operand constraints judge it: the decayed
     /// value type, `None` when unknown. A `void` type counts only where it is
-    /// exact -- a cast to `void`, or a call to a declared, non-builtin
-    /// function -- because builtin signatures are not all modelled and a
-    /// wrong `void` would reject a valid program.
+    /// exact -- a cast to `void`, a call to a declared, non-builtin function,
+    /// or a library builtin with GCC's prototype -- because the other builtin
+    /// signatures are not all modelled and a wrong `void` would reject a
+    /// valid program.
     fn constraint_operand(&self, expr: &Expr) -> Option<CType> {
         // GCC types `c ? v() : 1` as `void` (its one-void-arm extension), so
         // using the value is the void-value error.
@@ -4878,11 +4920,16 @@ impl SemanticAnalyzer {
         // `__builtin_ia32_*` vector builtins are declared to return a vector
         // struct but yield a pointer to the result slot, which
         // `__CCC_M128I_FROM_BUILTIN(e)` = `*(__m128i *)(e)` dereferences.
+        //
+        // A library builtin is the exception: its type is the result of
+        // GCC's prototype of it (`__builtin_strlen(s)` is a `size_t`,
+        // `__builtin_free(p)` a `void`), and the call is lowered by that
+        // prototype.
         if let Expr::FunctionCall(callee, ..) = expr {
-            if matches!(callee.as_ref(), Expr::Identifier(name, _) if builtins::is_builtin(name)
-                && name != "__builtin_choose_expr")
-            {
-                return None;
+            if let Expr::Identifier(name, _) = callee.as_ref() {
+                if builtins::is_builtin(name) && name != "__builtin_choose_expr" {
+                    return builtins::libc_builtin_prototype(name).map(|p| p.result.ctype());
+                }
             }
         }
         let ty = self.expr_type_checker().infer_value_ctype(expr)?;
@@ -4890,6 +4937,71 @@ impl SemanticAnalyzer {
             return None;
         }
         Some(ty)
+    }
+
+    /// The result type of a builtin call, when it is a real floating or a
+    /// complex type.
+    ///
+    /// [`Self::constraint_operand`] has no type for a builtin call: what a
+    /// builtin is declared to return is not always what lowering gives it
+    /// (the vector builtins yield an address), and some return the type of
+    /// an argument. A floating result is neither: no builtin declared to
+    /// return a floating type yields anything else. That is enough for the
+    /// operators that take integers only, where one floating operand is the
+    /// violation whatever the other is. Unjudged, `__builtin_sqrt(x) & 1`,
+    /// `d % __builtin_popcount(n)` and, from the SIMD headers, a `double`
+    /// handed to a mask parameter went to the code generator, which has no
+    /// such instruction and stopped with an internal error.
+    fn floating_builtin_operand(&self, expr: &Expr) -> Option<CType> {
+        self.builtin_call_ctype(expr)
+            .filter(|ty| operand_constraints::is_real_float(ty) || ty.is_complex())
+    }
+
+    /// What a builtin call is declared to yield, as a value type. Exact for
+    /// the scalar builtins and not for every builtin (see
+    /// [`Self::floating_builtin_operand`]): only for naming an operand in a
+    /// diagnostic another operand has already decided.
+    fn builtin_call_ctype(&self, expr: &Expr) -> Option<CType> {
+        let Expr::FunctionCall(callee, ..) = expr else {
+            return None;
+        };
+        if !matches!(callee.as_ref(), Expr::Identifier(name, _) if builtins::is_builtin(name)) {
+            return None;
+        }
+        self.expr_type_checker().infer_value_ctype(expr)
+    }
+
+    /// The operand types of an integer-only operator (`%`, `&`, `|`, `^`,
+    /// `<<`, `>>`) one of whose operands [`Self::constraint_operand`] does
+    /// not type, when the operator is known to be violated all the same: an
+    /// operand is floating for certain (an exactly typed one, or a builtin's
+    /// floating result). The other operand is then named by its declared
+    /// type; where it has none that is an arithmetic type, nothing is
+    /// returned and the lowering, which knows every type, says it.
+    fn integer_only_operands(
+        &self,
+        op: BinOp,
+        lhs: (&Expr, Option<CType>),
+        rhs: (&Expr, Option<CType>),
+    ) -> Option<(CType, CType)> {
+        if !operand_constraints::integer_operands_only(op) {
+            return None;
+        }
+        let floating = |ty: &CType| operand_constraints::is_real_float(ty) || ty.is_complex();
+        let decided = |(expr, exact): &(&Expr, Option<CType>)| match exact {
+            Some(ty) => floating(ty),
+            None => self.floating_builtin_operand(expr).is_some(),
+        };
+        if !decided(&lhs) && !decided(&rhs) {
+            return None;
+        }
+        let named = |(expr, exact): (&Expr, Option<CType>)| {
+            exact.or_else(|| {
+                self.builtin_call_ctype(expr)
+                    .filter(|ty| ty.is_integer() || floating(ty))
+            })
+        };
+        Some((named(lhs)?, named(rhs)?))
     }
 
     /// The type of `expr` for the expression-level constraints that inspect
@@ -4951,8 +5063,9 @@ impl SemanticAnalyzer {
     }
 
     /// Whether an inferred `void` type of `expr` can be trusted: a `(void)`
-    /// cast, or a call to a declared non-builtin function. Callers must have
-    /// inferred `void` first.
+    /// cast, a call to a declared non-builtin function, or a call of a
+    /// library builtin GCC's prototype gives no result
+    /// (`__builtin_abort()`). Callers must have inferred `void` first.
     fn is_exact_void(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Cast(TypeSpecifier::Void, ..) => true,
@@ -4976,7 +5089,9 @@ impl SemanticAnalyzer {
             Expr::FunctionCall(callee, _, _) => matches!(
                 callee.as_ref(),
                 Expr::Identifier(name, _)
-                    if self.result.functions.contains_key(name) && !builtins::is_builtin(name)
+                    if (self.result.functions.contains_key(name) && !builtins::is_builtin(name))
+                        || builtins::libc_builtin_prototype(name)
+                            .is_some_and(|p| p.result == builtins::LibcType::Void)
             ),
             _ => false,
         }
@@ -5080,9 +5195,12 @@ impl SemanticAnalyzer {
                 bit_width,
             }
         }
-        let (Some(lt), Some(rt)) = (self.constraint_operand(lhs), self.constraint_operand(rhs))
-        else {
-            return;
+        let (lt, rt) = match (self.constraint_operand(lhs), self.constraint_operand(rhs)) {
+            (Some(lt), Some(rt)) => (lt, rt),
+            (lt, rt) => match self.integer_only_operands(op, (lhs, lt), (rhs, rt)) {
+                Some(pair) => pair,
+                None => return,
+            },
         };
         if matches!(
             op,
@@ -5180,7 +5298,8 @@ impl SemanticAnalyzer {
                 let distinct = if a_void || b_void {
                     !matches!(op, BinOp::Eq | BinOp::Ne) && a_void != b_void
                 } else {
-                    pointee_compat_at(a, b, false) == PtrCompat::Incompatible
+                    a_space.atomic_conflict(*b_space)
+                        || pointee_compat_at(a, b, false) == PtrCompat::Incompatible
                 };
                 if distinct {
                     self.diagnostics.borrow_mut().warning_with_kind(
@@ -6472,6 +6591,18 @@ dereference it before applying '->' to it?"
                 span,
             );
         }
+        self.check_argument_conversions(name, args, params);
+    }
+
+    /// Each argument of a call of `name` against the parameter it is
+    /// converted to, as if by assignment (C23 6.5.2.2p7); how many arguments
+    /// the call may have is the caller's to judge.
+    fn check_argument_conversions(
+        &self,
+        name: &str,
+        args: &[Expr],
+        params: &[(CType, Option<String>)],
+    ) {
         let checker = self.expr_type_checker();
         // Arguments past the prototype only need a value (C23 6.5.2.2p7).
         for arg in args.iter().skip(params.len()) {
@@ -8118,6 +8249,22 @@ dereference it before applying '->' to it?"
                     return None;
                 }
                 let name = f.name.clone().unwrap_or_default();
+                // A bit-field is not an object an atomic operation can
+                // address: GCC 16.2's constraint and wording (Clang 23
+                // refuses it as a "non-integral type").
+                if f.bit_width.is_some()
+                    && self
+                        .field_own_cvr(f)
+                        .is_some_and(|cvr| cvr & PtrQuals::ATOMIC != 0)
+                {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "bit-field '{}' has atomic type",
+                            f.name.as_deref().unwrap_or("<anonymous>")
+                        ),
+                        f.span,
+                    );
+                }
                 let bit_width = f
                     .bit_width
                     .as_ref()
@@ -8247,26 +8394,57 @@ dereference it before applying '->' to it?"
         }
     }
 
+    /// How many arguments a library function called without a declaration
+    /// takes: a builtin's prototype says it (`__builtin_tan`), and for the
+    /// plain names (`memcpy(d, s)` in a dialect with implicit declarations)
+    /// the table of GCC's verdicts does.
     fn check_libc_builtin_arity(&self, name: &str, argc: usize, span: Span) {
-        let Some(arity) = libc_builtin_arity::libc_builtin_arity(name) else {
-            return;
+        let (min_args, variadic) = match builtins::libc_builtin_prototype(name) {
+            Some(prototype) => (prototype.parameters.len(), prototype.variadic),
+            None => match libc_builtin_arity::libc_builtin_arity(name) {
+                Some(arity) => (arity.min_args, arity.variadic),
+                None => return,
+            },
         };
-        let too_few = argc < arity.min_args;
-        if !too_few && (arity.variadic || argc == arity.min_args) {
+        let too_few = argc < min_args;
+        if !too_few && (variadic || argc == min_args) {
             return;
         }
-        let expected = if arity.variadic { "at least " } else { "" };
+        let expected = if variadic { "at least " } else { "" };
         self.diagnostics.borrow_mut().error(
             format!(
                 "{} arguments to function '{}'; expected {}{}, have {}",
                 if too_few { "too few" } else { "too many" },
                 name,
                 expected,
-                arity.min_args,
+                min_args,
                 argc,
             ),
             span,
         );
+    }
+
+    /// The arguments of a call of a library builtin against GCC's prototype
+    /// of it; `false` for a name that has none.
+    ///
+    /// Nothing checked them: the builtin has no declaration for the call
+    /// checker to read, so `__builtin_strlen(5)`, `__builtin_sqrt("a")` and
+    /// `__builtin_memcpy(d, s, p)` with a pointer `p` were accepted in
+    /// silence and lowered as whatever conversion the two IR types named.
+    /// The number of arguments is judged where the call is seen
+    /// (`check_libc_builtin_arity`).
+    fn check_library_builtin_call(&self, name: &str, args: &[Expr]) -> bool {
+        let Some(prototype) = builtins::libc_builtin_prototype(name) else {
+            return false;
+        };
+        let va_list = self.result.type_context.typedefs.get("__builtin_va_list");
+        let params: Vec<(CType, Option<String>)> = prototype
+            .parameters
+            .iter()
+            .map(|parameter| (parameter.parameter_ctype(va_list), None))
+            .collect();
+        self.check_argument_conversions(name, args, &params);
+        true
     }
 
     fn check_c2y_builtin_call(&mut self, name: &str, args: &[Expr], span: Span) {
@@ -8440,6 +8618,11 @@ dereference it before applying '->' to it?"
     /// than duplicating arity, pointer, record, and conversion rules here.
     /// Returning true means the name was handled, including an arity error.
     fn check_gcc17_builtin_call(&self, name: &str, args: &[Expr], span: Span) -> bool {
+        // A library builtin has GCC's prototype; the four below are builtins
+        // GCC gives no type as a value, and have no library function.
+        if self.check_library_builtin_call(name, args) {
+            return true;
+        }
         let void_ptr = || CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
         let const_void_ptr = || {
             CType::Pointer(
@@ -8447,54 +8630,23 @@ dereference it before applying '->' to it?"
                 PtrQuals::recorded(AddressSpace::Default, PtrQuals::CONST),
             )
         };
-        let const_char_ptr = || {
-            CType::Pointer(
-                Box::new(CType::Char),
-                PtrQuals::recorded(AddressSpace::Default, PtrQuals::CONST),
-            )
-        };
-        let double_ptr = || CType::Pointer(Box::new(CType::Double), PtrQuals::GENERIC);
-        let float_ptr = || CType::Pointer(Box::new(CType::Float), PtrQuals::GENERIC);
         let param = |ty| (ty, None);
         let size_t = if crate::common::types::target_is_32bit() {
             CType::UInt
         } else {
             CType::ULong
         };
-        let const_void_param = param(const_void_ptr());
-        let const_char_param = param(const_char_ptr());
-        let size_param = param(size_t);
         let params = match name {
-            // GCC's GNU aliases have no ordinary declaration to validate the
-            // call against. Their libc signatures still matter: a wrong
-            // pointer or width here is a silent ABI miscompile, not merely a
-            // missing diagnostic.
-            "__builtin_bcmp" => {
-                vec![
-                    const_void_param.clone(),
-                    const_void_param.clone(),
-                    size_param,
-                ]
-            }
-            "__builtin_bzero" => vec![param(void_ptr()), size_param],
-            "__builtin_bcopy" => {
-                vec![const_void_param, param(void_ptr()), size_param]
-            }
-            "__builtin_strdup" => vec![const_char_param],
-            "__builtin_strndup" => vec![const_char_param, size_param],
-            "__builtin_ilogb" => vec![param(CType::Double)],
-            "__builtin_modf" => vec![param(CType::Double), param(double_ptr())],
-            "__builtin_modff" => vec![param(CType::Float), param(float_ptr())],
-            "__builtin_strncasecmp" => {
-                vec![const_char_param.clone(), const_char_param, size_param]
-            }
             "__builtin_memcmp_eq" => {
-                vec![const_void_param.clone(), const_void_param, size_param]
+                vec![
+                    param(const_void_ptr()),
+                    param(const_void_ptr()),
+                    param(size_t),
+                ]
             }
             "__builtin_stack_save" => Vec::new(),
             "__builtin_stack_restore" => vec![param(void_ptr())],
             "__builtin_cexpi" => vec![param(CType::Double)],
-            "__builtin_cpow" => vec![param(CType::ComplexDouble), param(CType::ComplexDouble)],
             _ => return false,
         };
         self.check_call_arguments(name, args, &params, false, span);
@@ -10216,6 +10368,55 @@ dereference it before applying '->' to it?"
         }
     }
 
+    /// The operand of `++` or `--`, prefix or postfix (C11 6.5.2.4p1,
+    /// 6.5.3.1p1): a modifiable lvalue of real or pointer type.
+    fn check_step_operand(&self, operand: &Expr, increment: bool, span: Span) {
+        // An array or a function designator is said once, as GCC says it,
+        // and none of the other checks of a step applies to it.
+        if self.check_designator_step(operand, increment, span) {
+            return;
+        }
+        if let Some(ty) = self.constraint_operand(operand) {
+            self.constraint_error(operand_constraints::increment(increment, &ty), span);
+        }
+        // `p++` on a pointer to an undefined record type steps by a size
+        // that is not known: gcc-16.2's own wording, at the operator.
+        self.check_incomplete_pointer_step(operand, span, increment);
+        if !self.check_ext_vector_assignable(operand, span)
+            && !self.check_ext_vector_step(operand, increment, span)
+        {
+            self.check_lvalue_operand(operand, span);
+            let verb = if increment { "increment" } else { "decrement" };
+            self.check_readonly_mutation(operand, span, verb);
+        }
+    }
+
+    /// `++` and `--` of an array or of a function designator (C11 6.5.2.4p1,
+    /// 6.5.3.1p1: a modifiable lvalue of real or pointer type). The operand
+    /// converts to a pointer value, and a value is nothing to step: GCC
+    /// 16.2 says `lvalue required as increment operand`. lccc stepped the
+    /// address it had taken. Judged on the operand's own type, before the
+    /// conversion: a parameter written as an array is a pointer and steps.
+    /// Returns whether it reported.
+    fn check_designator_step(&self, operand: &Expr, increment: bool, span: Span) -> bool {
+        // A string literal is an array too, whatever type inference calls
+        // the value it becomes.
+        let designator = matches!(
+            operand,
+            Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..)
+        ) || matches!(
+            self.expr_type_checker().infer_expr_ctype(operand),
+            Some(CType::Array(..) | CType::Function(_))
+        );
+        if designator {
+            let what = if increment { "increment" } else { "decrement" };
+            self.diagnostics
+                .borrow_mut()
+                .error(format!("lvalue required as {what} operand"), span);
+        }
+        designator
+    }
+
     /// GCC 16.2 rejects an assignment whose left operand has array type
     /// with `assignment to expression with array type` (C11 6.5.16p1),
     /// reported BEFORE the const check (measured: `const int a[2]` says
@@ -10228,13 +10429,23 @@ dereference it before applying '->' to it?"
         // The assigned expression's own type decides: `*a` of a 1-D array
         // is the element (a legal assignment), `*a` of a 2-D array is the
         // inner array (measured on gcc-16.2.0), and `a` itself is the array.
-        let is_array = matches!(tc.infer_expr_ctype(target), Some(CType::Array(..)));
+        let target_type = tc.infer_expr_ctype(target);
+        let is_array = matches!(target_type, Some(CType::Array(..)));
         if is_array {
             self.diagnostics
                 .borrow_mut()
                 .error("assignment to expression with array type".to_string(), span);
         }
-        is_array
+        // A function designator is no object to assign to either (`f = g`,
+        // `f -= 1`): GCC's wording for it. lccc stored through the address.
+        let is_function = matches!(target_type, Some(CType::Function(_)));
+        if is_function {
+            self.diagnostics.borrow_mut().error(
+                "lvalue required as left operand of assignment".to_string(),
+                span,
+            );
+        }
+        is_array || is_function
     }
 
     /// Is `target` the selection of a BIT-FIELD member (through `.`, `->`, or
@@ -10850,6 +11061,7 @@ dereference it before applying '->' to it?"
                 param.is_const,
                 param.volatile_written(),
                 param.base_restrict,
+                param.is_atomic,
             ),
         )
     }
@@ -10874,7 +11086,12 @@ dereference it before applying '->' to it?"
     }
 
     fn field_ctype(&self, f: &StructFieldDecl) -> CType {
-        let written = written_cvr(f.base_const, f.base_volatile_written(), f.base_restrict);
+        let written = written_cvr(
+            f.base_const,
+            f.base_volatile_written(),
+            f.base_restrict,
+            f.base_atomic,
+        );
         // Resolved vector sizes are already `TypeSpecifier::Vector` nodes
         // (see Parser::apply_pending_vector_attr). A size that needed sema's
         // layout engine is resolved here and inserted at the same position.
@@ -10921,7 +11138,12 @@ dereference it before applying '->' to it?"
     /// a qualifier (`fold_simple_derived`), so a folded star's own bits are
     /// exactly none.
     fn field_own_cvr(&self, f: &StructFieldDecl) -> Option<u8> {
-        let written = written_cvr(f.base_const, f.base_volatile_written(), f.base_restrict);
+        let written = written_cvr(
+            f.base_const,
+            f.base_volatile_written(),
+            f.base_restrict,
+            f.base_atomic,
+        );
         if !f.derived.is_empty() {
             let ty = self.field_ctype(f);
             return type_builder::declarator_own_cvr(&f.derived, &ty, || {
@@ -11239,10 +11461,13 @@ pub(super) fn fold_to_type(
 }
 
 /// The qualifiers written in a declaration's specifiers, as `PtrQuals` bits.
-fn written_cvr(is_const: bool, is_volatile: bool, is_restrict: bool) -> u8 {
+/// `is_volatile` is the keyword (`base_volatile_written`), not the access
+/// flag `_Atomic` sets with it; `is_atomic` is `_Atomic` itself.
+fn written_cvr(is_const: bool, is_volatile: bool, is_restrict: bool, is_atomic: bool) -> u8 {
     u8::from(is_const) * PtrQuals::CONST
         | u8::from(is_volatile) * PtrQuals::VOLATILE
         | u8::from(is_restrict) * PtrQuals::RESTRICT
+        | u8::from(is_atomic) * PtrQuals::ATOMIC
 }
 
 impl type_builder::TypeConvertContext for SemanticAnalyzer {
@@ -11663,12 +11888,22 @@ fn enum_matches_integer(a: &CType, b: &CType) -> bool {
 /// The qualifiers of `from`'s pointee that pointer type `to`'s pointee lacks,
 /// when both are recorded (see `PtrQuals`), and whether that pointee is an
 /// array (its elements carry them).
+///
+/// `_Atomic` alone is never a discarded qualifier. Between two object types
+/// it makes the pointers incompatible (`pointer_argument_compat`), so the
+/// only conversion that reaches here with one is to or from `void *`, and
+/// there "assignments between atomic and non-atomic objects are OK" (GCC's
+/// `convert_for_assignment` masks it out of the test): `void *p = &flag;`
+/// and `memcpy(dst, &flag, n)` discard nothing. When another qualifier is
+/// dropped beside it, GCC names both (`volatile _Atomic int v; void *p =
+/// &v;`: "discards '_Atomic volatile' qualifier"), so the returned bits
+/// keep it for the message.
 fn discarded_pointee_qualifiers(from: &CType, to: &CType) -> Option<(u8, bool)> {
     let (CType::Pointer(from_inner, from_quals), CType::Pointer(_, to_quals)) = (from, to) else {
         return None;
     };
     let dropped = from_quals.cvr()? & !to_quals.cvr()?;
-    (dropped != 0).then(|| (dropped, matches!(**from_inner, CType::Array(..))))
+    (dropped & !PtrQuals::ATOMIC != 0).then(|| (dropped, matches!(**from_inner, CType::Array(..))))
 }
 
 fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
@@ -11781,6 +12016,13 @@ fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
             }
             if **from_inner == CType::Void || **to_inner == CType::Void {
                 return PtrCompat::Compatible;
+            }
+            // `_Atomic T` and `T` are not compatible types (C11 6.2.5p27),
+            // so neither pointer converts to the other: gcc-16.2 and
+            // clang-23 both refuse `int *p = &atomic_int_object;` and its
+            // converse, where the other qualifiers are merely discarded.
+            if from_space.atomic_conflict(*to_space) {
+                return PtrCompat::Incompatible;
             }
             pointee_compat(from_inner, to_inner)
         }

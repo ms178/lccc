@@ -472,7 +472,7 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
                     // deleting the subq/addq pair preserves that invariant.
                     ret_paired = pops.len() == pushes
                         && (matches!(infos[q].kind, LineKind::Ret)
-                            || is_direct_sibcall_jmp(&infos[q], infos[q].trimmed(store.get(q))));
+                            || is_sibcall_jmp(store, infos, q));
                     break;
                 }
                 if ret_paired {
@@ -523,7 +523,7 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
                     j += 1;
                     continue;
                 }
-                LineKind::Jmp if is_direct_sibcall_jmp(&infos[j], body) => {
+                LineKind::Jmp | LineKind::JmpIndirect if is_sibcall_jmp(store, infos, j) => {
                     // A sibling-call jmp leaves the function and must be
                     // reached from a collected epilogue addq, same contract
                     // as `ret`.  An unpaired external jmp fails closed —
@@ -672,7 +672,6 @@ fn drop_restated_cfa(store: &LineStore, infos: &mut [LineInfo], start: usize, en
     }
 }
 
-/// Parse `subq $N, %rsp` (constant adjustment only).
 /// A direct jump OUT of the function: the tail-call fold's `jmp sym` /
 /// `jmp sym@PLT` sibling call.  Function-local control flow always targets
 /// a dot-prefixed assembler label (`.LBB*`), and indirect jumps (computed
@@ -688,6 +687,30 @@ fn is_direct_sibcall_jmp(info: &LineInfo, trimmed: &str) -> bool {
     !target.is_empty() && !target.starts_with('.') && !target.starts_with('*')
 }
 
+/// A jump OUT of the function on line `at`: a direct one
+/// ([`is_direct_sibcall_jmp`]), or one through a register or a memory slot
+/// that the codegen published as a sibling call (`# LCCC_TAIL_CALL` behind
+/// it, [`super::liveness::tail_call_marked`]).  The marker is what tells
+/// `return o->fn(1);`'s `jmpq *%r10` from a computed goto, which stays
+/// inside the function and is refused as before: without it the frame
+/// around a call through a pointer stayed when nothing used it,
+///
+/// ```text
+///     subq $8, %rsp
+///     movq (%rdi), %r10
+///     movl $1, %edi
+///     addq $8, %rsp
+///     jmpq *%r10
+/// ```
+///
+/// where GCC 16.2 has `movq (%rdi), %rax; movl $1, %edi; jmp *%rax`.
+fn is_sibcall_jmp(store: &LineStore, infos: &[LineInfo], at: usize) -> bool {
+    is_direct_sibcall_jmp(&infos[at], infos[at].trimmed(store.get(at)))
+        || (matches!(infos[at].kind, LineKind::Jmp | LineKind::JmpIndirect)
+            && super::liveness::tail_call_marked(store, infos, at))
+}
+
+/// Parse `subq $N, %rsp` (constant adjustment only).
 fn parse_subq_rsp(line: &str) -> Option<i64> {
     let rest = line.strip_prefix("subq $")?;
     let val = rest.strip_suffix(", %rsp")?;

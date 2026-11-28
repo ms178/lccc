@@ -4829,6 +4829,36 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 } if x86_fp_pool && !is_32bit => {
                     eligible.insert(dest.0);
                 }
+                // x86-64 SIMD operations with an integer result: a mask, a
+                // lane, a conversion, a test. Their emitters compute in
+                // %rax with %xmm0/%xmm1/%k1 as scratch, none allocatable,
+                // and land the result with the register-aware
+                // `store_rax_to` (`x86_64_integer_result_in_accumulator` is
+                // the list and says how it is held to the emitters). In a
+                // slot, the compare that nearly always follows read it back
+                // from memory.
+                Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op,
+                    ..
+                } if x86_fp_pool
+                    && !is_32bit
+                    && crate::backend::x86_common::x86_64_integer_result_in_accumulator(*op) =>
+                {
+                    eligible.insert(dest.0);
+                }
+                // The halves of a full adder: created for x86-64 alone
+                // (`passes::carry_chain`), whose emitter computes in
+                // %rax/%rcx and lands both results with `store_rax_to`. In a
+                // slot, each link of a chain would store its carry and the
+                // next one load it, between an `adc` and the `adc` it feeds.
+                Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: IntrinsicOp::Carry(_),
+                    ..
+                } => {
+                    eligible.insert(dest.0);
+                }
                 // Session 28: PHI destinations are real values with real live
                 // intervals (loop-carried state: switch machines, running
                 // pointers).  Without a register home every use reloads them
@@ -14977,6 +15007,20 @@ fn apply_phi_coalesce_assignments_with_config(
             }
         }
 
+        // Bisect aid: CCC_PHI_COALESCE_SKIP=<src-id,...> vetoes the
+        // destructive update for the listed backedge sources (optionally
+        // scoped with CCC_PHI_COALESCE_FUNC=<function name>). Ahead of the
+        // blockers: moving them out of the way is a part of the update,
+        // and one of them may take the home this source would have left.
+        if phi_coalesce_skip_listed_with_config(func, backedge_src, ra_config) {
+            if ra_config.debug_phi_coalesce {
+                lccc::cli::stderr_line(format_args!(
+                    "[PHI_COALESCE] fn={} SKIPPED (env) dest=v{} src=v{} r{}",
+                    func.name, phi_dest, backedge_src, reg.0
+                ));
+            }
+            continue;
+        }
         if let Some(&src_iv) = iv_map.get(&backedge_src) {
             // Same-home class: the values proven to share this home by the
             // pairs applied so far, plus this candidate's own link. In a
@@ -15017,6 +15061,13 @@ fn apply_phi_coalesce_assignments_with_config(
                         assignments,
                         &applied,
                         reg,
+                        (
+                            backedge_src,
+                            seg_cov
+                                .as_ref()
+                                .and_then(|cov| cov.get(&backedge_src))
+                                .map_or(std::slice::from_ref(&src_iv), Vec::as_slice),
+                        ),
                         ra_config.debug_phi_coalesce.then_some(func.name.as_str()),
                     )
                 });
@@ -15041,18 +15092,6 @@ fn apply_phi_coalesce_assignments_with_config(
                 }
                 continue;
             }
-        }
-        // Bisect aid: CCC_PHI_COALESCE_SKIP=<src-id,...> vetoes the
-        // destructive update for the listed backedge sources (optionally
-        // scoped with CCC_PHI_COALESCE_FUNC=<function name>).
-        if phi_coalesce_skip_listed_with_config(func, backedge_src, ra_config) {
-            if ra_config.debug_phi_coalesce {
-                lccc::cli::stderr_line(format_args!(
-                    "[PHI_COALESCE] fn={} SKIPPED (env) dest=v{} src=v{} r{}",
-                    func.name, phi_dest, backedge_src, reg.0
-                ));
-            }
-            continue;
         }
         if ra_config.debug_phi_coalesce {
             lccc::cli::stderr_line(format_args!(
@@ -15105,6 +15144,20 @@ struct PhiBlockerRehome<'a> {
 ///   are constraints AT a call point, so none of Phase 2's call-argument
 ///   waves can apply to it.
 ///
+/// The home the back-edge source leaves (`leaving`: the source and where
+/// it is alive) is a target like any other of its pool, and it is free by
+/// another argument than the rest: where the source is alive it is the one
+/// holder of its register, and with the blockers gone it moves to the
+/// phi's. A blocker that lies strictly inside one piece of the source's
+/// life therefore finds that register empty, whatever the envelopes of the
+/// other values in it say (they share it through holes; csv_field_sum's
+/// `c = *++p` had a parameter around its whole digit loop in the same
+/// register, and both latch copies stayed: 12 instructions a digit for
+/// 10). Strictly inside, because two values may share a register at the
+/// point where one dies and the other is born. Not for a source in a
+/// copy-coalesce group or in an applied pair: its partners hold the same
+/// register while it is alive, and they stay.
+///
 /// x86-64 only (the caller gates it): the i686 callee-saved %esi/%edi have
 /// no byte forms, and no other target's allocator was measured with it.
 /// Returns true after committing the moves.
@@ -15115,15 +15168,29 @@ fn rehome_phi_blockers(
     assignments: &mut FxHashMap<u32, PhysReg>,
     applied: &[PhiCoalesceCandidate],
     phi_reg: PhysReg,
+    leaving: (u32, &[(u32, u32)]),
     debug_fn: Option<&str>,
 ) -> bool {
     let overlaps = |a: (u32, u32), b: (u32, u32)| a.0 <= b.1 && b.0 <= a.1;
+    let in_applied_pair = |v: u32| {
+        applied
+            .iter()
+            .any(|p| p.phi_dest == v || p.backedge_src == v)
+    };
+    // The register the source leaves, and where the source alone holds it.
+    let vacated: Option<(PhysReg, &[(u32, u32)])> = {
+        let (source, alive) = leaving;
+        assignments
+            .get(&source)
+            .copied()
+            .filter(|home| {
+                home.0 != phi_reg.0 && !ctx.groups.contains(&source) && !in_applied_pair(source)
+            })
+            .map(|home| (home, alive))
+    };
     let mut moves: Vec<(u32, PhysReg)> = Vec::with_capacity(blockers.len());
     for &b in blockers {
-        let pinned = ctx.groups.contains(&b)
-            || applied
-                .iter()
-                .any(|p| p.phi_dest == b || p.backedge_src == b);
+        let pinned = ctx.groups.contains(&b) || in_applied_pair(b);
         let Some(&b_iv) = iv_map.get(&b).filter(|_| !pinned) else {
             return false;
         };
@@ -15139,6 +15206,11 @@ fn rehome_phi_blockers(
         // `v816[127,128] v817[128,129] v819[129,130]` chain into three
         // registers and the move failed.
         let occupancy = |r: PhysReg, moves: &[(u32, PhysReg)]| {
+            if vacated.is_some_and(|(home, alive)| {
+                home.0 == r.0 && alive.iter().any(|&(s, e)| s < b_iv.0 && b_iv.1 < e)
+            }) {
+                return (true, true);
+            }
             let mut used = moves.iter().any(|&(_, h)| h.0 == r.0);
             for (&v, &h) in assignments.iter() {
                 if h.0 != r.0 || v == b {
@@ -17678,18 +17750,17 @@ mod phi_coalesce_tests {
         (func, cand)
     }
 
-    /// Runs the production apply path (blocker re-homing enabled) on x86-64.
-    fn apply_with_rehome(
+    /// The production apply path (blocker re-homing enabled) on x86-64.
+    fn apply_rehoming(
         func: &IrFunction,
         cand: PhiCoalesceCandidate,
         assignments: &mut FxHashMap<u32, PhysReg>,
         callee_saved: &[PhysReg],
         member_of: &FxHashMap<u32, u32>,
-    ) -> usize {
+    ) -> Vec<PhiCoalesceCandidate> {
         use crate::common::types::{set_target_elf_machine, target_elf_machine};
         let liveness = compute_live_intervals(func);
         let iv_map = interval_map(&liveness);
-        let before = assignments.clone();
         let saved = target_elf_machine();
         set_target_elf_machine(crate::backend::elf::EM_X86_64);
         // r11, r10, r8, r9, rdi, rsi
@@ -17706,6 +17777,21 @@ mod phi_coalesce_tests {
             &RaConfig::default(),
         );
         set_target_elf_machine(saved);
+        applied
+    }
+
+    /// `apply_rehoming`, and the envelopes of what shares a register checked.
+    fn apply_with_rehome(
+        func: &IrFunction,
+        cand: PhiCoalesceCandidate,
+        assignments: &mut FxHashMap<u32, PhysReg>,
+        callee_saved: &[PhysReg],
+        member_of: &FxHashMap<u32, u32>,
+    ) -> usize {
+        let liveness = compute_live_intervals(func);
+        let iv_map = interval_map(&liveness);
+        let before = assignments.clone();
+        let applied = apply_rehoming(func, cand, assignments, callee_saved, member_of);
         // Whatever moved, no two distinct homes may overlap (inclusive),
         // except the applied pair itself and co-tenants the input already
         // had (a two-address chain touching at its death point keeps that
@@ -17887,6 +17973,301 @@ mod phi_coalesce_tests {
             0
         );
         assert_eq!(at_call, initial);
+    }
+
+    /// csv_field_sum's digit loop: the back-edge source `v2` is live out of
+    /// the loop, and behind the loop a temporary `v5` that begins and ends
+    /// while `v2` is alive was given the phi's home. Every other register
+    /// is taken for the length of `v5`, so the one place for it is the
+    /// register `v2` leaves. `around`, if asked for, shares that register
+    /// with `v2`: it is alive ahead of the loop and in a block behind the
+    /// exit, on a way round the loop, and its envelope covers all of it.
+    /// `touch` lets `v5` begin where that piece of `v2`'s life begins (the
+    /// top of the exit block) or end at the very point `v2` ends.
+    fn exchange_fixture(around: bool, touch: Touch) -> (IrFunction, PhiCoalesceCandidate) {
+        let mut func = IrFunction::new("exchange".to_string(), IrType::I32, vec![], false);
+        let add = |dest: u32, lhs: Operand, rhs: Operand| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: IrType::I32,
+        };
+        let val = |v: u32| Operand::Value(Value(v));
+        let num = |n: i32| Operand::Const(IrConst::I32(n));
+        let constant = |dest: u32, n: i32| Instruction::Copy {
+            dest: Value(dest),
+            src: num(n),
+        };
+        let mut entry = vec![
+            constant(6, 0),
+            Instruction::Copy {
+                dest: Value(1),
+                src: val(6),
+            },
+        ];
+        // What holds the other registers from here to the end; the last
+        // of them has no home unless a test gives it one.
+        entry.extend((20..25).map(|v| constant(v, v as i32)));
+        if around {
+            entry.push(constant(30, 30));
+        }
+        // The source is alive from the top of this block; the temporary
+        // begins behind that.
+        let mut exit = Vec::new();
+        if touch != Touch::Start {
+            exit.push(add(8, val(21), num(1)));
+        }
+        exit.push(add(5, val(20), num(7)));
+        if touch == Touch::End {
+            // `v2` and `v5` are both read last by the same instruction.
+            exit.push(add(9, val(2), val(5)));
+        } else {
+            exit.push(add(4, val(5), num(1)));
+            exit.push(add(9, val(2), val(4)));
+        }
+        exit.extend((20..25).map(|v| add(v + 20, val(9), val(v))));
+        func.blocks = vec![
+            block(
+                0,
+                entry,
+                if around {
+                    Terminator::CondBranch {
+                        cond: val(6),
+                        true_label: BlockId(1),
+                        false_label: BlockId(4),
+                    }
+                } else {
+                    Terminator::Branch(BlockId(1))
+                },
+            ),
+            block(
+                1,
+                vec![add(2, val(1), num(1))],
+                Terminator::CondBranch {
+                    cond: val(2),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: val(2),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(3, exit, Terminator::Return(Some(val(44)))),
+        ];
+        if around {
+            func.blocks
+                .push(block(4, vec![], Terminator::Return(Some(val(30)))));
+        }
+        func.next_value_id = 45;
+        let cand = PhiCoalesceCandidate {
+            phi_dest: 1,
+            backedge_src: 2,
+            block_idx: 2,
+            source_block_idx: 1,
+            source_def_idx: 0,
+            copy_idx: 0,
+        };
+        (func, cand)
+    }
+
+    /// Where the temporary of `exchange_fixture` meets an end of the piece
+    /// of the source's life it lies in.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Touch {
+        No,
+        Start,
+        End,
+    }
+
+    /// The homes of `exchange_fixture`: the phi and the temporary in %rdi,
+    /// the source in %r11 (with `around`, if there), the rest taken.
+    fn exchange_homes(around: bool) -> FxHashMap<u32, PhysReg> {
+        let mut homes: FxHashMap<u32, PhysReg> = [
+            (1, PhysReg(14)),
+            (2, PhysReg(10)),
+            (5, PhysReg(14)),
+            (20, PhysReg(11)),
+            (21, PhysReg(12)),
+            (22, PhysReg(13)),
+            (23, PhysReg(15)),
+        ]
+        .into_iter()
+        .collect();
+        if around {
+            homes.insert(30, PhysReg(10));
+        }
+        homes
+    }
+
+    /// No two values of one register are alive at one point, the phi and
+    /// its source apart: the invariant the exchange rests on and has to
+    /// leave behind.
+    fn assert_one_holder_a_point(
+        func: &IrFunction,
+        homes: &FxHashMap<u32, PhysReg>,
+        applied: &[PhiCoalesceCandidate],
+    ) {
+        let liveness = compute_live_intervals(func);
+        let alive = owned_live_segments(&liveness, &FxHashMap::default());
+        for (&a, &ra) in homes {
+            for (&b, &rb) in homes {
+                let pair = applied.iter().any(|p| {
+                    [p.phi_dest, p.backedge_src] == [a, b] || [p.backedge_src, p.phi_dest] == [a, b]
+                });
+                if a == b || ra != rb || pair {
+                    continue;
+                }
+                for &(s, e) in &alive[&a] {
+                    for &(t, f) in &alive[&b] {
+                        assert!(
+                            e < t || f < s,
+                            "v{a} [{s},{e}] and v{b} [{t},{f}] share r{}: {homes:?}",
+                            ra.0
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phi_blocker_takes_the_home_the_source_leaves() {
+        for around in [false, true] {
+            let (func, cand) = exchange_fixture(around, Touch::No);
+            let initial = exchange_homes(around);
+            assert_one_holder_a_point(&func, &initial, &[]);
+            if around {
+                // The fixture is what it says: the value around the loop has
+                // a hole where the source and the temporary are alive, and
+                // an envelope over both.
+                let liveness = compute_live_intervals(&func);
+                let iv = interval_map(&liveness);
+                assert!(iv[&30].0 < iv[&5].0 && iv[&5].1 < iv[&30].1, "{iv:?}");
+            }
+            let mut homes = initial.clone();
+            let applied = apply_rehoming(&func, cand, &mut homes, &[], &FxHashMap::default());
+            assert_eq!(applied.len(), 1, "around {around}: {homes:?}");
+            assert_eq!(homes[&2], PhysReg(14), "the source has the phi's home");
+            assert_eq!(homes[&5], PhysReg(10), "and the temporary the source's");
+            assert_one_holder_a_point(&func, &homes, &applied);
+            // Nothing else moved.
+            for (v, home) in &initial {
+                if ![2, 5].contains(v) {
+                    assert_eq!(homes[v], *home, "v{v}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phi_blocker_exchange_fails_closed() {
+        let none: FxHashMap<u32, u32> = FxHashMap::default();
+        // The temporary begins or ends where the piece of the source's life
+        // does: two values may share a register at such a point, so the
+        // source's life proves nothing about it.
+        let initial = exchange_homes(false);
+        for touch in [Touch::Start, Touch::End] {
+            let (func, cand) = exchange_fixture(false, touch);
+            let mut homes = initial.clone();
+            assert!(apply_rehoming(&func, cand, &mut homes, &[], &none).is_empty());
+            assert_eq!(homes, initial);
+        }
+
+        let (func, cand) = exchange_fixture(false, Touch::No);
+        // A source in a copy-coalesce group: its partners hold the same
+        // register while it is alive, and they stay.
+        let grouped: FxHashMap<u32, u32> = [(2, 40)].into_iter().collect();
+        let mut homes = initial.clone();
+        assert!(apply_rehoming(&func, cand, &mut homes, &[], &grouped).is_empty());
+        assert_eq!(homes, initial);
+
+        // The source's register is in neither pool (%rdx, 16, is not one of
+        // the body-safe caller-saved registers of this fixture): what was
+        // right for the source's own admission says nothing of a temporary.
+        let mut elsewhere = initial.clone();
+        elsewhere.insert(2, PhysReg(16));
+        elsewhere.insert(24, PhysReg(10));
+        let mut homes = elsewhere.clone();
+        assert!(apply_rehoming(&func, cand, &mut homes, &[], &none).is_empty());
+        assert_eq!(homes, elsewhere);
+
+        // A callee-saved register the source holds is saved already: taken.
+        let mut saved = initial.clone();
+        saved.insert(2, PhysReg(1));
+        let mut homes = saved.clone();
+        let applied = apply_rehoming(&func, cand, &mut homes, &[PhysReg(1)], &none);
+        assert_eq!(applied.len(), 1, "{homes:?}");
+        assert_eq!((homes[&2], homes[&5]), (PhysReg(14), PhysReg(1)));
+        assert_one_holder_a_point(&func, &homes, &applied);
+
+        // A source that an earlier pair of this run tied to another value:
+        // that one is in the register too. (Asked of the rule itself; the
+        // same question without the pair is answered yes.)
+        let liveness = compute_live_intervals(&func);
+        let iv_map = interval_map(&liveness);
+        let alive = owned_live_segments(&liveness, &none);
+        let caller_saved = [10, 11, 12, 13, 14, 15].map(PhysReg);
+        let ctx = PhiBlockerRehome {
+            groups: FxHashSet::default(),
+            callee_saved: &[],
+            caller_saved: &caller_saved,
+            call_points: &liveness.call_points,
+        };
+        let tied = PhiCoalesceCandidate {
+            phi_dest: 2,
+            backedge_src: 43,
+            ..cand
+        };
+        for (pairs, moved) in [(vec![], true), (vec![tied], false)] {
+            let mut homes = initial.clone();
+            assert_eq!(
+                rehome_phi_blockers(
+                    &ctx,
+                    &[5],
+                    &iv_map,
+                    &mut homes,
+                    &pairs,
+                    PhysReg(14),
+                    (2, &alive[&2]),
+                    None,
+                ),
+                moved
+            );
+            assert_eq!(homes[&5], PhysReg(if moved { 10 } else { 14 }));
+        }
+
+        // The veto of `CCC_PHI_COALESCE_SKIP` comes ahead of the blockers:
+        // a temporary moved into the home of a source that then stays would
+        // be two values in one register.
+        let config = RaConfig {
+            phi_coalesce_skip: Some("2".to_string()),
+            ..RaConfig::default()
+        };
+        let liveness = compute_live_intervals(&func);
+        let caller_saved = [10, 11, 12, 13, 14, 15].map(PhysReg);
+        let machine = crate::common::types::target_elf_machine();
+        crate::common::types::set_target_elf_machine(crate::backend::elf::EM_X86_64);
+        let mut homes = initial.clone();
+        let applied = apply_phi_coalesce_assignments_with_config(
+            &func,
+            &liveness,
+            &interval_map(&liveness),
+            &[cand],
+            &mut homes,
+            &[],
+            Some((&none, &caller_saved)),
+            None,
+            &config,
+        );
+        crate::common::types::set_target_elf_machine(machine);
+        assert!(applied.is_empty());
+        assert_eq!(homes, initial);
     }
 
     /// loop_rotate_seq_loops shape: the rotated loop's backedge source `s`

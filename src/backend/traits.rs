@@ -2328,6 +2328,9 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
                     self.store_output_from_reg(operand, ptr, constraint, &all_output_reg_refs);
                 }
             }
+            if let Some(repair) = &trampoline.exit_repair {
+                self.state().emit_fmt(format_args!("    {repair}"));
+            }
             self.state().reg_cache.invalidate_all();
             self.emit_branch_to_block(trampoline.target);
         }
@@ -2939,6 +2942,20 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         _index: &Operand,
         _ty: IrType,
         _bit_clear: bool,
+    ) -> bool {
+        false
+    }
+
+    /// The two halves of a full adder (`IntrinsicOp::Carry`), the word
+    /// directly followed by its carry out on the same operands, emitted
+    /// together: x86 `adc`/`sbb` and `setc`. Returns false when this backend
+    /// has no fused form (the halves are then emitted one by one).
+    fn emit_carry_pair(
+        &mut self,
+        _word: &Value,
+        _out: &Value,
+        _op: crate::ir::intrinsics::CarryOp,
+        _args: &[Operand],
     ) -> bool {
         false
     }

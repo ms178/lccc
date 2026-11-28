@@ -1,5 +1,6 @@
 mod aggregate_abi;
 mod array_init_plan;
+mod atomic_access;
 pub(crate) mod complex;
 pub(crate) mod const_eval;
 mod const_eval_global_addr;
@@ -65,5 +66,6 @@ pub(crate) mod ubsan;
 mod vector_array_init;
 mod vector_simd;
 mod vm_layout;
+mod x86_asm_registers;
 
 pub(crate) use lower::Lowerer;

@@ -176,8 +176,10 @@ fluctuation in a byte-identical executable to optimization.
   copy-free lane loop (28/24 cycles), which is what the CI benchmark
   report compiles with.
   Follow-up landed: the commutative **dying-operand form**
-  (`emit_sse_dying_operand_form`) emits `op %live, %dying` when the second
-  operand's value is at its last use (`value_use_counts == 1`) instead of
+  (`emit_sse_dying_operand_form`) emits `op %live, %dying` when an
+  operand dies at the instruction (`vector_dying_values`: read once, in the
+  block that defines it -- a use count of one also names the hoisted
+  broadcast, whose home every iteration reads) instead of
   copying the live operand into scratch, which removed the per-iteration
   `movdqa` of the loop-invariant broadcast in every SLP-vectorized FP
   loop (`ax`: 6 -> 5 instructions per vector pair; `matmul`, `nbody`,
