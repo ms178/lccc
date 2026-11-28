@@ -2701,15 +2701,24 @@ impl Parser {
                         ),
                         span,
                     );
-                    self.diagnostics.note(
+                    let note = if spelling == "interrupt" {
+                        // No other object is involved: the other party is
+                        // the CPU, and no build option makes an ordinary
+                        // function a handler.
+                        "the CPU enters the handler with an interrupt frame on the stack and \
+                         expects every register preserved and a return through `iret`; \
+                         compiled as an ordinary function it would fault the first time \
+                         the interrupt fires"
+                            .to_string()
+                    } else {
                         format!(
                             "emitting {target}'s default convention under a foreign-ABI \
                              declaration would link and then disagree about the arguments; \
                              define CCC_ALLOW_UNSUPPORTED_ABI only if every object in the \
                              program is built by this compiler"
-                        ),
-                        span,
-                    );
+                        )
+                    };
+                    self.diagnostics.note(note, span);
                 }
             }
         }

@@ -83,6 +83,18 @@ Three verdicts are deliberately *not* "ignore it because gcc does":
   forbidden `xmm`/`x87` use, which we do not track), so honouring it silently
   could hand a caller a clobbered register. It is refused.
 
+* `interrupt` is refused on both x86 targets. It is the contract with the
+  CPU, not with a caller: the handler is entered with an interrupt frame on
+  the stack, preserves every register and returns with `iret`. GCC 16.2
+  (`-O2 -mgeneral-regs-only`) emits, for a handler that adds its error code
+  to a counter, `pushq %rax; movl ticks(%rip), %eax; addl 8(%rsp), %eax;
+  movl %eax, ticks(%rip); popq %rax; addq $8, %rsp; iretq`. lccc compiled it
+  as an ordinary function (the error code read from `%rsi`, two registers
+  overwritten, a `ret` into the saved frame), which links, warns about
+  nothing and faults when the interrupt fires. The table is x86's: on Arm
+  and RISC-V `interrupt` is another attribute and is not read through it.
+
+## Placement
 ## Placement
 
 `ms_struct` and `gcc_struct` are record-layout attributes: gcc honours them on

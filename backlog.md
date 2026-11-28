@@ -1711,6 +1711,12 @@ checks for the prologue contracts; `-fcf-protection` `endbr64` presence/absence 
 `nocf_check`/`cf_check`.
 **Accept:** no attribute in the list is both accepted and unobserved by a gate.
 **Effort** M–L · **ROI** 3.6.
+**Status (2026-11-28).** `interrupt` is refused on both x86 targets: it has a
+row in `ABI_VERDICTS`, and `tests/regression/check_attribute_diagnostics.py`
+re-measures the row against GCC and requires the refusal. Before, the handler
+was compiled as an ordinary function ending in `ret`. Implementing the entry
+and exit (`iret`, every register preserved, the error code popped) is open, as
+is the rest of the list.
 
 #### GP-05 · P0 · W — macro-environment hygiene
 

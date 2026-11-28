@@ -180,7 +180,7 @@ UNIMPLEMENTED = sorted(set("""
 access alloc_align alloc_size artificial assume assume_aligned btf_decl_tag btf_type_tag
 cf_check copy deprecated expected_throw
 fallthrough fd_arg fd_arg_read fd_arg_write flag_enum flatten format
-format_arg hardbool hot indirect_branch indirect_return interrupt leaf malloc
+format_arg hardbool hot indirect_branch indirect_return leaf malloc
 may_alias ms_hook_prologue musttail no_address_safety_analysis
 no_icf no_profile_instrument_function
 no_reorder no_sanitize_address no_sanitize_coverage no_sanitize_thread no_split_stack
