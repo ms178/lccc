@@ -511,6 +511,31 @@ compare o_vaes256.c -march=x86-64-v3 -mvaes -mno-avx
 compare o_vpclmul256.c -mvpclmulqdq
 compare o_vpclmul256.c -march=x86-64 -mvpclmulqdq
 
+# The same permission from the function, with nothing on the command line.
+# The headers have to declare the 256-bit names for it whatever the command
+# line enables: the declarations stood under `#ifdef __AVX2__`, so here (and
+# under `-mvaes -mno-avx2` above) the public name had none, and a call of it
+# was an implicit `int` whose value was the address of the result.
+cat >"$tmp/o_vaes256_target.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("avx,vaes")))
+__m256i aes_enc256(__m256i a, __m256i b) { return _mm256_aesenc_epi128(a, b); }
+EOF
+cat >"$tmp/o_vpclmul256_target.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("avx,vpclmulqdq")))
+__m256i clmul256(__m256i a, __m256i b) { return _mm256_clmulepi64_epi128(a, b, 1); }
+EOF
+cat >"$tmp/o_vaes256_target_short.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("avx")))
+__m256i aes_enc256(__m256i a, __m256i b) { return _mm256_aesenc_epi128(a, b); }
+EOF
+compare o_vaes256_target.c -march=x86-64
+compare o_vpclmul256_target.c -march=x86-64
+compare o_vaes256_target_short.c -march=x86-64
+compare o_vaes256_target_short.c -march=x86-64 -mvaes
+
 # ---------------------------------------------------------------------------
 # AVX-VNNI, AVX-VNNI-INT8 and AVX-VNNI-INT16: three extensions, three bits,
 # three flags.  This is where the audit's live SIGILL case lived: measured

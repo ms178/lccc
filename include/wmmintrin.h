@@ -48,17 +48,16 @@ _mm_aesimc_si128(__m128i __V)
 
 /* === 256-bit AES-NI / VPCLMULQDQ ===
  *
- * The GCC/Clang system headers gate _mm256_aes*_epi128 and
- * _mm256_clmulepi64_epi128 behind __VAES__ / (__VPCLMULQDQ__ && __AVX512F__),
- * which are never defined by a plain -mavx2 build. Without a declaration
- * there is no function signature, and the struct-copy-init lowering
- * misclassifies the call as a small packed return: it spilled the intrinsic's
- * result ADDRESS (8 bytes) and memcpy'd 32 bytes "through" it, corrupting
- * the destination (clmul256 regression). The builtin intercept handles the
- * bodies; these declarations exist so the signatures (sret for 32-byte
- * vector returns) are seeded from the header, exactly like the 128-bit
- * intrinsics above. */
-#ifdef __AVX2__
+ * Declared whatever the command line enables, as GCC's <immintrin.h>
+ * declares them (vaesintrin.h, under a target pragma): whether a call is
+ * allowed is the builtin's own question, asked per function, so
+ * `-mvaes -mno-avx2`, a bare `-mvaes` and `__attribute__((target("vaes")))`
+ * get the instruction and everything else gets the diagnostic. The
+ * declaration is what gives the call its type. This section used to stand
+ * under `#ifdef __AVX2__`; VAES at 256 bits needs AVX, not AVX2, and in
+ * the configurations between the two the public name had no declaration:
+ * the call was the implicit `int`, with the address of the result as its
+ * value. */
 #include <avxintrin.h>
 /* A macro, as _mm_clmulepi64_si128 is: the selector is an immediate of the
  * instruction, and a function's parameter is not one. As a function this
@@ -89,6 +88,5 @@ _mm256_aesdeclast_epi128(__m256i __V, __m256i __R)
 {
     return __CCC_M256I_FROM_BUILTIN(__builtin_ia32_aesdeclast256(__V, __R));
 }
-#endif /* __AVX2__ */
 
 #endif /* _WMMINTRIN_H_INCLUDED */
