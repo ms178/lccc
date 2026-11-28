@@ -2800,6 +2800,7 @@ impl LinearScanAllocator {
     fn find_phase2c_non_span_victim(&self, incoming: &LiveRange) -> Option<usize> {
         if !self.phase2c_span_over_local
             || self.active.is_empty()
+            || incoming.slot_operand_only
             || !(incoming.spans_loop && incoming.span_marked && incoming.span_has_in_loop_use)
         {
             return None;
@@ -6102,5 +6103,23 @@ mod tests {
         alloc.run();
         assert_eq!(alloc.assignments.get(&2), Some(&PhysReg(6)));
         assert!(!alloc.assignments.contains_key(&1));
+    }
+
+    #[test]
+    fn phase2c_non_span_victim_ignores_slot_operand_only_incoming() {
+        let mut short = lr_weighted(1, 5, 12, vec![(12, 100)]);
+        short.spans_loop = false;
+
+        let mut bound = lr_weighted(2, 8, 50, vec![(20, 600), (40, 500)]);
+        bound.spans_loop = true;
+        bound.span_marked = true;
+        bound.span_has_in_loop_use = true;
+        bound.slot_operand_only = true;
+
+        let mut alloc = LinearScanAllocator::new(vec![short, bound], vec![PhysReg(6)]);
+        alloc.phase2c_span_over_local = true;
+        alloc.run();
+        assert_eq!(alloc.assignments.get(&1), Some(&PhysReg(6)));
+        assert!(!alloc.assignments.contains_key(&2));
     }
 }

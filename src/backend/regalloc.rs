@@ -4335,23 +4335,11 @@ fn build_coalesce_groups(
                     .get(&v.0)
                     .copied()
                     .unwrap_or((IrType::I32, 0));
-                let is_32bit = crate::common::types::target_is_32bit();
-                let widen_from_load = load_def_types.get(&v.0).map(|&(ty, _)| ty) == Some(*from_ty)
-                    && load_uses >= 2
-                    && if is_32bit {
-                        matches!(from_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16)
-                            && matches!(to_ty, IrType::I32 | IrType::U32)
-                    } else {
-                        // Unsigned sub-word loads (`movzbl`/`movzwl` on x86-64,
-                        // `ldrb`/`ldrh` on AArch64, `lbu`/`lhu` on RISC-V) zero-
-                        // extend the full 64-bit architectural register, so all
-                        // widening integer casts hold identical register bits.
-                        matches!(from_ty, IrType::U8 | IrType::U16)
-                            && matches!(
-                                to_ty,
-                                IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64
-                            )
-                    };
+                let widen_from_load = crate::common::types::target_is_32bit()
+                    && matches!(from_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16)
+                    && matches!(to_ty, IrType::I32 | IrType::U32)
+                    && load_def_types.get(&v.0).map(|&(ty, _)| ty) == Some(*from_ty)
+                    && load_uses >= 2;
                 let (d, s) = (dest.0, v.0);
                 // ParamRef sources: the loop-carried-Copy rationale (the
                 // param's ABI home dies at a redefining Copy while the loop
@@ -7239,7 +7227,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 .as_deref()
                 .is_none_or(|f| f == func.name)
         });
-        for (_, _, value) in candidates {
+        let web_is_fold_base = |leader: u32| {
+            fold_use_transfer.contains_key(&leader)
+                || coalesce_groups.get(&leader).is_some_and(|members| {
+                    members.iter().any(|m| fold_use_transfer.contains_key(m))
+                })
+        };
+        for (pressure, _, value) in candidates {
             if fill_limit.is_some_and(|limit| added >= limit) {
                 break;
             }
@@ -7250,8 +7244,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 try_fill_segment_candidate(candidate_segments, &mut occupied_by_reg, &pool)
                     .or_else(|| {
                         if caller_pool.is_empty()
+                            || pressure <= 1
                             || call_spanning.contains(&value)
-                            || (!ordered_param_homes && param_restricted.contains(&value))
+                            || param_restricted.contains(&value)
                             || riscv_entry_guard.contains(&value)
                             || entry_param_guard.contains(&value)
                             || indirect_arg_values.contains(&value)
@@ -7260,7 +7255,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         {
                             return None;
                         }
-                        if fold_use_transfer.contains_key(&value) {
+                        if web_is_fold_base(value) {
                             let fold_caller: Vec<PhysReg> = caller_pool
                                 .iter()
                                 .copied()
@@ -7389,6 +7384,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             indirect_arg_values: &indirect_arg_values,
             call_arg_regs: &config.call_arg_regs,
             indirect_target_regs: &config.indirect_target_regs,
+            fold_bases: Some(&fold_use_transfer),
+            fold_base_regs: &config.fold_base_regs,
+            param_restricted: Some(&param_restricted),
         }),
         &config.ra_config,
     );
@@ -14860,6 +14858,9 @@ struct PhiCallArgHazards<'a> {
     indirect_arg_values: &'a FxHashSet<u32>,
     call_arg_regs: &'a [PhysReg],
     indirect_target_regs: &'a [PhysReg],
+    fold_bases: Option<&'a FxHashMap<u32, Vec<u32>>>,
+    fold_base_regs: &'a [PhysReg],
+    param_restricted: Option<&'a FxHashSet<u32>>,
 }
 
 /// When multiple phi candidates share the same `backedge_src`, rank the
@@ -14905,7 +14906,9 @@ fn phi_src_bound_to_other_reg(
     phi_dest: u32,
     ra_config: &RaConfig,
 ) -> bool {
-    let blocked = applied.iter().any(|p| p.backedge_src == backedge_src)
+    let blocked = applied
+        .iter()
+        .any(|p| p.backedge_src == backedge_src || p.phi_dest == backedge_src)
         && assignments.get(&backedge_src) != Some(&reg);
     if blocked && ra_config.debug_phi_coalesce {
         lccc::cli::stderr_line(format_args!(
@@ -14930,17 +14933,14 @@ fn apply_phi_coalesce_assignments_with_config(
     // Blocker re-homing (see `rehome_phi_blockers`) needs the copy-web
     // membership to keep groups intact and the body-safe caller-saved pool;
     // callers without them opt out.
-    let rehome: Option<PhiBlockerRehome<'_>> = rehome
-        .filter(|_| {
-            !ra_config.no_phi_blocker_rehome
-                && crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64
-        })
-        .map(|(member_of, caller_saved)| PhiBlockerRehome {
-            groups: member_of.iter().flat_map(|(&a, &b)| [a, b]).collect(),
-            callee_saved,
-            caller_saved,
-            call_points: &liveness.call_points,
-        });
+    let rehome = build_phi_blocker_rehome(
+        func,
+        liveness,
+        callee_saved,
+        rehome,
+        call_arg_hazards,
+        ra_config,
+    );
     // Applied destructive updates. The post-RA repair and the verifier must
     // union exactly this set: candidates are proofs of eligibility, but only
     // applied pairs share a register at repair time. Unioning rejected
@@ -15160,14 +15160,14 @@ fn apply_phi_coalesce_assignments_with_config(
             );
             let has_conflict = !blockers.is_empty()
                 && !rehome.as_ref().is_some_and(|ctx| {
-                    rehome_phi_blockers(
+                    try_rehome_conflict_blockers(
+                        func,
                         ctx,
                         &blockers,
                         iv_map,
                         assignments,
                         &applied,
                         reg,
-                        ra_config.debug_phi_coalesce.then_some(func.name.as_str()),
                     )
                 });
             if has_conflict {
@@ -15227,7 +15227,82 @@ struct PhiBlockerRehome<'a> {
     /// not call-spanning (the prologue already dropped %rdi/%rdx when the
     /// body has fixed-scratch clobbers; a hazard-admitted %rdx is absent).
     caller_saved: &'a [PhysReg],
-    call_points: &'a [u32],
+    liveness: &'a LivenessResult,
+    hazards: Option<PhiCallArgHazards<'a>>,
+    debug_fn: Option<&'a str>,
+}
+
+fn build_phi_blocker_rehome<'a>(
+    func: &'a IrFunction,
+    liveness: &'a LivenessResult,
+    callee_saved: &'a [PhysReg],
+    rehome: Option<(&FxHashMap<u32, u32>, &'a [PhysReg])>,
+    hazards: Option<PhiCallArgHazards<'a>>,
+    ra_config: &RaConfig,
+) -> Option<PhiBlockerRehome<'a>> {
+    rehome
+        .filter(|_| {
+            !ra_config.no_phi_blocker_rehome
+                && crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64
+        })
+        .map(|(member_of, caller_saved)| PhiBlockerRehome {
+            groups: member_of.iter().flat_map(|(&a, &b)| [a, b]).collect(),
+            callee_saved,
+            caller_saved,
+            liveness,
+            hazards,
+            debug_fn: ra_config.debug_phi_coalesce.then_some(func.name.as_str()),
+        })
+}
+
+fn try_rehome_conflict_blockers(
+    func: &IrFunction,
+    ctx: &PhiBlockerRehome<'_>,
+    blockers: &[u32],
+    iv_map: &FxHashMap<u32, (u32, u32)>,
+    assignments: &mut FxHashMap<u32, PhysReg>,
+    applied: &[PhiCoalesceCandidate],
+    phi_reg: PhysReg,
+) -> bool {
+    let rdx: Vec<u32> = if ctx.caller_saved.iter().any(|r| r.0 == 16) {
+        collect_x64_rdx_clobber_points(func)
+    } else {
+        Vec::new()
+    };
+    rehome_phi_blockers(ctx, blockers, iv_map, assignments, applied, phi_reg, &rdx)
+}
+
+fn rehome_caller_target_ok(
+    ctx: &PhiBlockerRehome<'_>,
+    b: u32,
+    b_iv: (u32, u32),
+    target: PhysReg,
+    rdx_clobbers: &[u32],
+) -> bool {
+    if let Some(haz) = ctx.hazards {
+        if haz
+            .fold_bases
+            .is_some_and(|fb| fb.contains_key(&b) && !haz.fold_base_regs.contains(&target))
+        {
+            return false;
+        }
+        if arg_reg_hazard(haz.later_arg_values, b, target, haz.call_arg_regs)
+            || (haz.indirect_arg_values.contains(&b) && haz.indirect_target_regs.contains(&target))
+        {
+            return false;
+        }
+    }
+    if target.0 == 16 && !rdx_clobbers.is_empty() {
+        let live = LiveInterval {
+            start: b_iv.0,
+            end: b_iv.1,
+            value_id: b,
+        };
+        if overlaps_inclusive_skip_birth_liveness(ctx.liveness, None, &live, rdx_clobbers) {
+            return false;
+        }
+    }
+    true
 }
 
 /// PHI-COALESCE-HOME-CONFLICT: move every value that blocks a loop phi
@@ -15265,12 +15340,18 @@ fn rehome_phi_blockers(
     assignments: &mut FxHashMap<u32, PhysReg>,
     applied: &[PhiCoalesceCandidate],
     phi_reg: PhysReg,
-    debug_fn: Option<&str>,
+    rdx_clobbers: &[u32],
 ) -> bool {
     let overlaps = |a: (u32, u32), b: (u32, u32)| a.0 <= b.1 && b.0 <= a.1;
+    let is_param = |v: u32| {
+        ctx.hazards
+            .and_then(|h| h.param_restricted)
+            .is_some_and(|p| p.contains(&v))
+    };
     let mut moves: Vec<(u32, PhysReg)> = Vec::with_capacity(blockers.len());
     for &b in blockers {
         let pinned = ctx.groups.contains(&b)
+            || is_param(b)
             || applied
                 .iter()
                 .any(|p| p.phi_dest == b || p.backedge_src == b);
@@ -15295,7 +15376,11 @@ fn rehome_phi_blockers(
                     continue;
                 }
                 used = true;
-                if iv_map.get(&v).is_none_or(|&iv| overlaps(iv, b_iv)) {
+                let Some(&iv) = iv_map.get(&v) else {
+                    return (true, false);
+                };
+                let iv = if is_param(v) { (0, iv.1) } else { iv };
+                if overlaps(iv, b_iv) {
                     return (true, false);
                 }
             }
@@ -15305,17 +15390,20 @@ fn rehome_phi_blockers(
             ctx.callee_saved.iter().copied().find(|&r| {
                 r.0 != phi_reg.0 && r.0 != home.0 && occupancy(r, &moves) == (true, true)
             });
+        let call_points = &ctx.liveness.call_points;
         let caller_ok = ctx.caller_saved.iter().any(|r| r.0 == home.0) && {
-            let idx = ctx.call_points.partition_point(|&cp| cp < b_iv.0);
-            ctx.call_points.get(idx).is_none_or(|&cp| cp > b_iv.1)
+            let idx = call_points.partition_point(|&cp| cp < b_iv.0);
+            call_points.get(idx).is_none_or(|&cp| cp > b_iv.1)
         };
         let target = callee_target.or_else(|| {
             caller_ok
                 .then(|| {
-                    ctx.caller_saved
-                        .iter()
-                        .copied()
-                        .find(|&r| r.0 != phi_reg.0 && r.0 != home.0 && occupancy(r, &moves).1)
+                    ctx.caller_saved.iter().copied().find(|&r| {
+                        r.0 != phi_reg.0
+                            && r.0 != home.0
+                            && rehome_caller_target_ok(ctx, b, b_iv, r, rdx_clobbers)
+                            && occupancy(r, &moves).1
+                    })
                 })
                 .flatten()
         });
@@ -15325,7 +15413,7 @@ fn rehome_phi_blockers(
         moves.push((b, target));
     }
     for &(b, target) in &moves {
-        if let Some(name) = debug_fn {
+        if let Some(name) = ctx.debug_fn {
             lccc::cli::stderr_line(format_args!(
                 "[PHI_COALESCE] fn={} REHOME blocker v{} r{} -> r{}",
                 name, b, phi_reg.0, target.0
@@ -18037,6 +18125,59 @@ mod phi_coalesce_tests {
             0
         );
         assert_eq!(at_call, initial);
+    }
+
+    #[test]
+    fn phi_blocker_rehome_respects_caller_hazards_and_fold_base() {
+        use crate::common::types::{set_target_elf_machine, target_elf_machine};
+        let (func, cand) = rehome_fixture(false);
+        let liveness = compute_live_intervals(&func);
+        let iv_map = interval_map(&liveness);
+        let saved = target_elf_machine();
+        set_target_elf_machine(crate::backend::elf::EM_X86_64);
+
+        // v5 (post-loop blocker in %rdi) is a deferred fold base, and the
+        // only caller-saved register left is %r11 (absent from fold_base_regs).
+        let mut fold_bases = FxHashMap::default();
+        fold_bases.insert(5u32, vec![99u32]);
+        let caller_saved = [PhysReg(14), PhysReg(10)]; // rdi, r11
+        let fold_base_regs = [PhysReg(14)]; // r11 omitted
+        let later_arg_values = FxHashMap::default();
+        let indirect_arg_values = FxHashSet::default();
+        let mut assignments: FxHashMap<u32, PhysReg> = [
+            (6, PhysReg(1)),
+            (1, PhysReg(14)),
+            (2, PhysReg(10)),
+            (5, PhysReg(14)),
+            (4, PhysReg(12)),
+        ]
+        .into_iter()
+        .collect();
+        let applied = apply_phi_coalesce_assignments_with_config(
+            &func,
+            &liveness,
+            &iv_map,
+            &[cand],
+            &mut assignments,
+            &[],
+            Some((&FxHashMap::default(), &caller_saved)),
+            Some(PhiCallArgHazards {
+                later_arg_values: &later_arg_values,
+                indirect_arg_values: &indirect_arg_values,
+                call_arg_regs: &[PhysReg(14), PhysReg(15)],
+                indirect_target_regs: &[PhysReg(11)],
+                fold_bases: Some(&fold_bases),
+                fold_base_regs: &fold_base_regs,
+                param_restricted: None,
+            }),
+            &RaConfig::default(),
+        );
+        set_target_elf_machine(saved);
+        assert!(
+            applied.is_empty(),
+            "fold-base blocker must not move to %r11"
+        );
+        assert_eq!(assignments.get(&5), Some(&PhysReg(14)));
     }
 
     /// loop_rotate_seq_loops shape: the rotated loop's backedge source `s`
@@ -21951,6 +22092,115 @@ mod scalar_lane_class_tests {
         assert_eq!(applied[0].phi_dest, 1);
         assert_eq!(assignments.get(&3).copied(), Some(PhysReg(10)));
     }
+
+    #[test]
+    fn apply_phi_coalesce_does_not_overwrite_already_bound_chain_dest() {
+        let mut f = IrFunction::new("chain_order".into(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Const(IrConst::I64(0)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Const(IrConst::I64(1)),
+                    },
+                ],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: vec![Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(2)),
+                    ty: IrType::U64,
+                }],
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Value(Value(4)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(2),
+                instructions: vec![
+                    Instruction::BinOp {
+                        dest: Value(3),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Const(IrConst::I64(1)),
+                        ty: IrType::U64,
+                    },
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Value(Value(3)),
+                    },
+                ],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(3),
+                instructions: vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                }],
+                terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            },
+        ];
+        let liveness = compute_live_intervals(&f);
+        let cands = vec![
+            PhiCoalesceCandidate {
+                phi_dest: 2,
+                backedge_src: 3,
+                block_idx: 2,
+                copy_idx: 1,
+                source_block_idx: 2,
+                source_def_idx: 0,
+            },
+            PhiCoalesceCandidate {
+                phi_dest: 1,
+                backedge_src: 2,
+                block_idx: 3,
+                copy_idx: 0,
+                source_block_idx: 0,
+                source_def_idx: 1,
+            },
+        ];
+        let iv_map: FxHashMap<u32, (u32, u32)> = liveness
+            .intervals
+            .iter()
+            .map(|iv| (iv.value_id, (iv.start, iv.end)))
+            .collect();
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(10));
+        assignments.insert(2, PhysReg(11));
+        assignments.insert(3, PhysReg(12));
+        let applied = apply_phi_coalesce_assignments(
+            &f,
+            &liveness,
+            &iv_map,
+            &cands,
+            &mut assignments,
+            &[PhysReg(1)],
+        );
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].phi_dest, 2);
+        assert_eq!(assignments.get(&2).copied(), Some(PhysReg(11)));
+        assert_eq!(assignments.get(&3).copied(), Some(PhysReg(11)));
+    }
 }
 
 /// Tests for the single definition of the phi-coalescer's chain shape.
@@ -22915,6 +23165,142 @@ mod wide_hazard_tests {
         // A nested function's static chain arrives in %r10.
         let chained = widening_product(vec![Instruction::GetStaticChain { dest: Value(5) }]);
         assert!(!x86_wide_body_param_overflow_safe(&chained, &config));
+    }
+
+    #[test]
+    fn phase2f_caller_pool_respects_coalesce_fold_base_and_param_restricted() {
+        use crate::common::types::{set_target_elf_machine, target_elf_machine};
+        let saved = target_elf_machine();
+        set_target_elf_machine(crate::backend::elf::EM_X86_64);
+
+        // `v0` (Load, coalesce leader) is NOT in `fold_use_transfer`; its
+        // Copy member `v1` IS the deferred fold base (`GEP(v1, 8/16)` + Load).
+        // `v20` has higher spill weight and occupies the sole caller-saved
+        // register %r11 (`PhysReg(10)`, NOT in `fold_base_regs`) inside B1,
+        // leaving a hole in B0/B2 where `v0`'s segments live. Phase 2 spills
+        // `v0`; Phase 2f (`caller_pool`) must check `web_is_fold_base(v0)`
+        // and refuse %r11.
+        let ld = |dest: u32, ptr: u32| Instruction::Load {
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty: IrType::I64,
+            seg_override: Default::default(),
+            volatile: false,
+        };
+        let mut f = IrFunction::new("p2f_fold".to_string(), IrType::I64, vec![], false);
+        f.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::GlobalAddr {
+                        dest: Value(10),
+                        name: "g".into(),
+                    },
+                    ld(0, 10),
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Value(Value(0)),
+                    },
+                    Instruction::GetElementPtr {
+                        dest: Value(2),
+                        base: Value(1),
+                        offset: Operand::Const(IrConst::I64(8)),
+                        ty: IrType::Ptr,
+                    },
+                    ld(3, 2),
+                ],
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Value(Value(3)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: vec![
+                    Instruction::BinOp {
+                        dest: Value(20),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(3)),
+                        rhs: Operand::Const(IrConst::I64(1)),
+                        ty: IrType::I64,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(21),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(20)),
+                        rhs: Operand::Value(Value(20)),
+                        ty: IrType::I64,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(22),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(21)),
+                        rhs: Operand::Value(Value(20)),
+                        ty: IrType::I64,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(23),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(22)),
+                        rhs: Operand::Value(Value(20)),
+                        ty: IrType::I64,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Value(Value(23)))),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(2),
+                instructions: vec![
+                    Instruction::GetElementPtr {
+                        dest: Value(4),
+                        base: Value(1),
+                        offset: Operand::Const(IrConst::I64(16)),
+                        ty: IrType::Ptr,
+                    },
+                    ld(5, 4),
+                ],
+                terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+        ];
+        f.next_value_id = 24;
+        let cfg = RegAllocConfig {
+            ipa_regs: Vec::new(),
+            available_regs: Vec::new(),
+            accumulator_policy: AccumulatorPolicy {
+                operand_order: AccumulatorOperandOrder::LhsFirst,
+                return_consumes_accumulator: false,
+            },
+            caller_saved_regs: vec![PhysReg(10)], // only %r11
+            call_arg_regs: Vec::new(),
+            indirect_target_regs: Vec::new(),
+            allow_inline_asm_regalloc: false,
+            leaf_caller_saved_homes: true,
+            param_volatile_pool: Vec::new(),
+            param_arrival_regs: Vec::new(),
+            xmm_regs: Vec::new(),
+            never_materialized: FxHashSet::default(),
+            folded_index_uses: FxHashMap::default(),
+            fold_base_regs: vec![PhysReg(11)], // %r11 excluded
+            fold_readmit: FxHashSet::default(),
+            reg_hints: FxHashMap::default(),
+            reg_prefs: FxHashMap::default(),
+            ra_config: Arc::new(RaConfig::default()),
+        };
+        let res = allocate_registers(&f, &cfg);
+        assert_ne!(
+            res.assignments.get(&1),
+            Some(&PhysReg(10)),
+            "coalesce member fold base must never land in %r11: {:?}",
+            res.assignments
+        );
+        set_target_elf_machine(saved);
     }
 }
 

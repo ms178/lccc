@@ -888,6 +888,9 @@ e_neg_cases=(
   'gnu11|int outer = 1; int f(void) { auto outer = &outer; return outer != 0; }|err'
   'c23|int outer = 1; int f(void) { __auto_type outer = &outer; return outer != 0; }|ok'
   'c23|int outer = 1; int f(void) { auto outer = &outer; return outer != 0; }|err'
+  'c23|int outer = 1; int f(void) { auto outer = ({ int y = outer; y; }); return outer; }|err'
+  'c23|int outer = 1; int f(void) { auto outer = ({ auto outer = 5; outer; }); return outer == 5; }|ok'
+  'c23|int outer = 1; int f(void) { __auto_type outer = ({ int y = outer; y; }); return outer; }|ok'
   'c23|int f(void) { auto p = &p; return p != 0; }|err'
 )
 e_neg_bad=0

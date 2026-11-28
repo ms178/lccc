@@ -2489,9 +2489,112 @@ impl SemanticAnalyzer {
             {
                 return true;
             }
+            if let Expr::StmtExpr(compound, _) = e
+                && Self::compound_references_ident(compound, name)
+            {
+                return true;
+            }
             e.for_each_child(&mut |child| stack.push(child));
         }
         false
+    }
+
+    fn decl_references_ident_or_shadows(decl: &Declaration, name: &str) -> Option<bool> {
+        let gnu_auto = matches!(&decl.type_spec, TypeSpecifier::AutoType) && !decl.is_c23_auto();
+        for init_decl in &decl.declarators {
+            if !gnu_auto && init_decl.name == name {
+                return Some(false);
+            }
+            let mut hit = false;
+            init_decl.for_each_expr(&mut |e| hit |= Self::expr_references_ident(e, name));
+            if hit {
+                return Some(true);
+            }
+            if gnu_auto && init_decl.name == name {
+                return Some(false);
+            }
+        }
+        None
+    }
+
+    fn compound_references_ident(compound: &CompoundStmt, name: &str) -> bool {
+        for item in &compound.items {
+            match item {
+                BlockItem::Declaration(decl) => {
+                    if let Some(res) = Self::decl_references_ident_or_shadows(decl, name) {
+                        return res;
+                    }
+                }
+                BlockItem::Statement(stmt) => {
+                    if let Some(res) = Self::stmt_references_ident_or_shadows(stmt, name) {
+                        return res;
+                    }
+                }
+                BlockItem::NestedFunction(_) | BlockItem::StaticAssert(_) => {}
+            }
+        }
+        false
+    }
+
+    fn stmt_references_ident_or_shadows(stmt: &Stmt, name: &str) -> Option<bool> {
+        let mut hit = false;
+        stmt.for_each_own_expr(&mut |e| hit |= Self::expr_references_ident(e, name));
+        if hit {
+            return Some(true);
+        }
+        match stmt {
+            Stmt::Declaration(decl) => return Self::decl_references_ident_or_shadows(decl, name),
+            Stmt::If(_, then_s, else_s, _) => {
+                if Self::stmt_references_ident_or_shadows(then_s, name) == Some(true)
+                    || else_s
+                        .as_deref()
+                        .and_then(|s| Self::stmt_references_ident_or_shadows(s, name))
+                        == Some(true)
+                {
+                    return Some(true);
+                }
+            }
+            Stmt::While(_, body, _) | Stmt::DoWhile(body, _, _) | Stmt::Switch(_, body, _) => {
+                if Self::stmt_references_ident_or_shadows(body, name) == Some(true) {
+                    return Some(true);
+                }
+            }
+            Stmt::For(init, cond, inc, body, _) => {
+                if let Some(init) = init {
+                    if let ForInit::Declaration(decl) = init.as_ref() {
+                        if let Some(res) = Self::decl_references_ident_or_shadows(decl, name) {
+                            return res.then_some(true);
+                        }
+                    }
+                }
+                if cond
+                    .iter()
+                    .chain(inc)
+                    .any(|e| Self::expr_references_ident(e, name))
+                    || Self::stmt_references_ident_or_shadows(body, name) == Some(true)
+                {
+                    return Some(true);
+                }
+            }
+            Stmt::Compound(c) => {
+                if Self::compound_references_ident(c, name) {
+                    return Some(true);
+                }
+            }
+            Stmt::Labeled(run, _) => {
+                if Self::stmt_references_ident_or_shadows(&run.body, name) == Some(true) {
+                    return Some(true);
+                }
+            }
+            Stmt::Expr(_)
+            | Stmt::Return(..)
+            | Stmt::Break(..)
+            | Stmt::Continue(..)
+            | Stmt::Goto(..)
+            | Stmt::GotoIndirect(..)
+            | Stmt::InlineAsm { .. } => {}
+        }
+        None
     }
 
     /// Designator validity for one braced initializer (C11 6.7.9p2-p6).

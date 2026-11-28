@@ -101,6 +101,25 @@ static long long __attribute__((noinline)) shape_four(int n)
     return sum * 100 + a.h.a;
 }
 
+/* `shape_five` reads `S` only at the loop top, then copies `tmp = a` and
+ * writes `tmp.h.a = 999` with no same-iteration read of `a` afterwards.
+ * Only the loop backedge exposes the stale `a.h.a` on later iterations. */
+static long long __attribute__((noinline)) shape_five(int n)
+{
+    Big a;
+    init(&a, 3, 4, 5, 6, 7, 8);
+    long long sum = 0;
+    for (int i = 0; i < n; i++) {
+        sum += a.h.a * 10 + a.tail[0];
+        if (i == 1) {
+            Big tmp = a;
+            tmp.h.a = 999;
+            sum += tmp.h.a;
+        }
+    }
+    return sum * 100 + a.h.a;
+}
+
 int main(void)
 {
     long long r1 = shape_one();
@@ -108,12 +127,14 @@ int main(void)
     long long r3a = shape_three(0);
     long long r3b = shape_three(1);
     long long r4 = shape_four(3);
-    printf("r1=%lld r2=%lld r3a=%lld r3b=%lld r4=%lld\n", r1, r2, r3a, r3b, r4);
+    long long r5 = shape_five(3);
+    printf("r1=%lld r2=%lld r3a=%lld r3b=%lld r4=%lld r5=%lld\n", r1, r2, r3a, r3b, r4, r5);
     return (r1 == 11022077
             && r2 == 505101202707LL
             && r3a == 11301160LL
             && r3b == 11301160LL
-            && r4 == 2703)
+            && r4 == 2703
+            && r5 == 110403)
         ? 0
         : 1;
 }

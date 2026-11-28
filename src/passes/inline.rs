@@ -1350,38 +1350,14 @@ fn select_inline_site(
         // Attribute/section/PGO cases keep their stronger correctness or
         // profile-driven policy.
         if aggregate_frame_should_stay_outlined(callee_data, site.pgo_force, size_optimized)
-            || template_wrapper_should_wait_for_specialization(
+            || wrapper_or_loop_clone_should_stay_outlined(
                 callee_data,
                 callee_inst_count,
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
+                call_sites,
+                site,
+                loop_blocks,
+                (const_trip_admitted, caller_has_section, size_optimized),
             )
-            || multisite_loop_wrapper_should_stay_outlined(
-                callee_data,
-                callee_inst_count,
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
-            )
-            || (!const_trip_admitted
-                && !small_loop_helper_exempt(callee_data, callee_inst_count)
-                && nested_loop_multisite_static_should_stay_outlined(
-                    callee_data,
-                    callee_inst_count,
-                    loop_blocks.contains(&site.block_idx),
-                    caller_has_section,
-                    site.pgo_force,
-                    size_optimized,
-                ))
-            || (!small_loop_helper_exempt(callee_data, callee_inst_count)
-                && repeated_small_loop_clone_should_stay_outlined(
-                    callee_data,
-                    callee_inst_count,
-                    caller_has_section,
-                    site.pgo_force,
-                    size_optimized,
-                ))
         {
             continue;
         }
@@ -1491,38 +1467,14 @@ fn select_inline_site(
             .map(|b| b.instructions.len())
             .sum();
         if aggregate_frame_should_stay_outlined(callee_data, site.pgo_force, size_optimized)
-            || template_wrapper_should_wait_for_specialization(
+            || wrapper_or_loop_clone_should_stay_outlined(
                 callee_data,
                 callee_inst_count,
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
+                call_sites,
+                site,
+                loop_blocks,
+                (const_trip_admitted, caller_has_section, size_optimized),
             )
-            || multisite_loop_wrapper_should_stay_outlined(
-                callee_data,
-                callee_inst_count,
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
-            )
-            || (!const_trip_admitted
-                && !small_loop_helper_exempt(callee_data, callee_inst_count)
-                && nested_loop_multisite_static_should_stay_outlined(
-                    callee_data,
-                    callee_inst_count,
-                    loop_blocks.contains(&site.block_idx),
-                    caller_has_section,
-                    site.pgo_force,
-                    size_optimized,
-                ))
-            || (!small_loop_helper_exempt(callee_data, callee_inst_count)
-                && repeated_small_loop_clone_should_stay_outlined(
-                    callee_data,
-                    callee_inst_count,
-                    caller_has_section,
-                    site.pgo_force,
-                    size_optimized,
-                ))
         {
             continue;
         }
@@ -5683,6 +5635,56 @@ fn is_small_readonly_loop_helper_blocks(
     })
 }
 
+fn wrapper_or_loop_clone_should_stay_outlined(
+    callee_data: &CalleeData,
+    callee_inst_count: usize,
+    call_sites: &[InlineCallSite],
+    site: &InlineCallSite,
+    loop_blocks: &FxHashSet<usize>,
+    (const_trip_admitted, caller_has_section, size_optimized): (bool, bool, bool),
+) -> bool {
+    if template_wrapper_should_wait_for_specialization(
+        callee_data,
+        callee_inst_count,
+        caller_has_section,
+        site.pgo_force,
+        size_optimized,
+    ) || multisite_loop_wrapper_should_stay_outlined(
+        callee_data,
+        callee_inst_count,
+        caller_has_section,
+        site.pgo_force,
+        size_optimized,
+    ) {
+        return true;
+    }
+    if small_loop_helper_site_exempt(
+        callee_data,
+        callee_inst_count,
+        call_sites,
+        site,
+        loop_blocks,
+    ) {
+        return false;
+    }
+    (!const_trip_admitted
+        && nested_loop_multisite_static_should_stay_outlined(
+            callee_data,
+            callee_inst_count,
+            loop_blocks.contains(&site.block_idx),
+            caller_has_section,
+            site.pgo_force,
+            size_optimized,
+        ))
+        || repeated_small_loop_clone_should_stay_outlined(
+            callee_data,
+            callee_inst_count,
+            caller_has_section,
+            site.pgo_force,
+            size_optimized,
+        )
+}
+
 fn small_loop_helper_exempt(data: &CalleeData, raw_inst_count: usize) -> bool {
     is_pure_alu_loop_helper_blocks(&data.blocks, raw_inst_count)
         || is_small_readonly_loop_helper_blocks(
@@ -5690,6 +5692,29 @@ fn small_loop_helper_exempt(data: &CalleeData, raw_inst_count: usize) -> bool {
             raw_inst_count,
             data.direct_call_count,
         )
+}
+
+fn small_loop_helper_site_exempt(
+    data: &CalleeData,
+    raw_inst_count: usize,
+    call_sites: &[InlineCallSite],
+    site: &InlineCallSite,
+    loop_blocks: &FxHashSet<usize>,
+) -> bool {
+    if !small_loop_helper_exempt(data, raw_inst_count) {
+        return false;
+    }
+    let mut caller_sites = 0usize;
+    let mut caller_loop_sites = 0usize;
+    for s in call_sites {
+        if s.callee_name == site.callee_name {
+            caller_sites += 1;
+            if loop_blocks.contains(&s.block_idx) {
+                caller_loop_sites += 1;
+            }
+        }
+    }
+    caller_loop_sites <= 1 && caller_sites <= 2
 }
 
 /// Return whether a descendant is selected by the inliner's unconditional
@@ -9199,6 +9224,41 @@ mod inline_limit_tests {
             volatile: false,
         };
         assert!(!small_loop_helper_exempt(&with_param_alloca, 35));
+
+        let mk_site = |block_idx: usize, inst_idx: usize| InlineCallSite {
+            block_idx,
+            inst_idx,
+            callee_name: "helper".to_string(),
+            dest: None,
+            args: Vec::new(),
+            pgo_force: false,
+            arg_meta: CallArgMeta::default(),
+        };
+        let mut alu_site = loop_helper_data(8, 33);
+        alu_site.is_plain_static = true;
+        alu_site.is_static_inline = false;
+        alu_site.direct_call_count = 4;
+        let loop_blocks: FxHashSet<usize> = [1].into_iter().collect();
+        // Single loop site + single non-loop site in a caller stays exempt
+        // (e.g. x2nmodp/zng_crc32_combine calling multmodp).
+        let sites_ok = [mk_site(1, 0), mk_site(2, 0)];
+        assert!(small_loop_helper_site_exempt(
+            &alu_site,
+            33,
+            &sites_ok,
+            &sites_ok[0],
+            &loop_blocks
+        ));
+        // Repeated loop call sites inside one caller (e.g. clz_safe_guards ref)
+        // stay outlined to avoid per-site loop bloat.
+        let sites_multi_loop = [mk_site(1, 0), mk_site(1, 1)];
+        assert!(!small_loop_helper_site_exempt(
+            &alu_site,
+            33,
+            &sites_multi_loop,
+            &sites_multi_loop[0],
+            &loop_blocks
+        ));
     }
 }
 

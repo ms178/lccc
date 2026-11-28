@@ -1670,25 +1670,13 @@ impl X86Codegen {
                     let consumer_depth =
                         depths.get(block_idx).copied().unwrap_or_else(|| usize::MAX);
                     for inst in &block.instructions {
-                        let base = match inst {
-                            Instruction::GetElementPtr {
-                                base,
-                                offset: Operand::Value(_),
-                                ..
-                            } => base,
-                            Instruction::BinOp {
-                                op: IrBinOp::Add | IrBinOp::Sub,
-                                lhs: Operand::Value(b),
-                                rhs: Operand::Value(_),
-                                ..
-                            } if set.contains(&b.0) => b,
-                            Instruction::BinOp {
-                                op: IrBinOp::Add,
-                                lhs: Operand::Value(_),
-                                rhs: Operand::Value(b),
-                                ..
-                            } if set.contains(&b.0) => b,
-                            _ => continue,
+                        let Instruction::GetElementPtr {
+                            base,
+                            offset: Operand::Value(_),
+                            ..
+                        } = inst
+                        else {
+                            continue;
                         };
                         if !set.contains(&base.0) {
                             continue;
