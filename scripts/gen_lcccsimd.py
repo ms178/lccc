@@ -12,12 +12,51 @@ IR operand.
 
 Regenerate: python3 scripts/gen_lcccsimd.py
 """
+import subprocess
 import sys
 import re
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent
-OUT = REPO / "include" / "lcccsimd.h"
+HEADER = REPO / "include" / "lcccsimd.h"
+OUT = HEADER
+
+# Tables recorded from the header.  Each has a gate of its own in another
+# lane, so a regenerated header that leaves one of them as it was passes
+# `--check` here and fails there: the 288 named mask compares did exactly
+# that to the first two, on one push.  `--check` therefore answers for the
+# header and for what is recorded from it.  The two checks it runs need no
+# compiler; the third table needs lccc and GCC 16.2 and is only named.
+#
+# (table, its check or None, the command that records it again)
+DEPENDENTS = (
+    ("engineering/isa/sse-avx-public-api.json",
+     ("scripts/audit_sse_avx_public_api.py", "--check"),
+     "python3 scripts/audit_sse_avx_public_api.py --write"),
+    ("tests/simd/isa_permissions_gcc16.json",
+     ("tests/simd/check_isa_permissions.py",),
+     'python3 tests/simd/gen_isa_permissions.py --headers "$(gcc-16 -print-file-name=include)"'),
+    ("tests/x86-intrinsics/expected.txt",
+     None,
+     "python3 scripts/x86_intrinsic_census.py --update --lccc target/fastbuild/lccc --gcc gcc-16"),
+)
+
+
+def failing_dependents():
+    """The recorded tables whose check fails, each with the check's last lines."""
+    failing = []
+    for table, check, record in DEPENDENTS:
+        if check is None:
+            continue
+        run = subprocess.run(
+            [sys.executable, str(REPO / check[0]), *check[1:]],
+            cwd=REPO, capture_output=True, text=True, check=False,
+        )
+        if run.returncode != 0:
+            tail = (run.stdout + run.stderr).strip().splitlines()[-6:]
+            failing.append((table, record, tail))
+    return failing
+
 
 # `--check` regenerates into memory and fails when the committed header differs
 # from what this script produces.  The header is machine output -- a hand edit
@@ -1005,6 +1044,24 @@ if _CHECK_ONLY:
         )
         sys.exit(1)
     print(f"gen_lcccsimd: {OUT} matches the generator ({len(L)} lines)")
+    # Only the repository's own header has recorded tables; `--out` compares
+    # a header written somewhere else.
+    if OUT == HEADER:
+        failing = failing_dependents()
+        for table, record, tail in failing:
+            print(f"gen_lcccsimd: {table} is recorded from the header and fails its check:", file=sys.stderr)
+            for line in tail:
+                print(f"    {line}", file=sys.stderr)
+            print(f"  if the header is what changed, record it again and review the diff:\n    {record}",
+                  file=sys.stderr)
+        if failing:
+            sys.exit(1)
+        checked = sum(1 for _, check, _ in DEPENDENTS if check is not None)
+        print(f"gen_lcccsimd: the {checked} tables recorded from it that need no compiler agree with it")
 else:
     OUT.write_text(generated)
     print(f"wrote {OUT} ({len(L)} lines)")
+    if OUT == HEADER:
+        print("recorded from this header; record them again and review each diff:")
+        for table, _, record in DEPENDENTS:
+            print(f"  {table}\n    {record}")
