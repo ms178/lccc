@@ -260,6 +260,12 @@ pub struct Lowerer {
     /// Wrapped in RefCell because many lowering methods take &self (not &mut self)
     /// but still need to emit diagnostics (same pattern as expr_ctype_cache).
     pub(super) diagnostics: RefCell<DiagnosticEngine>,
+    /// Where the binary operator being lowered stands in the source: the
+    /// place GCC's "invalid operands to binary" points at. The operand
+    /// lowering functions are handed the operands and not the expression;
+    /// the one diagnostic they are the last to be able to give
+    /// (`lower_arithmetic_binop`) reads the place here.
+    pub(super) binary_operator_span: Option<Span>,
     /// Source-span identity of materialized compound literals. Initializer
     /// canonicalization clones Exprs into temporary allocations, so pointer
     /// identity can be reused for DIFFERENT literals and silently alias them.
@@ -506,6 +512,7 @@ impl Lowerer {
             symver_ref_map: FxHashMap::default(),
             expr_ctype_cache: RefCell::new(FxHashMap::default()),
             diagnostics: RefCell::new(diagnostics),
+            binary_operator_span: None,
             materialized_compound_literals: FxHashMap::default(),
             gnu89_inline,
             trapv: false,

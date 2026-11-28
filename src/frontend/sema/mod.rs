@@ -17,5 +17,6 @@ pub(crate) mod void_declarators;
 
 pub(crate) use analysis::{ExprTypeMap, FunctionInfo, SemanticAnalyzer};
 pub(crate) use const_eval::ConstMap;
+pub(crate) use operand_constraints::{integer_operands_only, invalid_binary_operands};
 
 mod function_pointer_cast;

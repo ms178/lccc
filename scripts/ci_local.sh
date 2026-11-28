@@ -1458,6 +1458,15 @@ gate "gcc162-diagnostic-severity" fast \
 gate "operand-diagnostics" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_operand_diagnostics.sh
 
+# Every operator on every kind of operand against GCC 16.2: 200 unary cells
+# and 14,112 binary ones. No cell may be a valid program refused or an
+# internal error; the cells lccc accepts where GCC refuses are counted in the
+# script and may only become fewer.
+gate "operand-constraint-matrix-self-test" fast \
+    python3 scripts/operand_constraint_matrix.py --self-test
+gate "operand-constraint-matrix" slow \
+    python3 scripts/operand_constraint_matrix.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+
 # Clang ext_vector_type component access against the Clang 23.1.5 oracle:
 # LCCC's diagnostics for ext_vector_select/errors.c equal Clang's (line,
 # column, message), LCCC accepts exactly the forms Clang accepts and puts the

@@ -225,7 +225,23 @@ pub(super) fn value_required(ty: &CType) -> Option<String> {
     matches!(ty, CType::Void).then(|| VOID_VALUE.into())
 }
 
-/// Unary `+`, `-`, `~`, `!` and `__real__`/`__imag__`.
+/// Unary `+`, `-`, `~`, `!` and `__real__`/`__imag__` (C11 6.5.3.3p1): `+`
+/// and `-` take an arithmetic operand, `~` an integer, `!` a scalar.
+///
+/// Measured on gcc-16.2.0, twenty operand kinds against the ten unary
+/// operators (`tests/regression/check_operand_diagnostics.sh` keeps the
+/// table): a pointer, which an array and a function designator are by the
+/// time they are operands, is a scalar and nothing more, so `!p` is its
+/// truth value and `+p`, `-p`, `~p`, `__real__ p` and `__imag__ p` are
+/// "wrong type argument"; `~` of a real floating value is too, and of a
+/// complex one it is GNU C's conjugate; a GNU vector has `+`, `-` and, with
+/// integer lanes, `~`, and neither a truth value nor parts. lccc compiled
+/// all of these: `~d` as the complement of the bits of the `double`
+/// (`~5.7` was -0.7875), `-p` as arithmetic on the address.
+///
+/// The vector rows are GCC's and are applied to GNU vectors
+/// (`vector_size`); an `ext_vector_type` is Clang's and keeps the rules it
+/// had.
 pub(super) fn unary(op: UnaryOp, ty: &CType) -> Option<String> {
     let what = match op {
         UnaryOp::Plus => "unary plus",
@@ -234,21 +250,33 @@ pub(super) fn unary(op: UnaryOp, ty: &CType) -> Option<String> {
         UnaryOp::LogicalNot => "unary exclamation mark",
         UnaryOp::PreInc => "increment",
         UnaryOp::PreDec => "decrement",
-        // GCC: `__real__`/`__imag__` of a record or `nullptr_t` is "wrong
-        // type argument to __real__"; of `void`, the void-value error.
-        UnaryOp::RealPart => "__real__",
-        UnaryOp::ImagPart => "__imag__",
+        // GCC names the operators without their trailing underscores:
+        // "wrong type argument to __real". Of `void`, the void-value error.
+        UnaryOp::RealPart => "__real",
+        UnaryOp::ImagPart => "__imag",
     };
+    let wrong = || Some(format!("wrong type argument to {what}"));
+    let steps = matches!(op, UnaryOp::PreInc | UnaryOp::PreDec);
     match kind(ty) {
         Kind::Void => Some(VOID_USE.into()),
-        Kind::Record => Some(format!("wrong type argument to {what}")),
+        Kind::Record => wrong(),
         // `!nullptr` is valid (a scalar operand); every arithmetic unary
         // operator requires an arithmetic operand (C23 6.5.3.3p1).
-        Kind::NullPtr if op != UnaryOp::LogicalNot => {
-            Some(format!("wrong type argument to {what}"))
-        }
+        Kind::NullPtr if op != UnaryOp::LogicalNot => wrong(),
+        Kind::Pointer if op != UnaryOp::LogicalNot && !steps => wrong(),
+        Kind::Vector if matches!(ty, CType::Vector(..)) => match op {
+            UnaryOp::Plus | UnaryOp::Neg | UnaryOp::PreInc | UnaryOp::PreDec => None,
+            UnaryOp::BitNot if !vector_of_floats(ty) => None,
+            _ => wrong(),
+        },
+        Kind::Other if op == UnaryOp::BitNot && is_real_float(ty) => wrong(),
         _ => None,
     }
+}
+
+/// A GNU vector whose lanes are floating: it has no `~`.
+fn vector_of_floats(ty: &CType) -> bool {
+    matches!(ty, CType::Vector(element, _) if is_real_float(element))
 }
 
 /// Unary `*` (C23 6.5.3.2p2): the operand must have pointer type. An array or
@@ -378,6 +406,28 @@ fn binop_spelling(op: BinOp) -> &'static str {
     }
 }
 
+/// Whether `op` takes integer operands only (C11 6.5.5p2 `%`, 6.5.7p2 the
+/// shifts, 6.5.10-12 the bitwise operators).
+pub(crate) fn integer_operands_only(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Mod | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+    )
+}
+
+/// GCC's verdict on a binary operator its operand types rule out, with the
+/// operands named after the integer promotions as GCC names them. For the
+/// one caller that judges an operator outside [`binary`]: the lowering,
+/// which knows the type of an operand the analyzer leaves alone.
+pub(crate) fn invalid_binary_operands(op: BinOp, lhs: &CType, rhs: &CType) -> String {
+    format!(
+        "invalid operands to binary {} (have '{}' and '{}')",
+        binop_spelling(op),
+        type_name(&lhs.integer_promoted()),
+        type_name(&rhs.integer_promoted())
+    )
+}
+
 /// Binary operators. `&&`/`||` take any scalar operands. `==`/`!=` accept a
 /// `nullptr_t` operand against another `nullptr_t`, a pointer, or a null
 /// pointer constant (C23 6.5.9p2); every other operator rejects it, and every
@@ -429,13 +479,19 @@ pub(super) fn binary(op: BinOp, lhs: Operand<'_>, rhs: Operand<'_>) -> Option<St
     // Modulo and the bitwise/shift operators accept no floating-point
     // operand (measured on gcc-16.2.0: `2.0 % 2.0`, `2.0 & 2`, `1.5 & 1`,
     // `2 << 1.5` all report `invalid operands`; `2.0 == 2.0` does not).
-    if matches!(
-        op,
-        BinOp::Mod | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
-    ) && (is_real_float(lhs.ty)
-        || lhs.ty.is_complex()
-        || is_real_float(rhs.ty)
-        || rhs.ty.is_complex())
+    if integer_operands_only(op)
+        && (is_real_float(lhs.ty)
+            || lhs.ty.is_complex()
+            || is_real_float(rhs.ty)
+            || rhs.ty.is_complex())
+    {
+        return Some(invalid(()));
+    }
+    // The complex numbers are not ordered (C11 6.5.8p2: real operands).
+    // Measured on gcc-16.2.0: `z < 1`, `1.5 >= z` and `z <= z` report
+    // `invalid operands`; `z == 1` does not.
+    if matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+        && (lhs.ty.is_complex() || rhs.ty.is_complex())
     {
         return Some(invalid(()));
     }
@@ -725,6 +781,183 @@ mod tests {
 
     /// Record and `void` operands: every case is a GCC 16.2 hard error (also
     /// under `-fpermissive`) that lccc used to accept.
+    /// The unary operators on every operand kind, as measured on GCC 16.2
+    /// (`-std=gnu23`, one statement per translation unit; the gate
+    /// `check_operand_diagnostics.sh` holds the compiler to the same table).
+    #[test]
+    fn unary_operands_match_gcc() {
+        use UnaryOp::{BitNot, ImagPart, LogicalNot, Neg, Plus, PreDec, PreInc, RealPart};
+        const ALL: [UnaryOp; 8] = [
+            Plus, Neg, BitNot, LogicalNot, RealPart, ImagPart, PreInc, PreDec,
+        ];
+        let spelled = |op: UnaryOp| match op {
+            Plus => "unary plus",
+            Neg => "unary minus",
+            BitNot => "bit-complement",
+            LogicalNot => "unary exclamation mark",
+            RealPart => "__real",
+            ImagPart => "__imag",
+            PreInc => "increment",
+            PreDec => "decrement",
+        };
+        let vector = |lane: CType| CType::Vector(Box::new(lane), 16);
+        // (the operand, the operators GCC refuses for it)
+        let table: Vec<(CType, &[UnaryOp])> = vec![
+            (CType::Int, &[]),
+            (CType::Bool, &[]),
+            (CType::ULongLong, &[]),
+            (CType::Float, &[BitNot]),
+            (CType::Double, &[BitNot]),
+            (CType::LongDouble, &[BitNot]),
+            (CType::Float16, &[BitNot]),
+            (CType::Float128, &[BitNot]),
+            (CType::Decimal64, &[BitNot]),
+            // `~z` is the conjugate (GNU C).
+            (CType::ComplexDouble, &[]),
+            (CType::ComplexFloat, &[]),
+            (ptr(CType::Int), &[Plus, Neg, BitNot, RealPart, ImagPart]),
+            (ptr(CType::Void), &[Plus, Neg, BitNot, RealPart, ImagPart]),
+            (ptr(CType::Char), &[Plus, Neg, BitNot, RealPart, ImagPart]),
+            (vector(CType::Int), &[LogicalNot, RealPart, ImagPart]),
+            (
+                vector(CType::Float),
+                &[BitNot, LogicalNot, RealPart, ImagPart],
+            ),
+            (
+                vector(CType::Double),
+                &[BitNot, LogicalNot, RealPart, ImagPart],
+            ),
+            (CType::Struct("struct.S".into()), &ALL),
+            (CType::Union("union.U".into()), &ALL),
+        ];
+        for (ty, refused) in &table {
+            for operator in ALL {
+                let verdict = unary(operator, ty);
+                if refused.contains(&operator) {
+                    assert_eq!(
+                        verdict.as_deref(),
+                        Some(format!("wrong type argument to {}", spelled(operator)).as_str()),
+                        "{operator:?} of {ty:?}"
+                    );
+                } else {
+                    assert_eq!(verdict, None, "{operator:?} of {ty:?}");
+                }
+            }
+        }
+        // `void` has its own wording, and `nullptr_t` only a truth value.
+        assert_eq!(unary(BitNot, &CType::Void).as_deref(), Some(VOID_USE));
+        assert_eq!(unary(LogicalNot, &CType::NullPtr), None);
+        assert_eq!(
+            unary(Neg, &CType::NullPtr).as_deref(),
+            Some("wrong type argument to unary minus")
+        );
+        // An array and a function designator are pointers when they are
+        // operands; `kind` classes them so before any conversion too.
+        let array = CType::Array(Box::new(CType::Int), Some(3));
+        assert_eq!(
+            unary(BitNot, &array).as_deref(),
+            Some("wrong type argument to bit-complement")
+        );
+    }
+
+    /// The operators of integers only and the ordering of complex values
+    /// (gcc-16.2.0): one floating operand is the violation.
+    #[test]
+    fn integer_only_operators_and_complex_ordering_match_gcc() {
+        let (int, double, complex) = (CType::Int, CType::Double, CType::ComplexDouble);
+        for operator in [
+            BinOp::Mod,
+            BinOp::BitAnd,
+            BinOp::BitOr,
+            BinOp::BitXor,
+            BinOp::Shl,
+            BinOp::Shr,
+        ] {
+            assert!(integer_operands_only(operator));
+            assert!(
+                binary(operator, op(&double), op(&int)).is_some(),
+                "{operator:?}"
+            );
+            assert!(
+                binary(operator, op(&int), op(&double)).is_some(),
+                "{operator:?}"
+            );
+            assert!(
+                binary(operator, op(&complex), op(&int)).is_some(),
+                "{operator:?}"
+            );
+            assert!(
+                binary(operator, op(&int), op(&int)).is_none(),
+                "{operator:?}"
+            );
+        }
+        for operator in [
+            BinOp::Add,
+            BinOp::Sub,
+            BinOp::Mul,
+            BinOp::Div,
+            BinOp::Eq,
+            BinOp::Lt,
+        ] {
+            assert!(!integer_operands_only(operator));
+            assert!(
+                binary(operator, op(&double), op(&int)).is_none(),
+                "{operator:?}"
+            );
+        }
+        for operator in [BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge] {
+            for other in [&int, &double, &complex, &CType::Bool, &CType::ULongLong] {
+                assert!(
+                    binary(operator, op(&complex), op(other)).is_some(),
+                    "{operator:?}"
+                );
+                assert!(
+                    binary(operator, op(other), op(&complex)).is_some(),
+                    "{operator:?}"
+                );
+            }
+        }
+        for operator in [
+            BinOp::Eq,
+            BinOp::Ne,
+            BinOp::Add,
+            BinOp::Sub,
+            BinOp::Mul,
+            BinOp::Div,
+        ] {
+            assert!(
+                binary(operator, op(&complex), op(&int)).is_none(),
+                "{operator:?}"
+            );
+            assert!(
+                binary(operator, op(&complex), op(&complex)).is_none(),
+                "{operator:?}"
+            );
+        }
+        assert_eq!(
+            binary(BinOp::Lt, op(&int), op(&complex)).as_deref(),
+            Some("invalid operands to binary < (have 'int' and 'complex double')")
+        );
+    }
+
+    /// The wording the lowering borrows: the operands after their integer
+    /// promotions, in GCC's spelling.
+    #[test]
+    fn the_lowerings_verdict_names_promoted_operands() {
+        assert_eq!(
+            invalid_binary_operands(BinOp::BitAnd, &CType::Double, &CType::UShort),
+            "invalid operands to binary & (have 'double' and 'int')"
+        );
+        assert_eq!(
+            invalid_binary_operands(BinOp::Mod, &CType::Char, &CType::LongDouble),
+            "invalid operands to binary % (have 'int' and 'long double')"
+        );
+        assert_eq!(
+            invalid_binary_operands(BinOp::Shl, &CType::ULong, &CType::Float),
+            "invalid operands to binary << (have 'long unsigned int' and 'float')"
+        );
+    }
+
     #[test]
     fn record_and_void_operands_are_rejected() {
         let s = CType::Struct("struct.S".into());

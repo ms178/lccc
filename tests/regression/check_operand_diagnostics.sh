@@ -644,6 +644,254 @@ for std in gnu90 gnu17 gnu23; do
     fi
 done
 
+# --- the arithmetic operators: `+ - ~ !`, the parts of a complex value, and
+# the operators of integers only ------------------------------------------
+#
+# Recorded from gcc-16.2.0 as everything above. The unary rows are the cells
+# of a table of twenty operand kinds against the ten unary operators in which
+# lccc and GCC differed: lccc compiled all of them (`~d` as the complement of
+# the bits of the double, `-p` as arithmetic on the address, `!v` of a vector
+# as an `int`). The binary rows have an operand that is the result of a
+# builtin, which the analyzer left untyped and so unjudged: `%`, the shifts
+# and the bitwise operators with a floating operand reached the code
+# generator, which has no such instruction and stopped with an internal error
+# ("unsupported float binop: And on type F64"). The SIMD headers got there
+# with a `double` handed to a mask parameter. And an ordering of complex
+# values, which C does not have.
+cat > operand_unary.c <<'C'
+typedef int v4 __attribute__((vector_size(16)));
+typedef float f4 __attribute__((vector_size(16)));
+struct S { int a; };
+void g(void);
+void u_not_float(float x){ (void)~x; }
+void u_not_double(double x){ (void)~x; }
+void u_not_ldouble(long double x){ (void)~x; }
+void u_not_f16(_Float16 x){ (void)~x; }
+void u_not_f128(__float128 x){ (void)~x; }
+void u_not_dec(_Decimal64 x){ (void)~x; }
+void u_plus_ptr(int *p){ (void)+p; }
+void u_minus_ptr(int *p){ (void)-p; }
+void u_not_ptr(int *p){ (void)~p; }
+void u_real_ptr(int *p){ (void)__real__ p; }
+void u_imag_ptr(int *p){ (void)__imag__ p; }
+void u_minus_voidptr(void *p){ (void)-p; }
+void u_minus_array(void){ int a[3]; (void)-a; }
+void u_not_array(void){ int a[3]; (void)~a; }
+void u_plus_function(void){ (void)+g; }
+void u_minus_function(void){ (void)-g; }
+void u_not_string(void){ (void)~"abc"; }
+void u_not_fvec(f4 v){ (void)~v; }
+void u_truth_ivec(v4 v){ (void)!v; }
+void u_truth_fvec(f4 v){ (void)!v; }
+void u_real_ivec(v4 v){ (void)__real__ v; }
+void u_imag_fvec(f4 v){ (void)__imag__ v; }
+void u_real_struct(struct S s){ (void)__real__ s; }
+void u_imag_struct(struct S s){ (void)__imag__ s; }
+void u_not_builtin(double x){ (void)~__builtin_sqrt(x); }
+void u_not_builtinf(float x){ (void)~__builtin_fabsf(x); }
+C
+cat > operand_integer_only.c <<'C'
+void b_and(double d){ (void)(__builtin_sqrt(d) & 1); }
+void b_mod(double d, int i){ (void)(i % __builtin_fabs(d)); }
+void b_shl(double d, int i){ (void)(i << __builtin_floor(d)); }
+void b_or(float d){ (void)(__builtin_sqrtf(d) | __builtin_popcount(3)); }
+void b_xor_assign(double d){ d ^= __builtin_popcount(3); }
+void b_and_assign(int i){ i &= __builtin_inf(); }
+void b_and_inf(int i){ (void)(i & __builtin_huge_valf()); }
+void b_shr_nan(int i){ (void)(i >> __builtin_nan("")); }
+void b_complex(_Complex double z){ (void)(z & __builtin_popcount(1)); }
+void b_paren(double d){ (void)((d) & (__builtin_ffs(3))); }
+void b_double_popcount(double d, int i){ (void)(d & __builtin_popcount(i)); }
+void b_double_expect(double d, int i){ (void)(d | __builtin_expect(i, 1)); }
+void b_double_bswap(double d, unsigned i){ (void)(d % __builtin_bswap32(i)); }
+void b_lt_complex(_Complex double z, int i){ (void)(z < i); }
+void b_le_complex(_Complex double z, double d){ (void)(d <= z); }
+void b_gt_complex(_Complex float z){ (void)(z > z); }
+void b_ge_complex(_Complex double z){ (void)(1 >= z); }
+C
+for std in gnu90 gnu17 gnu23; do
+expect_diags operand_unary.c "$std" 1 <<'EOF'
+operand_unary.c:5:34: error: wrong type argument to bit-complement
+operand_unary.c:6:36: error: wrong type argument to bit-complement
+operand_unary.c:7:42: error: wrong type argument to bit-complement
+operand_unary.c:8:35: error: wrong type argument to bit-complement
+operand_unary.c:9:38: error: wrong type argument to bit-complement
+operand_unary.c:10:37: error: wrong type argument to bit-complement
+operand_unary.c:11:32: error: wrong type argument to unary plus
+operand_unary.c:12:33: error: wrong type argument to unary minus
+operand_unary.c:13:31: error: wrong type argument to bit-complement
+operand_unary.c:14:32: error: wrong type argument to __real
+operand_unary.c:15:32: error: wrong type argument to __imag
+operand_unary.c:16:38: error: wrong type argument to unary minus
+operand_unary.c:17:43: error: wrong type argument to unary minus
+operand_unary.c:18:41: error: wrong type argument to bit-complement
+operand_unary.c:19:35: error: wrong type argument to unary plus
+operand_unary.c:20:36: error: wrong type argument to unary minus
+operand_unary.c:21:32: error: wrong type argument to bit-complement
+operand_unary.c:22:30: error: wrong type argument to bit-complement
+operand_unary.c:23:32: error: wrong type argument to unary exclamation mark
+operand_unary.c:24:32: error: wrong type argument to unary exclamation mark
+operand_unary.c:25:31: error: wrong type argument to __real
+operand_unary.c:26:31: error: wrong type argument to __imag
+operand_unary.c:27:39: error: wrong type argument to __real
+operand_unary.c:28:39: error: wrong type argument to __imag
+operand_unary.c:29:37: error: wrong type argument to bit-complement
+operand_unary.c:30:37: error: wrong type argument to bit-complement
+EOF
+expect_diags operand_integer_only.c "$std" 1 <<'EOF'
+operand_integer_only.c:1:48: error: invalid operands to binary & (have 'double' and 'int')
+operand_integer_only.c:2:39: error: invalid operands to binary % (have 'int' and 'double')
+operand_integer_only.c:3:39: error: invalid operands to binary << (have 'int' and 'double')
+operand_integer_only.c:4:47: error: invalid operands to binary | (have 'float' and 'int')
+operand_integer_only.c:5:32: error: invalid operands to binary ^ (have 'double' and 'int')
+operand_integer_only.c:6:29: error: invalid operands to binary & (have 'int' and 'double')
+operand_integer_only.c:7:33: error: invalid operands to binary & (have 'int' and 'float')
+operand_integer_only.c:8:33: error: invalid operands to binary >> (have 'int' and 'double')
+operand_integer_only.c:9:45: error: invalid operands to binary & (have 'complex double' and 'int')
+operand_integer_only.c:10:36: error: invalid operands to binary & (have 'double' and 'int')
+operand_integer_only.c:11:51: error: invalid operands to binary & (have 'double' and 'int')
+operand_integer_only.c:12:49: error: invalid operands to binary | (have 'double' and 'long int')
+operand_integer_only.c:13:53: error: invalid operands to binary % (have 'double' and 'unsigned int')
+operand_integer_only.c:14:55: error: invalid operands to binary < (have 'complex double' and 'int')
+operand_integer_only.c:15:58: error: invalid operands to binary <= (have 'double' and 'complex double')
+operand_integer_only.c:16:47: error: invalid operands to binary > (have 'complex float' and 'complex float')
+operand_integer_only.c:17:48: error: invalid operands to binary >= (have 'int' and 'complex double')
+EOF
+done
+
+# `++`, `--` and assignment want an object. An array and a function
+# designator are none: what they convert to is a value, and gcc says "lvalue
+# required". lccc stepped, or stored through, the address it had taken. A
+# parameter written as an array or as a function is a pointer, and is not
+# in these rows but in the legal ones.
+cat > operand_designators.c <<'C'
+void g(void);
+void d_post_array(void){ int x[3]; x++; }
+void d_pre_array(void){ int x[3]; --x; }
+void d_post_function(void){ g++; }
+void d_pre_function(void){ ++g; }
+void d_post_function_dec(void){ g--; }
+void d_assign_function(void){ g = g; }
+void d_compound_function(void){ g -= 1; }
+void d_member_array(void){ struct { int a[2]; } s; s.a++; }
+void d_inner_array(void){ int x[2][3]; x[1]++; }
+void d_string(void){ "abc"++; }
+void d_const_array(void){ const int x[3] = { 0 }; ++x; }
+C
+cat > operand_designators_legal.c <<'C'
+void g(void);
+int *l_param(int a[3]){ a++; --a; return a; }
+void l_function_param(void h(void)){ h = g; (void)h; }
+int l_element(void){ int x[3] = { 1, 2, 3 }; x[1]++; ++x[2]; return x[1] + x[2]; }
+int l_inner(void){ int x[2][3] = { { 0 } }; x[1][2]++; return x[1][2]; }
+void (*l_pointer(void (*p)(void)))(void){ p = g; return p; }
+char l_string(void){ const char *s = "abc"; s++; return *s; }
+C
+for std in gnu90 gnu17 gnu23; do
+expect_diags operand_designators.c "$std" 1 <<'EOF'
+operand_designators.c:2:37: error: lvalue required as increment operand
+operand_designators.c:3:35: error: lvalue required as decrement operand
+operand_designators.c:4:30: error: lvalue required as increment operand
+operand_designators.c:5:28: error: lvalue required as increment operand
+operand_designators.c:6:34: error: lvalue required as decrement operand
+operand_designators.c:7:33: error: lvalue required as left operand of assignment
+operand_designators.c:8:35: error: lvalue required as left operand of assignment
+operand_designators.c:9:55: error: lvalue required as increment operand
+operand_designators.c:10:44: error: lvalue required as increment operand
+operand_designators.c:11:27: error: lvalue required as increment operand
+operand_designators.c:12:51: error: lvalue required as increment operand
+EOF
+    rc=$(run_cc "$CCC" operand_designators_legal.c "$std")
+    [[ $rc == 0 ]] || { cat "operand_designators_legal.c.$std.err" >&2; fail "operand_designators_legal.c@$std: a legal form is rejected"; }
+    [[ -z $(diag_lines "operand_designators_legal.c.$std.err") ]] \
+        || { cat "operand_designators_legal.c.$std.err" >&2; fail "operand_designators_legal.c@$std: a legal form is diagnosed"; }
+    if [[ -n ${oracle:-} ]]; then
+        rc=$(run_cc "$GCC" operand_designators_legal.c "$std")
+        [[ $rc == 0 ]] || fail "operand_designators_legal.c@$std: gcc rejects it too (record drift)"
+    fi
+done
+
+# Where the analyzer has no type for the builtin at all, the lowering is the
+# one that knows the operand is floating, and it says the same thing at the
+# same place. One function per file: an error of the analyzer ends the
+# compilation before the lowering runs. Each is compiled to an object, with
+# and without optimization, and held to what gcc says of the same file.
+lowered=0
+while IFS= read -r function; do
+    [[ -n $function ]] || continue
+    lowered=$((lowered + 1))
+    printf '%s\n' "$function" > "lowered_$lowered.c"
+    for opt in -O0 -O2; do
+        set +e
+        "$CCC" -std=gnu17 "$opt" -c "lowered_$lowered.c" -o /dev/null 2>"lowered_$lowered.err"
+        rc=$?
+        set -e
+        ! grep -qE 'panicked at|internal error|RUST_BACKTRACE' "lowered_$lowered.err" \
+            || { cat "lowered_$lowered.err" >&2; fail "lowered_$lowered.c $opt: an internal error instead of a diagnostic: $function"; }
+        [[ $rc == 1 ]] || { cat "lowered_$lowered.err" >&2; fail "lowered_$lowered.c $opt: exit $rc, wanted 1: $function"; }
+        [[ $(diag_lines "lowered_$lowered.err" | wc -l) == 1 ]] \
+            || { cat "lowered_$lowered.err" >&2; fail "lowered_$lowered.c $opt: wanted one diagnostic: $function"; }
+        if [[ -n ${oracle:-} ]]; then
+            set +e
+            "$GCC" -std=gnu17 -fsyntax-only -c "lowered_$lowered.c" 2>"lowered_$lowered.gcc"
+            set -e
+            diff -u <(diag_lines "lowered_$lowered.gcc") <(diag_lines "lowered_$lowered.err") \
+                || fail "lowered_$lowered.c $opt: not what gcc says: $function"
+        else
+            grep -qE ': error: invalid operands to binary ' "lowered_$lowered.err" \
+                || { cat "lowered_$lowered.err" >&2; fail "lowered_$lowered.c $opt: not the operand diagnostic: $function"; }
+        fi
+    done
+done <<'C'
+void b_abs(double d, int i){ (void)(d & __builtin_abs(i)); }
+void b_abs_first(float d, int i){ (void)(__builtin_abs(i) % d); }
+int b_cbrtl(long double k){ return __builtin_cbrtl(k) | 1; }
+int b_or_assign(long double k, int i){ i |= __builtin_cbrtl(k); return i; }
+int b_mod_assign(long double k, int i){ i %= __builtin_cbrtl(k); return i; }
+int b_shl_assign(long double k, int i){ i <<= __builtin_cbrtl(k); return i; }
+int b_inner(long double k, int i){ return (i + 2) * (3 ^ __builtin_cbrtl(k)); }
+C
+[[ $lowered == 7 ]] || fail "the lowering rows were not read ($lowered)"
+
+# What the same operators take stays legal (a gate of rejections alone would
+# pass with every operator refused): a builtin's integer result in `&`, a
+# floating one in `*`, `<` and `&&`, `~` of a complex value (its conjugate),
+# `!` of a pointer, `-` and `~` of vectors.
+cat > operand_arith_legal.c <<'C'
+typedef int v4 __attribute__((vector_size(16)));
+typedef float f4 __attribute__((vector_size(16)));
+int l_truth(double d, int i){ return d && __builtin_popcount(i); }
+double l_times(double d, int i){ return d * __builtin_popcount(i); }
+int l_less(double d, int i){ return d < __builtin_popcount(i); }
+int l_and(int i){ return __builtin_popcount(i) & 3; }
+int l_cast(double d){ return (int)__builtin_sqrt(d) & 1; }
+int l_cmp(double d){ return __builtin_sqrt(d) < 2; }
+long l_shift(long x, int i){ return x << __builtin_ctz(i); }
+int l_eq_complex(_Complex double z, int i){ return z == i; }
+_Complex double l_conj(_Complex double z){ return ~z; }
+int l_truth_ptr(int *p){ return !p; }
+v4 l_neg_ivec(v4 v){ return -v; }
+v4 l_not_ivec(v4 v){ return ~v; }
+f4 l_neg_fvec(f4 v){ return -v; }
+f4 l_plus_fvec(f4 v){ return +v; }
+int l_not_bool(_Bool b){ return ~b; }
+double l_real(_Complex double z){ return __real__ z + __imag__ z; }
+double l_real_double(double d){ return __real__ d; }
+int *l_inc(int *p){ ++p; --p; return p; }
+C
+for std in gnu90 gnu17 gnu23; do
+    rc=$(run_cc "$CCC" operand_arith_legal.c "$std")
+    [[ $rc == 0 ]] || { cat "operand_arith_legal.c.$std.err" >&2; fail "operand_arith_legal.c@$std: a legal form is rejected"; }
+    [[ -z $(diag_lines "operand_arith_legal.c.$std.err") ]] \
+        || { cat "operand_arith_legal.c.$std.err" >&2; fail "operand_arith_legal.c@$std: a legal form is diagnosed"; }
+    if [[ -n ${oracle:-} ]]; then
+        rc=$(run_cc "$GCC" operand_arith_legal.c "$std")
+        [[ $rc == 0 ]] || fail "operand_arith_legal.c@$std: gcc rejects it too (record drift)"
+    fi
+done
+"$CCC" -O2 -c operand_arith_legal.c -o operand_arith_legal.o \
+    || fail "operand_arith_legal.c does not compile to an object"
+
 # ... and a legal program that uses them executes correctly.
 cat > legal_exec.c <<'C'
 #include <stdio.h>

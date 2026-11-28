@@ -3743,50 +3743,27 @@ impl SemanticAnalyzer {
                     discarded && matches!(op, UnaryOp::PreInc | UnaryOp::PreDec),
                     2,
                 );
-                if let Some(ty) = self.constraint_operand(operand) {
-                    let message = match op {
-                        UnaryOp::PreInc => operand_constraints::increment(true, &ty),
-                        UnaryOp::PreDec => operand_constraints::increment(false, &ty),
-                        _ => operand_constraints::unary(*op, &ty),
-                    };
-                    self.constraint_error(message, *span);
-                }
-                if matches!(op, UnaryOp::PreInc | UnaryOp::PreDec) {
-                    // `p++` on a pointer to an undefined record type steps by a
-                    // size that is not known: gcc-16.2's own wording, at the
-                    // operator.
-                    self.check_incomplete_pointer_step(operand, *span, *op == UnaryOp::PreInc);
-                    if !self.check_ext_vector_assignable(operand, *span)
-                        && !self.check_ext_vector_step(operand, *op == UnaryOp::PreInc, *span)
-                    {
-                        self.check_lvalue_operand(operand, *span);
-                        let verb = if *op == UnaryOp::PreInc {
-                            "increment"
-                        } else {
-                            "decrement"
-                        };
-                        self.check_readonly_mutation(operand, *span, verb);
+                match op {
+                    UnaryOp::PreInc => self.check_step_operand(operand, true, *span),
+                    UnaryOp::PreDec => self.check_step_operand(operand, false, *span),
+                    _ => {
+                        // `~` of a builtin's floating result
+                        // (`~__builtin_sqrt(x)`) is judged as `~` of any
+                        // floating value is.
+                        let operand_type = self.constraint_operand(operand).or_else(|| {
+                            (*op == UnaryOp::BitNot)
+                                .then(|| self.floating_builtin_operand(operand))
+                                .flatten()
+                        });
+                        if let Some(ty) = operand_type {
+                            self.constraint_error(operand_constraints::unary(*op, &ty), *span);
+                        }
                     }
                 }
             }
             Expr::PostfixOp(op, operand, span) => {
                 self.analyze_write_operand(operand, discarded, 2);
-                if let Some(ty) = self.constraint_operand(operand) {
-                    let message = operand_constraints::increment(*op == PostfixOp::PostInc, &ty);
-                    self.constraint_error(message, *span);
-                }
-                self.check_incomplete_pointer_step(operand, *span, *op == PostfixOp::PostInc);
-                if !self.check_ext_vector_assignable(operand, *span)
-                    && !self.check_ext_vector_step(operand, *op == PostfixOp::PostInc, *span)
-                {
-                    self.check_lvalue_operand(operand, *span);
-                    let verb = if *op == PostfixOp::PostInc {
-                        "increment"
-                    } else {
-                        "decrement"
-                    };
-                    self.check_readonly_mutation(operand, *span, verb);
-                }
+                self.check_step_operand(operand, *op == PostfixOp::PostInc, *span);
             }
             Expr::Assign(lhs, rhs, span) => {
                 self.analyze_write_operand(lhs, discarded, 1);
@@ -4956,6 +4933,71 @@ impl SemanticAnalyzer {
         Some(ty)
     }
 
+    /// The result type of a builtin call, when it is a real floating or a
+    /// complex type.
+    ///
+    /// [`Self::constraint_operand`] has no type for a builtin call: what a
+    /// builtin is declared to return is not always what lowering gives it
+    /// (the vector builtins yield an address), and some return the type of
+    /// an argument. A floating result is neither: no builtin declared to
+    /// return a floating type yields anything else. That is enough for the
+    /// operators that take integers only, where one floating operand is the
+    /// violation whatever the other is. Unjudged, `__builtin_sqrt(x) & 1`,
+    /// `d % __builtin_popcount(n)` and, from the SIMD headers, a `double`
+    /// handed to a mask parameter went to the code generator, which has no
+    /// such instruction and stopped with an internal error.
+    fn floating_builtin_operand(&self, expr: &Expr) -> Option<CType> {
+        self.builtin_call_ctype(expr)
+            .filter(|ty| operand_constraints::is_real_float(ty) || ty.is_complex())
+    }
+
+    /// What a builtin call is declared to yield, as a value type. Exact for
+    /// the scalar builtins and not for every builtin (see
+    /// [`Self::floating_builtin_operand`]): only for naming an operand in a
+    /// diagnostic another operand has already decided.
+    fn builtin_call_ctype(&self, expr: &Expr) -> Option<CType> {
+        let Expr::FunctionCall(callee, ..) = expr else {
+            return None;
+        };
+        if !matches!(callee.as_ref(), Expr::Identifier(name, _) if builtins::is_builtin(name)) {
+            return None;
+        }
+        self.expr_type_checker().infer_value_ctype(expr)
+    }
+
+    /// The operand types of an integer-only operator (`%`, `&`, `|`, `^`,
+    /// `<<`, `>>`) one of whose operands [`Self::constraint_operand`] does
+    /// not type, when the operator is known to be violated all the same: an
+    /// operand is floating for certain (an exactly typed one, or a builtin's
+    /// floating result). The other operand is then named by its declared
+    /// type; where it has none that is an arithmetic type, nothing is
+    /// returned and the lowering, which knows every type, says it.
+    fn integer_only_operands(
+        &self,
+        op: BinOp,
+        lhs: (&Expr, Option<CType>),
+        rhs: (&Expr, Option<CType>),
+    ) -> Option<(CType, CType)> {
+        if !operand_constraints::integer_operands_only(op) {
+            return None;
+        }
+        let floating = |ty: &CType| operand_constraints::is_real_float(ty) || ty.is_complex();
+        let decided = |(expr, exact): &(&Expr, Option<CType>)| match exact {
+            Some(ty) => floating(ty),
+            None => self.floating_builtin_operand(expr).is_some(),
+        };
+        if !decided(&lhs) && !decided(&rhs) {
+            return None;
+        }
+        let named = |(expr, exact): (&Expr, Option<CType>)| {
+            exact.or_else(|| {
+                self.builtin_call_ctype(expr)
+                    .filter(|ty| ty.is_integer() || floating(ty))
+            })
+        };
+        Some((named(lhs)?, named(rhs)?))
+    }
+
     /// The type of `expr` for the expression-level constraints that inspect
     /// the operand itself rather than a value of it (`.`/`->`/`*`), **without**
     /// array-to-pointer decay: `int a[3]; a.x` is a member request on an
@@ -5144,9 +5186,12 @@ impl SemanticAnalyzer {
                 bit_width,
             }
         }
-        let (Some(lt), Some(rt)) = (self.constraint_operand(lhs), self.constraint_operand(rhs))
-        else {
-            return;
+        let (lt, rt) = match (self.constraint_operand(lhs), self.constraint_operand(rhs)) {
+            (Some(lt), Some(rt)) => (lt, rt),
+            (lt, rt) => match self.integer_only_operands(op, (lhs, lt), (rhs, rt)) {
+                Some(pair) => pair,
+                None => return,
+            },
         };
         if matches!(
             op,
@@ -10297,6 +10342,55 @@ dereference it before applying '->' to it?"
         }
     }
 
+    /// The operand of `++` or `--`, prefix or postfix (C11 6.5.2.4p1,
+    /// 6.5.3.1p1): a modifiable lvalue of real or pointer type.
+    fn check_step_operand(&self, operand: &Expr, increment: bool, span: Span) {
+        // An array or a function designator is said once, as GCC says it,
+        // and none of the other checks of a step applies to it.
+        if self.check_designator_step(operand, increment, span) {
+            return;
+        }
+        if let Some(ty) = self.constraint_operand(operand) {
+            self.constraint_error(operand_constraints::increment(increment, &ty), span);
+        }
+        // `p++` on a pointer to an undefined record type steps by a size
+        // that is not known: gcc-16.2's own wording, at the operator.
+        self.check_incomplete_pointer_step(operand, span, increment);
+        if !self.check_ext_vector_assignable(operand, span)
+            && !self.check_ext_vector_step(operand, increment, span)
+        {
+            self.check_lvalue_operand(operand, span);
+            let verb = if increment { "increment" } else { "decrement" };
+            self.check_readonly_mutation(operand, span, verb);
+        }
+    }
+
+    /// `++` and `--` of an array or of a function designator (C11 6.5.2.4p1,
+    /// 6.5.3.1p1: a modifiable lvalue of real or pointer type). The operand
+    /// converts to a pointer value, and a value is nothing to step: GCC
+    /// 16.2 says `lvalue required as increment operand`. lccc stepped the
+    /// address it had taken. Judged on the operand's own type, before the
+    /// conversion: a parameter written as an array is a pointer and steps.
+    /// Returns whether it reported.
+    fn check_designator_step(&self, operand: &Expr, increment: bool, span: Span) -> bool {
+        // A string literal is an array too, whatever type inference calls
+        // the value it becomes.
+        let designator = matches!(
+            operand,
+            Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..)
+        ) || matches!(
+            self.expr_type_checker().infer_expr_ctype(operand),
+            Some(CType::Array(..) | CType::Function(_))
+        );
+        if designator {
+            let what = if increment { "increment" } else { "decrement" };
+            self.diagnostics
+                .borrow_mut()
+                .error(format!("lvalue required as {what} operand"), span);
+        }
+        designator
+    }
+
     /// GCC 16.2 rejects an assignment whose left operand has array type
     /// with `assignment to expression with array type` (C11 6.5.16p1),
     /// reported BEFORE the const check (measured: `const int a[2]` says
@@ -10309,13 +10403,23 @@ dereference it before applying '->' to it?"
         // The assigned expression's own type decides: `*a` of a 1-D array
         // is the element (a legal assignment), `*a` of a 2-D array is the
         // inner array (measured on gcc-16.2.0), and `a` itself is the array.
-        let is_array = matches!(tc.infer_expr_ctype(target), Some(CType::Array(..)));
+        let target_type = tc.infer_expr_ctype(target);
+        let is_array = matches!(target_type, Some(CType::Array(..)));
         if is_array {
             self.diagnostics
                 .borrow_mut()
                 .error("assignment to expression with array type".to_string(), span);
         }
-        is_array
+        // A function designator is no object to assign to either (`f = g`,
+        // `f -= 1`): GCC's wording for it. lccc stored through the address.
+        let is_function = matches!(target_type, Some(CType::Function(_)));
+        if is_function {
+            self.diagnostics.borrow_mut().error(
+                "lvalue required as left operand of assignment".to_string(),
+                span,
+            );
+        }
+        is_array || is_function
     }
 
     /// Is `target` the selection of a BIT-FIELD member (through `.`, `->`, or

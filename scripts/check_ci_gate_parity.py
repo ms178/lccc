@@ -1043,6 +1043,29 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
         rest_spec=("--check",),
     ),
     InvocationContract(
+        program="scripts/operand_constraint_matrix.py",
+        name="operand-constraint-matrix-self-test",
+        sides=_BOTH,
+        rest_spec=("--self-test",),
+        local_gate=("operand-constraint-matrix-self-test", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/operand_constraint_matrix.py",
+        name="operand-constraint-matrix-local",
+        sides=frozenset({"local"}),
+        option_spec={"--lccc": ("$LCCC",), "--gcc": ("${GCC16:-gcc-16}",)},
+        rest_spec=("--check",),
+        local_gate=("operand-constraint-matrix", "slow"),
+    ),
+    InvocationContract(
+        program="scripts/operand_constraint_matrix.py",
+        name="operand-constraint-matrix-hosted",
+        sides=frozenset({"hosted"}),
+        option_spec={"--lccc": ("target/fastbuild/lccc",),
+                     "--gcc": (HOSTED_GCC162,)},
+        rest_spec=("--check",),
+    ),
+    InvocationContract(
         program="scripts/x86_intrinsic_values.py",
         name="x86-intrinsic-values-local",
         sides=frozenset({"local"}),
@@ -1114,6 +1137,7 @@ PROGRAM_ENV_CHANNELS: dict[str, frozenset[str]] = {
     "scripts/check_x86_prefetch.py": frozenset({"GCC"}),
     "scripts/x86_intrinsic_census.py": frozenset({"GCC"}),
     "scripts/x86_intrinsic_types.py": frozenset({"GCC"}),
+    "scripts/operand_constraint_matrix.py": frozenset({"GCC"}),
     "scripts/x86_intrinsic_values.py": frozenset({"GCC"}),
 }
 

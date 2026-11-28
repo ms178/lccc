@@ -1147,6 +1147,17 @@ impl Lowerer {
     // -----------------------------------------------------------------------
 
     pub(super) fn lower_compound_assign(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Operand {
+        // `%=`, the shifts and the bitwise forms with a floating operand:
+        // refused here as their binary operators are, before any of the
+        // paths below picks a floating operation there is no code for.
+        if crate::frontend::sema::integer_operands_only(*op) {
+            let (lhs_ty, rhs_ty) = (self.get_expr_type(lhs), self.get_expr_type(rhs));
+            if let Some(rejected) =
+                self.reject_floating_operand_of_integer_operator(op, lhs, rhs, lhs_ty, rhs_ty)
+            {
+                return rejected;
+            }
+        }
         // Vector compound assignment (element-wise)
         let lhs_ct = self.expr_ctype(lhs);
         if lhs_ct.is_vector() {

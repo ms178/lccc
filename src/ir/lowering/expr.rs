@@ -350,11 +350,24 @@ impl Lowerer {
                 Some((value, _)) => Operand::Const(IrConst::I64(value)),
                 None => self.lower_identifier(name),
             },
-            Expr::BinaryOp(op, lhs, rhs, _) => self.lower_binary_op(op, lhs, rhs),
+            Expr::BinaryOp(op, lhs, rhs, span) => {
+                // The operands may be binary expressions themselves: the
+                // place is this operator's until its operands are lowered,
+                // and again the enclosing one's afterwards.
+                let enclosing = self.binary_operator_span.replace(*span);
+                let result = self.lower_binary_op(op, lhs, rhs);
+                self.binary_operator_span = enclosing;
+                result
+            }
             Expr::UnaryOp(op, inner, _) => self.lower_unary_op(*op, inner),
             Expr::PostfixOp(op, inner, _) => self.lower_post_inc_dec(inner, *op),
             Expr::Assign(lhs, rhs, _) => self.lower_assign(lhs, rhs),
-            Expr::CompoundAssign(op, lhs, rhs, _) => self.lower_compound_assign(op, lhs, rhs),
+            Expr::CompoundAssign(op, lhs, rhs, span) => {
+                let enclosing = self.binary_operator_span.replace(*span);
+                let result = self.lower_compound_assign(op, lhs, rhs);
+                self.binary_operator_span = enclosing;
+                result
+            }
             Expr::FunctionCall(func, args, _) => self.lower_function_call(func, args),
             Expr::Conditional(cond, then_expr, else_expr, _) => {
                 let value = self.lower_conditional(cond, then_expr, else_expr);

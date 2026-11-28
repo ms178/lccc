@@ -519,11 +519,76 @@ impl Lowerer {
         Operand::Value(scaled)
     }
 
+    /// `lhs OP rhs` or `lhs OP= rhs` where OP takes integers only and an
+    /// operand is floating: GCC's diagnostic, and a zero for the value.
+    ///
+    /// `%`, the shifts and the bitwise operators have integer operands (C11
+    /// 6.5.5p2, 6.5.7p2, 6.5.10-12): there is no floating form to lower to,
+    /// and the code generator has none to emit. The analyzer refuses a
+    /// floating operand wherever it knows the operand types. Lowering knows
+    /// all of them (the result of a builtin the analyzer has no type for),
+    /// so this is the last place that can answer with the diagnostic where
+    /// the code generator stopped with an internal error ("unsupported
+    /// float binop: And on type F64").
+    ///
+    /// The place is the operator, where GCC points. The operands are still
+    /// lowered, for what else is wrong in them.
+    pub(super) fn reject_floating_operand_of_integer_operator(
+        &mut self,
+        op: &BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        lhs_ty: IrType,
+        rhs_ty: IrType,
+    ) -> Option<Operand> {
+        if !crate::frontend::sema::integer_operands_only(*op)
+            || !(lhs_ty.is_float() || rhs_ty.is_float())
+        {
+            return None;
+        }
+        let message = crate::frontend::sema::invalid_binary_operands(
+            *op,
+            &self.diagnosed_operand_ctype(lhs, lhs_ty),
+            &self.diagnosed_operand_ctype(rhs, rhs_ty),
+        );
+        let place = self
+            .binary_operator_span
+            .take()
+            .unwrap_or_else(|| lhs.span());
+        self.emit_error(message, place);
+        let _ = self.lower_expr(lhs);
+        let _ = self.lower_expr(rhs);
+        Some(Operand::Const(IrConst::I32(0)))
+    }
+
+    /// The C type an operand is named by in a diagnostic of the lowering:
+    /// its C type, unless that is of another kind than the value it is
+    /// lowered to. They are for the builtins whose C type nothing records:
+    /// `__builtin_cbrtl(x)` is an `int` to `expr_ctype` and a `long double`
+    /// to the lowering, and "invalid operands (have 'int' and 'int')" names
+    /// no violation. (The width is the C type's to say: a literal `1` is an
+    /// `int` lowered at register width.)
+    fn diagnosed_operand_ctype(&self, expr: &Expr, lowered: IrType) -> CType {
+        let ctype = self.expr_ctype(expr);
+        match lowered {
+            IrType::F32 if !ctype.is_floating() => CType::Float,
+            IrType::F64 if !ctype.is_floating() => CType::Double,
+            IrType::F128 if !ctype.is_floating() => CType::LongDouble,
+            _ => ctype,
+        }
+    }
+
     pub(super) fn lower_arithmetic_binop(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Operand {
         let lhs_ty = self.infer_expr_type(lhs);
         let rhs_ty = self.infer_expr_type(rhs);
         let lhs_expr_ty = self.get_expr_type(lhs);
         let rhs_expr_ty = self.get_expr_type(rhs);
+
+        if let Some(rejected) =
+            self.reject_floating_operand_of_integer_operator(op, lhs, rhs, lhs_expr_ty, rhs_expr_ty)
+        {
+            return rejected;
+        }
 
         let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
 

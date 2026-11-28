@@ -2446,6 +2446,21 @@ jobs:
       run: >-
         python3 scripts/x86_intrinsic_types.py --check --lccc target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
+    # Every operator on every kind of operand, lccc's verdict against GCC's:
+    # 200 unary cells and 14,112 binary ones. The operand gate of the
+    # frontend lane pins the messages of the cases somebody wrote down; this
+    # asks the question for all of them, so that an operand kind nobody
+    # thought of (`~` of a double was compiled as the complement of its
+    # bits) is a cell that differs. No cell may be a valid program refused
+    # or an internal error, and the cells lccc still accepts where GCC
+    # refuses are counted in the script and may only become fewer.
+    - name: Self-test the operand-constraint matrix
+      run: python3 scripts/operand_constraint_matrix.py --self-test
+    - name: Every operator on every operand kind against GCC 16.2
+      run: >-
+        python3 scripts/operand_constraint_matrix.py --check
+        --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
     # Which extension each SIMD helper of include/lcccsimd.h needs is held to
     # a table generated from GCC 16.2's headers. Nothing ran the comparison
     # (only its self-test), and it had come apart: 29 helpers, the FMA 132
