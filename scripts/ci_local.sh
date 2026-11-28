@@ -1411,6 +1411,12 @@ gate "x86-prefetch-instructions" fast \
 # directions.
 gate "x86-intrinsic-census" fast \
     python3 scripts/x86_intrinsic_census.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# A call that compiles also has a type. For 48 intrinsics lccc lowers by name
+# it was the implicit `int`, and its value the address of the vector:
+# `return _mm_sll_epi16(a, n);` returned a stack address. Every intrinsic lccc
+# has is asserted to have the type GCC 16.2's header gives it.
+gate "x86-intrinsic-types" fast \
+    python3 scripts/x86_intrinsic_types.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 # Which extension each SIMD helper needs, against the table generated from
 # GCC 16.2's headers (tests/simd/isa_permissions_gcc16.json). No compiler.
 gate "simd-isa-permissions" fast \

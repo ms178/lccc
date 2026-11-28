@@ -2436,6 +2436,16 @@ jobs:
       run: >-
         python3 scripts/x86_intrinsic_census.py --check --lccc target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
+    # A call that compiles also has a type, and for 48 intrinsics it was the
+    # implicit `int`: lccc lowers the name itself, no header declares it, and
+    # the call's value is the address of the vector. A variable initialized
+    # from it got the right bytes; `return _mm_sll_epi16(a, n);` returned a
+    # stack address. Every intrinsic lccc has is asserted to have the type GCC
+    # 16.2's header gives it.
+    - name: Verify the type of every x86 intrinsic call against GCC 16.2's headers
+      run: >-
+        python3 scripts/x86_intrinsic_types.py --check --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
     # Which extension each SIMD helper of include/lcccsimd.h needs is held to
     # a table generated from GCC 16.2's headers. Nothing ran the comparison
     # (only its self-test), and it had come apart: 29 helpers, the FMA 132

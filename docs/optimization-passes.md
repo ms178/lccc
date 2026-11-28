@@ -471,6 +471,34 @@ passes; the backend peepholes are documented per backend
   [x86-isa-permissions-and-simd-abi.md](x86-isa-permissions-and-simd-abi.md)
   §2.3.
 
+- **Store forwarding of 32-byte slots** (x86-64, `global_store_forwarding`)
+  — a store from `%ymm0`..`%ymm15` maps its slot to the register, and a
+  32-byte reload of the slot is the 256-bit register move of the load's own
+  spelling (`vmovdqu %ymm4, 8(%rsp); vmovaps 8(%rsp), %ymm0` becomes
+  `vmovaps %ymm4, %ymm0`): both copy 256 bits and zero bits 256 and up.
+  Reloaded into the register that wrote the slot, only that zeroing is left;
+  the reload goes when the `zmm` upper half is dead
+  (`FpLiveness::zmm_high_dead_after`) and stays, with its mapping, otherwise.
+  A reload of sixteen bytes or fewer at the slot's offset reads the low half
+  of the register. The mapping ends at any write of the register (at any
+  width, legacy or VEX, masked or not), any write into the slot's 32 bytes,
+  `vzeroupper`, a call, and a stack adjustment. `movupd`/`vmovupd` are slot
+  moves like the other five packed spellings (they were the one that was
+  not, so a `__m128d`/`__m256d` home kept its store and reload). The
+  whole-vector store gate (`check_vector_store_forward.sh`) holds its shapes
+  to their budgets with the IR pass, without it, and with neither stage.
+
+- **Alignment of a home beside a call** (x86-64, `vecabialign`) — a home
+  that a call marshals (a register-passed vector argument, the buffer of a
+  `%ymm0`/`%zmm0` result) and an explicit-SIMD intrinsic fills or drains
+  (`Loadu256`, `Storeu256`, any operand `pointer_vector_arg_width` lists) is
+  relaxed to sixteen bytes when every use tolerates it: the intrinsic uses
+  are answered by the table `downgrade_nonescaping_vector_align` relaxes
+  by. A 32-byte contract (`Store256`, `Load256`, the streaming forms) and
+  an unlisted position keep the alignment. See
+  [x86-isa-permissions-and-simd-abi.md](x86-isa-permissions-and-simd-abi.md)
+  §2.4.
+
 - **Identical basic-block merging** (`merge_identical_blocks`) — a block is
   deleted and its predecessors retargeted when its instruction text matches
   another block's and either (a) both have the **same non-empty predecessor

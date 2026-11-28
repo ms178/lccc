@@ -257,6 +257,20 @@ impl FpLiveness {
         f.live_out[idx - f.start] & upper_regions(low) == 0
     }
 
+    /// A 256-bit VEX move into `%ymm<n>` copies the low 256 bits and zeroes
+    /// bits 256..511. Reloading a 32-byte slot into the register that wrote
+    /// it leaves only that zeroing, which is dead exactly when the ZMM upper
+    /// region is. Fails closed like its 128-bit counterpart above.
+    pub(super) fn zmm_high_dead_after(&self, idx: usize, n: u32) -> bool {
+        if n >= 16 {
+            return false;
+        }
+        let Some(f) = self.func_of(idx).filter(|f| f.known) else {
+            return false;
+        };
+        f.live_out[idx - f.start] & (1u128 << (ZMM_HIGH_SHIFT + n)) == 0
+    }
+
     /// Same question for the `size`-byte frame slot at `offset(%base)`
     /// (`base` is the family id: `REG_RSP` or `REG_RBP`).  Any overlapping
     /// tracked slot that is live makes the answer `Some(true)`; a slot that

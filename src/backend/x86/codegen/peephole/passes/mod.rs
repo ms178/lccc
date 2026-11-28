@@ -7025,8 +7025,41 @@ mod regression_tests {
 
     /// With a prologue `subq` the frame-preserving form applies: the frame
     /// total, and with it every `%rsp`-relative (aligned) slot, is unchanged.
+    ///
+    /// The slot has to stay a slot for this to be about anything: `%ymm0` is
+    /// rewritten between the store and the reload, so store forwarding (which
+    /// serves a 32-byte reload from the register that filled the slot) has no
+    /// register to serve it from.
     #[test]
     fn fpo_dead_callee_save_dropped_with_aligned_vector_stack_traffic() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %r13\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    subq $32, %rsp\n",
+            "    vmovaps %ymm0, (%rsp)\n",
+            "    vxorps %xmm0, %xmm0, %xmm0\n",
+            "    vmovaps (%rsp), %ymm1\n",
+            "    addq $32, %rsp\n",
+            "    popq %r13\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%r13"), "{out}");
+        assert!(out.contains("subq $40, %rsp"), "{out}");
+        assert!(out.contains("addq $40, %rsp"), "{out}");
+        assert!(out.contains("vmovaps %ymm0, (%rsp)"), "{out}");
+        assert!(out.contains("vmovaps (%rsp), %ymm1"), "{out}");
+    }
+
+    /// The same frame with nothing between the store and the reload: the
+    /// reload is the register move, the store has no reader left, and a frame
+    /// that holds nothing goes with the save.
+    #[test]
+    fn fpo_forwarded_vector_slot_takes_its_frame_and_the_dead_save_with_it() {
         let asm = concat!(
             "f:\n",
             ".cfi_startproc\n",
@@ -7042,10 +7075,9 @@ mod regression_tests {
             ".size f, .-f\n",
         );
         let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("vmovaps %ymm0, %ymm1"), "{out}");
+        assert!(!out.contains("%rsp"), "{out}");
         assert!(!out.contains("%r13"), "{out}");
-        assert!(out.contains("subq $40, %rsp"), "{out}");
-        assert!(out.contains("addq $40, %rsp"), "{out}");
-        assert!(out.contains("vmovaps %ymm0, (%rsp)"), "{out}");
     }
 
     /// Without a `subq` the push must go outright, which moves `%rsp`:

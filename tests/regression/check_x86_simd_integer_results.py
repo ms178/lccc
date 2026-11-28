@@ -27,9 +27,8 @@ What is checked, per function of the probe below:
 * a `vpcmp` names no `%zmm1`: its second source is where it was;
 * it is no longer than GCC's function, give or take what the table says
   and why (GCC is measured here, not remembered);
-* the functions of `OPEN` are recorded at the length they have: a 256-bit
-  value that goes through a slot stays there. They may not get longer, and
-  when they get shorter the record has to follow;
+* the functions of `OPEN` are recorded at the length they have. They may
+  not get longer, and when they get shorter the record has to follow;
 * its values are GCC's: the probe is built by both and run, where the CPU
   has what the group is built for (/proc/cpuinfo). Elsewhere the group is
   built and its shapes are checked, and the gate says it ran nothing.
@@ -74,22 +73,29 @@ SSE2 = {
              "{ int x = _mm_movemask_epi8(a), y = _mm_movemask_epi8(b);\n"
              "  return x * 31 + y; }", 1),
 }
-# Open, recorded so that they can only get better: a 256-bit value that goes
-# through a slot stays there (the store forwarder gives a 32-byte store no
-# mapping), and the 256-bit float compares still compute through memory.
+# GCC leaves the upper halves to the caller that passed a 256-bit argument;
+# lccc (and Clang 23.1.5) clears them before it returns: one `vzeroupper`
+# in each of these.
 AVX2 = {
-    # GCC leaves the upper halves to the caller that passed a 256-bit
-    # argument; lccc clears them before it returns: one `vzeroupper`.
     "full32": ("int full32(__m256i a)\n"
                "{ return _mm256_movemask_epi8(a) == -1; }", 1),
-}
-OPEN = {
+    # The compare's result went through a 32-byte slot: a 32-byte store had
+    # no mapping in the store forwarder (11 instructions).
     "equal32": ("int equal32(__m256i a, __m256i b)\n"
-                "{ return _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) == -1; }", 5),
-    "signs8": ("int signs8(__m256 a, __m256 b)\n"
-               "{ return _mm256_movemask_ps(_mm256_cmp_ps(a, b, 1)); }", 12),
+                "{ return _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) == -1; }", 1),
+    # The float sign masks had no row among the operations that read a home
+    # whole, so the parameter was copied into a home aligned to 32, half by
+    # half (19 instructions).
     "signs4": ("int signs4(__m256d a)\n"
-               "{ return _mm256_movemask_pd(a) != 0; }", 14),
+               "{ return _mm256_movemask_pd(a) != 0; }", 1),
+}
+# Open, recorded so that it can only get better: the second operand of the
+# compare is stored and read back as the instruction's memory operand
+# (`vmovdqu %ymm1, 40(%rsp); vcmpps $1, 40(%rsp), %ymm0, %ymm0`), which the
+# store forwarder does not rewrite: a frame, a store, and the `vzeroupper`.
+OPEN = {
+    "signs8": ("int signs8(__m256 a, __m256 b)\n"
+               "{ return _mm256_movemask_ps(_mm256_cmp_ps(a, b, 1)); }", 4),
 }
 AVX512 = {
     # GCC tests the mask where it is (`kortestw`); lccc moves it out and

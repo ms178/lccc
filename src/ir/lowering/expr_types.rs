@@ -440,6 +440,9 @@ impl Lowerer {
         if crate::common::avx_widen::AvxWiden::raw_builtin(name).is_some() {
             return Some(IrType::Ptr);
         }
+        if let Some(result) = crate::frontend::sema::builtins::x86_vector_builtin_ctype(name) {
+            return Some(IrType::from_ctype(&result));
+        }
         match name {
             // x86 vector scalar extractions with 64-bit results (long long /
             // unsigned long long). Without these the call was typed with the

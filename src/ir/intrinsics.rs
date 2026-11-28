@@ -2624,6 +2624,19 @@ impl IntrinsicOp {
             | DpPs256 | RcpPs256 | RsqrtPs256
             | RoundPs256 | RoundPd256 | VpermilPs256 | VpermilPd256
             | VpermilvarPs256 | VpermilvarPd256 | BlendPs256 | BlendPd256
+            // The variable blends, the FMA3 forms and the rest of the VNNI
+            // dot products write a 32-byte result like every row above; the
+            // list had the immediate blends, no FMA and three of the
+            // fourteen dot products, so the results of the others stayed
+            // homes no pass could reason about.
+            | BlendvPs256 | BlendvPd256
+            | FmaPs132v256 | FmaPs213v256 | FmaPs231v256
+            | FmaPd132v256 | FmaPd213v256 | FmaPd231v256
+            | FmsubPs132v256 | FmsubPd132v256 | FnmaddPs132v256 | FnmaddPd132v256
+            | FnmsubPs132v256 | FnmsubPd132v256 | FmaddsubPs132v256 | FmaddsubPd132v256
+            | FmsubaddPs132v256 | FmsubaddPd132v256
+            | Dpbusds256 | Dpwusd256 | Dpwusds256 | Dpbssds256 | Dpbsud256 | Dpbsuds256
+            | Dpbuud256 | Dpbuuds256 | Dpwuuds256 | Dpwssd256 | Dpwssds256
             | LoaduPs256 | StoreuPs256 | LoaduPd256
             | StoreuPd256 | Permute2x128 | Permute4x64 | Permutevar8x32 | Pshufd256
             | Punpcklbw256 | Punpckhbw256 | Punpcklwd256 | Punpckhwd256

@@ -395,8 +395,12 @@ class UniversalContractTest(unittest.TestCase):
             prefetch = f"python3 scripts/check_x86_prefetch.py {lccc}"
             census = f"python3 scripts/x86_intrinsic_census.py --check --lccc {lccc}"
             values = f"python3 scripts/x86_intrinsic_values.py --check --lccc {lccc}"
+            types = f"python3 scripts/x86_intrinsic_types.py --check --lccc {lccc}"
             for name, old, new in (
                 ("census without --check", census, census.replace(" --check", "")),
+                ("types without --check", types, types.replace(" --check", "")),
+                ("types of another binary", types, types.replace(lccc, "/usr/bin/gcc")),
+                ("the types of one header", types, types + " --only emmintrin.h"),
                 ("values without --check", values, values.replace(" --check", "")),
                 ("a census that rewrites its record", census,
                  census.replace("--check", "--update")),
@@ -418,7 +422,7 @@ class UniversalContractTest(unittest.TestCase):
             # The reference compiler and the assembler, at each gate's own
             # line: the first `--gcc` after the program's name is its own.
             for program in ("check_x86_prefetch.py", "x86_intrinsic_census.py",
-                            "x86_intrinsic_values.py"):
+                            "x86_intrinsic_types.py", "x86_intrinsic_values.py"):
                 start = text.index(f"python3 scripts/{program}")
                 at = text.index(gcc, start)
                 self.assertLess(at - start, 200, program)
@@ -457,7 +461,7 @@ class UniversalContractTest(unittest.TestCase):
                     self.check(**{side: text + "\n" + extra + "\n"}), 1)
         # Deleting a gate from one mirror leaves a contract nothing matches.
         for program in ("check_x86_prefetch.py", "x86_intrinsic_census.py",
-                        "x86_intrinsic_values.py"):
+                        "x86_intrinsic_types.py", "x86_intrinsic_values.py"):
             with self.subTest(program=program, edit="gone from the workflow"):
                 kept = "\n".join(line for line in self.hosted.splitlines()
                                  if program not in line)

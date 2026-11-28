@@ -881,6 +881,52 @@ impl Lowerer {
 
     /// Reject a builtin call, lower the arguments for their side effects, and
     /// return a placeholder of `bytes` bytes.
+    /// The type a call of the public or GNU-named x86 intrinsic `name` has,
+    /// when that type is neither `bytes` wide nor a pointer.
+    ///
+    /// The value of such a call is the address of a `bytes`-byte result, and
+    /// every consumer reads it by the call's type: a return copies that many
+    /// bytes, an argument is passed in a vector register, `sizeof` is that
+    /// number. Two types say what the value is. A vector (or a record) of
+    /// `bytes` bytes: the call is the object at that address. A pointer: the
+    /// call is the address, and the header dereferences it
+    /// (`__CCC_M128I_FROM_BUILTIN`). A call typed as anything else -- the
+    /// implicit `int` of a name no header declares and no builtin table
+    /// types -- is compiled as a scalar whose value is that address.
+    /// `_mm_sll_epi16` was one of 48: `return _mm_sll_epi16(a, n);` returned
+    /// a stack address.
+    ///
+    /// The type is looked up as `get_expr_ctype` looks it up for the call
+    /// expression: the declaration in scope first, the builtin's own type
+    /// second. The header-private spellings (`__lccc_*`) are not asked: they
+    /// are declared by the generated header, each with the type its one
+    /// caller there expects.
+    fn mistyped_x86_vector_call(&self, name: &str, bytes: usize) -> Option<String> {
+        if !(name.starts_with("_mm") || name.starts_with("__builtin_ia32_")) {
+            return None;
+        }
+        let key = self.callee_signature_key(name);
+        let typed = self
+            .func_meta
+            .sigs
+            .get(key.as_str())
+            .and_then(|sig| sig.return_ctype.clone())
+            .or_else(|| {
+                self.sema_functions
+                    .get(key.as_str())
+                    .map(|info| info.return_type.clone())
+            })
+            .or_else(|| {
+                crate::frontend::sema::type_checker::ExprTypeChecker::builtin_return_ctype(name)
+            });
+        match typed {
+            Some(CType::Pointer(..)) => None,
+            Some(ctype) if ctype.size_ctx(&*self.types.borrow_struct_layouts()) == bytes => None,
+            Some(ctype) => Some(format!("{ctype}")),
+            None => Some("int".to_string()),
+        }
+    }
+
     pub(super) fn reject_builtin_call(
         &mut self,
         message: String,
@@ -3796,6 +3842,21 @@ impl Lowerer {
                 Some(Operand::Const(IrConst::I64(0)))
             }
             X86IntrinsicKind::Vec128 | X86IntrinsicKind::Vec256 => {
+                let result_size = match x86_intrinsic_kind(intrinsic) {
+                    X86IntrinsicKind::Vec128 => 16,
+                    _ => 32,
+                };
+                if let Some(typed) = self.mistyped_x86_vector_call(name, result_size) {
+                    return self.reject_builtin_call(
+                        format!(
+                            "a call of '{name}' has type '{typed}' here, and its value is a \
+                             {result_size}-byte vector: no declaration of '{name}' is in scope \
+                             (include <immintrin.h>)"
+                        ),
+                        args,
+                        result_size,
+                    );
+                }
                 // GNU's byte-lane shift/align builtins take BIT counts;
                 // the instruction IR and public _mm APIs take byte counts.
                 let bit_count = name.starts_with("__builtin_ia32_")
@@ -3854,11 +3915,6 @@ impl Lowerer {
                 if let (Some(value), Some(last)) = (immediate_value, arg_ops.last_mut()) {
                     *last = Operand::Const(IrConst::I32(value as i32));
                 }
-                let result_size = match x86_intrinsic_kind(intrinsic) {
-                    X86IntrinsicKind::Vec128 => 16,
-                    X86IntrinsicKind::Vec256 => 32,
-                    _ => unreachable!(),
-                };
                 let result_alloca = self.fresh_value();
                 let align = match result_size {
                     32 => 32usize,

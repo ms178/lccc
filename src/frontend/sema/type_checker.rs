@@ -1552,6 +1552,9 @@ impl<'a> ExprTypeChecker<'a> {
         if let Some(op) = crate::common::avx_widen::AvxWiden::raw_builtin(name) {
             return Some(CType::Vector(Box::new(op.result_element()), 32));
         }
+        if let Some(ct) = crate::frontend::sema::builtins::x86_vector_builtin_ctype(name) {
+            return Some(ct);
+        }
         if let Some(ct) = crate::frontend::sema::builtins::gcc_compat_builtin_ctype(name) {
             return Some(ct);
         }

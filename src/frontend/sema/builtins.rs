@@ -4755,6 +4755,173 @@ pub fn normalize_atomic_size_suffix(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The 128-bit stems of the VNNI dot products the compiler lowers by name
+/// (`_mm_<stem>`, and `_mm256_<stem>` at 256 bits): AVX512-VNNI's four,
+/// AVX-VNNI's `_avx` spellings of them, and the INT8 and INT16 families.
+const X86_DOT_PRODUCT_STEMS: [&str; 24] = [
+    "dpbssd_epi32",
+    "dpbssds_epi32",
+    "dpbsud_epi32",
+    "dpbsuds_epi32",
+    "dpbusd_avx_epi32",
+    "dpbusd_epi32",
+    "dpbusds_avx_epi32",
+    "dpbusds_epi32",
+    "dpbuud_epi32",
+    "dpbuuds_epi32",
+    "dpwssd_avx_epi32",
+    "dpwssd_epi32",
+    "dpwssds_avx_epi32",
+    "dpwssds_epi32",
+    "dpwsud_avx_epi32",
+    "dpwsuds_avx_epi32",
+    "dpwusd_avx_epi32",
+    "dpwusd_epi32",
+    "dpwusds_avx_epi32",
+    "dpwusds_epi32",
+    "dpwuud_avx_epi32",
+    "dpwuud_epi32",
+    "dpwuuds_avx_epi32",
+    "dpwuuds_epi32",
+];
+
+/// lccc's own 128-bit vector builtins under `__builtin_ia32_` names that the
+/// table generated from GCC's `i386-builtin.def` has no row for (GCC spells
+/// most of them otherwise: its `pand` at 256 bits is
+/// `__builtin_ia32_andsi256`). A call of one is the vector.
+const X86_PRIVATE_VECTOR_BUILTINS_128: [&str; 11] = [
+    "__builtin_ia32_extract128i256",
+    "__builtin_ia32_extracti128",
+    "__builtin_ia32_gf2p8affineinvqb",
+    "__builtin_ia32_gf2p8affineqb",
+    "__builtin_ia32_gf2p8mulb",
+    "__builtin_ia32_set1_epi32",
+    "__builtin_ia32_set1_epi8",
+    "__builtin_ia32_vpdpbusd128",
+    "__builtin_ia32_vpdpbusds128",
+    "__builtin_ia32_vpdpwssd128",
+    "__builtin_ia32_vpdpwssds128",
+];
+
+/// The 256-bit ones.
+const X86_PRIVATE_VECTOR_BUILTINS_256: [&str; 12] = [
+    "__builtin_ia32_insert128i256",
+    "__builtin_ia32_pand256",
+    "__builtin_ia32_vbroadcasti128",
+    "__builtin_ia32_vpbroadcastb256",
+    "__builtin_ia32_vpbroadcastd256",
+    "__builtin_ia32_vpbroadcastq256",
+    "__builtin_ia32_vpbroadcastw256",
+    "__builtin_ia32_vpdpbusd256",
+    "__builtin_ia32_vpdpbusds256",
+    "__builtin_ia32_vpdpwssd256",
+    "__builtin_ia32_vpdpwssds256",
+    "__builtin_ia32_vzextsi128_si256",
+];
+
+/// lccc's own vector builtins whose call is the ADDRESS of the result: the
+/// headers write `__CCC_M128I_FROM_BUILTIN(call)`, which is
+/// `*(__m128i *)(call)`. That convention is older than the typed one above
+/// and these are the names that still have it.
+const X86_PRIVATE_POINTER_BUILTINS: [&str; 14] = [
+    "__builtin_ia32_aesdec256",
+    "__builtin_ia32_aesdeclast256",
+    "__builtin_ia32_aesenc256",
+    "__builtin_ia32_aesenclast256",
+    "__builtin_ia32_cvtsi32si128",
+    "__builtin_ia32_loadldi128",
+    "__builtin_ia32_pinsrb128",
+    "__builtin_ia32_pinsrd128",
+    "__builtin_ia32_pinsrq128",
+    "__builtin_ia32_pinsrw128",
+    "__builtin_ia32_pshufd128",
+    "__builtin_ia32_pshufhw128",
+    "__builtin_ia32_pshuflw128",
+    "__builtin_ia32_vpclmulqdq256",
+];
+
+/// The type of a call of an x86 vector builtin that nothing else types.
+///
+/// A call is typed by the declaration in scope, and most public names have
+/// one: `_mm_add_epi8` is an inline function of a header. A GNU builtin is
+/// typed by the table generated from GCC's own (`x86_builtin_types`). Two
+/// kinds of name fall between:
+///
+/// * a public name the compiler lowers itself and no lccc header declares:
+///   the wrapper was a scalar loop and was taken out when the name became
+///   the instruction (`_mm_sll_epi16`), or the family never had a header
+///   (VNNI, GFNI);
+/// * a builtin of lccc's own under a `__builtin_ia32_` name the generated
+///   table does not have (`__builtin_ia32_pand256`,
+///   `__builtin_ia32_pshufd128`).
+///
+/// Without a row here such a call is the implicit `int` -- and its value is
+/// the address of a 16- or 32-byte result. Stored into an `__m128i` variable
+/// that happens to work, and so did every test. Returned, passed on or
+/// measured, it is wrong code:
+///
+/// ```c
+/// __m128i f(__m128i a, __m128i n) { return _mm_sll_epi16(a, n); }
+/// ```
+///
+/// returned the address of the shifted vector, and `sizeof` of the call was 8.
+///
+/// A row is one of two types, by what the name's callers do with the call.
+/// Where the call is the vector, it is `__m128i` or `__m256i` by the width:
+/// the header type of the public names, and what lccc's headers convert the
+/// private ones from (every one is an integer vector). Where the header
+/// dereferences the call (`X86_PRIVATE_POINTER_BUILTINS`), it is `void *`,
+/// which is what that convention always meant and the `int` only resembled.
+///
+/// A row that is missing, or of the wrong kind, is no longer wrong code: the
+/// lowering refuses a vector builtin whose call is neither typed at the width
+/// it yields nor a pointer (`mistyped_x86_vector_call`), and a header that
+/// no longer compiles is what the intrinsic census counts. The gate
+/// `scripts/x86_intrinsic_types.py` holds every intrinsic lccc has to the
+/// type GCC 16.2's headers give it.
+pub fn x86_vector_builtin_ctype(name: &str) -> Option<CType> {
+    if X86_PRIVATE_POINTER_BUILTINS.contains(&name) {
+        return Some(CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC));
+    }
+    let bytes = if X86_PRIVATE_VECTOR_BUILTINS_128.contains(&name) {
+        16
+    } else if X86_PRIVATE_VECTOR_BUILTINS_256.contains(&name) {
+        32
+    } else if let Some(stem) = name.strip_prefix("_mm256_") {
+        (X86_DOT_PRODUCT_STEMS.contains(&stem)
+            || matches!(stem, "cmpgt_epi8" | "bslli_epi128" | "bsrli_epi128"))
+        .then_some(32)?
+    } else {
+        let stem = name.strip_prefix("_mm_")?;
+        (X86_DOT_PRODUCT_STEMS.contains(&stem)
+            || matches!(
+                stem,
+                "sll_epi16"
+                    | "sll_epi32"
+                    | "sll_epi64"
+                    | "srl_epi16"
+                    | "srl_epi32"
+                    | "srl_epi64"
+                    | "sra_epi16"
+                    | "sra_epi32"
+                    | "avg_epu16"
+                    | "mul_epi32"
+                    | "gf2p8mul_epi8"
+                    | "gf2p8affine_epi64_epi8"
+                    | "gf2p8affineinv_epi64_epi8"
+            ))
+        .then_some(16)?
+    };
+    Some(CType::Vector(Box::new(CType::LongLong), bytes))
+}
+
+/// Every name the builtin table knows: for the tests that hold another table
+/// to it.
+#[cfg(test)]
+pub(crate) fn registered_builtin_names() -> impl Iterator<Item = &'static str> {
+    BUILTIN_MAP.keys().copied()
+}
+
 /// Return types of the GCC compatibility builtins added for the GCC 17-git
 /// C-torture compile leg.  Both `ExprTypeChecker::builtin_return_ctype` and
 /// the IR lowerer's `get_c2y_builtin_ctype` call this function, so the C-level
@@ -5047,5 +5214,164 @@ mod gcc17_torture_builtin_tests {
             libc_alias_param_types("bcmp"),
             Some(vec![IrType::Ptr, IrType::Ptr, st])
         );
+    }
+}
+
+#[cfg(test)]
+mod x86_vector_builtin_type_tests {
+    use super::{
+        BuiltinKind, X86_DOT_PRODUCT_STEMS, X86_PRIVATE_POINTER_BUILTINS,
+        X86_PRIVATE_VECTOR_BUILTINS_128, X86_PRIVATE_VECTOR_BUILTINS_256, registered_builtin_names,
+        resolve_builtin, x86_vector_builtin_ctype,
+    };
+    use crate::common::types::{CType, PtrQuals};
+
+    fn vector(bytes: usize) -> Option<CType> {
+        Some(CType::Vector(Box::new(CType::LongLong), bytes))
+    }
+
+    /// The names a program writes: `__m128i` at 128 bits, `__m256i` at 256.
+    #[test]
+    fn public_names_without_a_header_have_the_header_type() {
+        for name in [
+            "_mm_sll_epi16",
+            "_mm_sll_epi32",
+            "_mm_sll_epi64",
+            "_mm_srl_epi16",
+            "_mm_srl_epi32",
+            "_mm_srl_epi64",
+            "_mm_sra_epi16",
+            "_mm_sra_epi32",
+            "_mm_avg_epu16",
+            "_mm_mul_epi32",
+            "_mm_gf2p8mul_epi8",
+            "_mm_gf2p8affine_epi64_epi8",
+            "_mm_gf2p8affineinv_epi64_epi8",
+        ] {
+            assert_eq!(x86_vector_builtin_ctype(name), vector(16), "{name}");
+        }
+        for name in [
+            "_mm256_cmpgt_epi8",
+            "_mm256_bslli_epi128",
+            "_mm256_bsrli_epi128",
+        ] {
+            assert_eq!(x86_vector_builtin_ctype(name), vector(32), "{name}");
+        }
+        for stem in X86_DOT_PRODUCT_STEMS {
+            assert_eq!(
+                x86_vector_builtin_ctype(&format!("_mm_{stem}")),
+                vector(16),
+                "{stem}"
+            );
+            assert_eq!(
+                x86_vector_builtin_ctype(&format!("_mm256_{stem}")),
+                vector(32),
+                "{stem}"
+            );
+        }
+    }
+
+    /// A stem is listed for its own width only, and a name a header or the
+    /// generated table types is not listed here: one owner per name.
+    #[test]
+    fn the_table_answers_only_for_its_own_names() {
+        for name in [
+            // The other width of a listed stem.
+            "_mm256_sll_epi16",
+            "_mm256_avg_epu16",
+            "_mm_cmpgt_epi8",
+            "_mm_bslli_epi128",
+            // Declared by a header.
+            "_mm_add_epi8",
+            "_mm256_add_epi8",
+            // Typed by GCC's own table.
+            "__builtin_ia32_paddb128",
+            "__builtin_ia32_psllw128",
+            // A scalar result.
+            "__builtin_ia32_pextrq128",
+            // Not x86 vector builtins at all.
+            "_mm512_dpbusd_epi32",
+            "_mm_",
+            "__builtin_popcount",
+            "",
+        ] {
+            assert_eq!(x86_vector_builtin_ctype(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn private_names_are_typed_by_their_width() {
+        for name in X86_PRIVATE_VECTOR_BUILTINS_128 {
+            assert_eq!(x86_vector_builtin_ctype(name), vector(16), "{name}");
+        }
+        for name in X86_PRIVATE_VECTOR_BUILTINS_256 {
+            assert_eq!(x86_vector_builtin_ctype(name), vector(32), "{name}");
+        }
+    }
+
+    /// The names a header dereferences are pointers, and in no other list:
+    /// `*(__m128i *)(call)` of a call typed as the vector reads eight bytes
+    /// of the vector as an address.
+    #[test]
+    fn dereferenced_names_are_pointers() {
+        for name in X86_PRIVATE_POINTER_BUILTINS {
+            assert_eq!(
+                x86_vector_builtin_ctype(name),
+                Some(CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC)),
+                "{name}"
+            );
+            assert!(!X86_PRIVATE_VECTOR_BUILTINS_128.contains(&name), "{name}");
+            assert!(!X86_PRIVATE_VECTOR_BUILTINS_256.contains(&name), "{name}");
+        }
+    }
+
+    /// A row for a name the compiler does not lower is a typo: every row
+    /// names a registered intrinsic.
+    #[test]
+    fn every_row_names_a_registered_intrinsic() {
+        let mut rows: Vec<String> = X86_PRIVATE_VECTOR_BUILTINS_128
+            .iter()
+            .chain(&X86_PRIVATE_VECTOR_BUILTINS_256)
+            .chain(&X86_PRIVATE_POINTER_BUILTINS)
+            .map(|name| (*name).to_string())
+            .collect();
+        for stem in X86_DOT_PRODUCT_STEMS {
+            rows.push(format!("_mm_{stem}"));
+            rows.push(format!("_mm256_{stem}"));
+        }
+        for name in &rows {
+            assert!(
+                matches!(
+                    resolve_builtin(name).map(|info| &info.kind),
+                    Some(BuiltinKind::Intrinsic(_))
+                ),
+                "{name} is not a registered intrinsic"
+            );
+        }
+        // And the sorted lists hold no name twice.
+        for list in [
+            &X86_PRIVATE_VECTOR_BUILTINS_128[..],
+            &X86_PRIVATE_VECTOR_BUILTINS_256[..],
+            &X86_PRIVATE_POINTER_BUILTINS[..],
+            &X86_DOT_PRODUCT_STEMS[..],
+        ] {
+            assert!(list.windows(2).all(|pair| pair[0] < pair[1]), "{list:?}");
+        }
+    }
+
+    /// Every row is needed: a registered name the table lists is one the
+    /// generated GNU table does not type (a name with two owners would hide
+    /// a disagreement between them).
+    #[test]
+    fn no_row_shadows_the_generated_table() {
+        for name in registered_builtin_names() {
+            if x86_vector_builtin_ctype(name).is_some() {
+                assert_eq!(
+                    crate::common::x86_builtin_types::result_type(name),
+                    None,
+                    "{name} is typed twice"
+                );
+            }
+        }
     }
 }

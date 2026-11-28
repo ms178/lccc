@@ -1,0 +1,1 @@
+-mavx2 -mgfni -mavxvnni -mavxvnniint8 -mavxvnniint16

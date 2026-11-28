@@ -2106,7 +2106,9 @@
       "generic_helpers": [],
       "header": "emmintrin.h",
       "name": "_mm_cmplt_epi32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_pcmpgtd128"
+      ],
       "wrapper_dependencies": []
     },
     {

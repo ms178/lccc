@@ -554,6 +554,29 @@ followed by integer code, and four things stood between the two:
   compared where it is (`mask_cmp_source_512`), and the `kmov` behind it
   is a plain write for the peephole, with the zero-extension its width
   gives.
+* **A 32-byte store had no mapping.** The store forwarder kept a slot's
+  register for stores of sixteen bytes and fewer, so a 256-bit value that
+  went through a slot came back through it. A 32-byte store from
+  `%ymm0`..`%ymm15` maps its slot now, and a 32-byte reload is the register
+  move of the load's own spelling: both copy 256 bits and, being VEX.256,
+  zero bits 256 and up of the destination. Into the register that wrote
+  the slot, only that zeroing is left of the reload; it goes when the
+  upper half of the `zmm` register is dead and stays otherwise. A narrower
+  reload reads the low half (`%xmmN` of `%ymmN`). `vzeroupper` ends a
+  32-byte mapping and no other. The unaligned double-precision move
+  (`movupd`, `vmovupd`) was the one packed spelling that was no slot move
+  to the peephole at all, at either width: every `__m128d` and `__m256d`
+  home kept its store and its reload.
+* **The float sign masks had no row.** `_mm256_movemask_ps` and
+  `_mm256_movemask_pd` read their operand whole through an unaligned load,
+  like the byte mask, but were not among the operations of
+  `pointer_vector_arg_width` that say so. A home they read kept its
+  32-byte alignment (an address computed and masked at every access), and
+  a parameter was copied into such a home half by half. The same table
+  had no row for `vtestps`, the variable blends, the 256-bit FMA3 forms
+  and eleven of the fourteen VNNI dot products, and
+  `IntrinsicOp::vector_home_width` none for the results of the last three
+  groups.
 
 Instructions, `ret` included, at `-O2`:
 
@@ -565,12 +588,91 @@ Instructions, `ret` included, at `-O2`:
 | `_mm_movemask_ps(_mm_cmplt_ps(a, b))` | 5 | 3 | 3 | 3 |
 | `_mm512_cmpge_epu32_mask(a, b) == 0xffff`, two loads | 13, with a frame | 8 | 7 | 7 |
 | `_mm512_mask_cmplt_epi32_mask(k, a, b)`, two loads | 10 | 7 | 6 | 6 |
+| `_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) == -1` | 11, with a frame | 7 | 6 | 6 |
+| `_mm256_movemask_pd(a) != 0` | 19, with a frame | 6 | 5 | 5 |
+| `_mm256_movemask_ps(_mm256_cmp_ps(a, b, 1))` | 15, with a frame | 7, with a frame | 3 | 4 |
+
+The one instruction more than GCC's in the 256-bit rows is `vzeroupper`:
+GCC leaves the upper halves to a caller that passed a 256-bit argument,
+lccc and Clang clear them before they return.
 
 Open, and recorded in the gate at the length they have: a mask is moved
 to a general register and compared there where GCC tests it in place
 (`kortestw`); a mask operand `k` is combined in a general register where
-GCC compares under it; and three 256-bit shapes (a 32-byte value that goes
-through a slot stays there).
+GCC compares under it; and in the last row the compare's second operand is
+stored and read back as the instruction's memory operand (`vmovdqu %ymm1,
+40(%rsp); vcmpps $1, 40(%rsp), %ymm0, %ymm0`), which the store forwarder
+does not rewrite: it serves loads, not operands.
+
+### 2.4 Homes beside a call
+
+A 256-bit argument is an object in the IR, and the object has the
+alignment of its type: every access of it computes its address and masks
+it (`leaq`; `andq $-32`). Two passes take the alignment away where nothing
+can observe it. `downgrade_nonescaping_vector_align` does so for a home
+whose every use is an intrinsic operand the emitter reaches with an
+unaligned-safe access, and refuses any home a call uses.
+`relax_call_marshalled_vector_align` (x86-64) accepts the two call uses the
+back end marshals itself, a vector argument passed in a register and the
+buffer of a `%ymm0`/`%zmm0` result, and refused any home an intrinsic uses
+beyond the `VecLoad`/`VecStore` family. A home with one use of each kind
+was refused by both:
+
+```c
+_mm256_storeu_si256(d, step(_mm256_loadu_si256(x), _mm256_loadu_si256(y), k));
+```
+
+Two argument homes an intrinsic fills and a result buffer an intrinsic
+drains: six masked addresses per iteration of that loop. The second
+pass now answers an intrinsic use from the table the first one relaxes by
+(`intrinsic_arg_required_alignment`, `intrinsic_dest_required_alignment`):
+a position reached without an alignment assumption, or with one of sixteen
+bytes, survives the relaxation to sixteen; a 32-byte contract
+(`_mm256_store_si256`, `_mm256_stream_si256`, `_mm256_load_si256`), a
+position that is no memory operand, and an operation the table does not
+list keep the declared alignment.
+
+### 2.5 The type of an intrinsic call
+
+lccc lowers some public names itself: `_mm_sll_epi16` is the instruction,
+and no header function stands behind it. A call is typed by the declaration
+in scope, and 48 such names had none (the count-in-XMM shifts,
+`_mm_avg_epu16`, `_mm_mul_epi32`, `_mm256_cmpgt_epi8`, the two
+`_mm256_bs?li_epi128`, the GFNI three, and every VNNI dot product at both
+widths). So did 37 builtins of lccc's own under `__builtin_ia32_` names the
+table generated from GCC's has no row for (`__builtin_ia32_pand256`,
+`__builtin_ia32_pshufd128`). A call without a type is the implicit `int`,
+and its value is the address of the 16- or 32-byte result. An `__m128i`
+variable initialized from it gets the right bytes, which is the shape of
+every test these intrinsics had. Read by its type, the call was wrong code:
+
+```c
+__m128i f(__m128i a, __m128i n) { return _mm_sll_epi16(a, n); }   /* a stack address in %xmm0 */
+g(_mm_avg_epu16(a, b));                                           /* a pointer in %rdi */
+sizeof(_mm_mul_epi32(a, b))                                       /* 8 */
+```
+
+Three things changed. The names have their types
+(`sema::builtins::x86_vector_builtin_ctype`): `__m128i` or `__m256i` by the
+width where the call is the vector, and `void *` for the fourteen private
+names whose callers in the headers dereference the call
+(`__CCC_M128I_FROM_BUILTIN(call)` is `*(__m128i *)(call)`), which is what
+that convention always meant. The lowering refuses a vector builtin whose
+call is neither typed at the width it yields nor a pointer
+(`mistyped_x86_vector_call`), so the next name without a type is a compile
+error where it is used and not a wrong value where it is returned. And `scripts/x86_intrinsic_types.py` asserts, for every
+intrinsic lccc has, that a call has the type GCC 16.2's header gives it:
+1,555 intrinsics, none wrong; 48 before.
+
+### 2.6 What one call costs
+
+`scripts/x86_intrinsic_shapes.py` compiles, for every intrinsic both
+compilers take for a target, a function that calls it once with its
+operands as parameters, and counts instructions. It is the worklist for
+this chapter: an intrinsic is supposed to be an instruction, and where a
+header writes it as a loop over the lanes, or the operands go through the
+stack, it is twenty or a hundred and no test fails. It also found §2.5:
+the first function it wrote for `_mm_sll_epi16` returned an address.
 
 ## 3. Call-frame information
 
@@ -600,6 +702,11 @@ instructions.
 | `tests/regression/check_x86_zmm_homes.py` | 512-bit objects in `zmm16`..`zmm31` (§2.2): the instructions of chains, copies and a loop; no register above 15 anywhere with the homes off; no home given up at code generation; generated programs run at every level against GCC's build |
 | `tests/regression/check_x86_simd_integer_results.py` | Integer results of vector operations (§2.3): no stack traffic, no vector copy, no `%zmm1` in a mask compare, length against GCC's function measured in the run, the open shapes at their recorded length; the probe run against GCC's build where the CPU has the extension |
 | `integer_result_contract_tests` (unit) | Each of the 48 operations whose result may live in a register: the emitter takes it, writes no allocatable register on the way, and writes the result last |
+| `scripts/x86_intrinsic_types.py --check` | The type of a call of every intrinsic lccc has (§2.5): `__builtin_types_compatible_p` with the return type of GCC 16.2's header, asserted at compile time for the widest target |
+| `tests/regression/x86_intrinsic_call_types.c` (corpus) | The 48 public names without a header: their types asserted; the calls an AVX2 machine executes returned, passed on, chosen, stored in a member and measured, against GCC's output |
+| `x86_vector_builtin_type_tests` (unit) | The table of §2.5: each row's width, the dereferenced names typed as pointers and in no other list, no row for a name another table or a header types, every row a registered intrinsic |
+| `homes_filled_and_drained_by_unaligned_intrinsics_relax` and its neighbours (unit) | §2.4: a home with a call use and an intrinsic use relaxes when both tolerate sixteen bytes, at 16, 32 and 64 bytes; a 32-byte contract, a count position, an unlisted operation and a result of another width refuse |
+| `qq_*` in `store_forwarding` (unit) | 32-byte store forwarding (§2.3): the six spellings, the self-reload under a live and a dead `zmm` upper half, narrower reloads, and every event that ends the mapping (a write of the register at any width or under a mask, a write into the slot at each edge, `vzeroupper`, a call, a stack adjustment) |
 | `every_signature_holds_for_its_emitter` (unit) | Each operation a homed object may be an operand of, with its operands in registers, in memory and shared with the result: the value the destination ends with is the one the all-in-memory path computes |
 | `x86_macro_gate_tests` (unit) | XSAVE precedence, the AES/PCLMUL/GFNI announcement split, the POPCNT unwind matrix, sticky `-mno-mmx`, `-mprefer-vector-width=` parsing |
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |
