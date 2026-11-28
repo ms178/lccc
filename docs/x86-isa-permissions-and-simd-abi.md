@@ -716,6 +716,30 @@ the same sources agrees with every row) and the corpus test
 `tests/regression/x86_vector_load_const_offset.c` (35 functions, executed,
 output against GCC's).
 
+### 2.8 Constant arguments
+
+The scalar parameter of an intrinsic is an `int`, a `char`, a `long long`
+or a `float`, and C converts the argument to it as an assignment would.
+For a constant the lowering makes the conversion itself
+(`lower_typed_x86_builtin_argument`), so that an immediate is a constant
+at every optimization level: an integer constant expression is its value
+however it is spelled, and a floating constant given to an integer
+parameter is the `int` it converts to, toward zero
+(`integer_constant_argument`; GCC 16.2 reads `_mm_shuffle_epi32(v, 27.9)`
+as selector 27). A floating parameter takes the expression.
+
+The conversion is made once. Until PR #1211 a floating constant for an
+integer parameter was read as its integer and then converted "from
+double" again, with the integer's bits taken for a double. The optimizer
+folded that second conversion by value; without it the code generator
+converted the bits, so at `-O0` only, `_mm_set1_epi32(3.7)` was a vector
+of zeros, `_mm_slli_epi32(v, 2.9)` a shift by none and
+`_mm_crc32_u32(1.5, 77.7)` the checksum of two zeros. Gate: the case
+`tests/intrinsics/cases/constant_arguments.c` of the intrinsic
+differential (57 rows: floating constants for integer parameters of every
+width, integer constants of another width or signedness, floating
+parameters; with and without optimization, against GCC 16.2).
+
 ## 3. Call-frame information
 
 Code generation never writes `.cfi_*` directives. `backend/cfi_synth.rs`
@@ -753,6 +777,7 @@ instructions.
 | `x86_macro_gate_tests` (unit) | XSAVE precedence, the AES/PCLMUL/GFNI announcement split, the POPCNT unwind matrix, sticky `-mno-mmx`, `-mprefer-vector-width=` parsing |
 | `check_x86_int_map_registers.sh` | Packed operations on registers and on a folded load: budgets per shape, values against a scalar reference and GCC, and (section 4b) the displacement of a constant offset in the load's address (§2.7) |
 | `tests/regression/x86_vector_load_const_offset.c` (corpus) | §2.7: 35 ways of writing `pointer + constant` inside a packed operation, executed, output against GCC's |
+| `tests/intrinsics/cases/constant_arguments.c` (intrinsic differential, `-O2` and `-O0`) | §2.8: a constant argument is converted to its parameter's type once; 57 rows against GCC |
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |
 | `check_target_attribute_isa.sh` | `target()` scoping, ordering, errors and intrinsic verdicts, re-measured on GCC |
 | `check_target_attribute_arguments.py` | The arguments of `target("...")` on definitions and prototypes and of `#pragma GCC target`: errors, order and position against GCC 16.2 |

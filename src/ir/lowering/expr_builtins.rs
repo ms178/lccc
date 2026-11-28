@@ -3610,14 +3610,33 @@ impl Lowerer {
         // to instructions that only the optimizer folds. So at -O0 the lane
         // of `_mm_extract_epi8(v, -(-1))` reached the emitter as a value,
         // and the emitter wrote `pextrb $0`.
-        let constant = self.integer_constant_argument(arg);
+        //
+        // A floating constant read that way is the `int` the call converts
+        // it to, which a floating parameter does not do: there the
+        // expression is the operand. (An operand without a type here is an
+        // integer one the tables do not describe, the element of
+        // `_mm_insert_epi32` for one, and keeps the integer reading.)
+        let floating = self.expr_ctype(arg).is_floating();
+        let constant = self
+            .integer_constant_argument(arg)
+            .filter(|_| !(floating && target.is_some_and(|target| target.is_float())));
         let lowered = |this: &mut Self| match constant {
             Some(value) => Operand::Const(value),
             None => this.lower_expr(arg),
         };
         match target {
             Some(target) => {
-                let source = self.get_expr_type(arg);
+                // What is left to convert when the constant was floating is
+                // the integer it has become, not the expression. Converted
+                // "from double" once more, the integer's bits were read as a
+                // double, which the optimizer folded by value and the code
+                // generator did not: at -O0 `_mm_set1_epi32(3.7)` was a
+                // vector of zeros, `_mm_slli_epi32(v, 2.9)` a shift by none.
+                let source = if floating && constant.is_some() {
+                    IrType::I64
+                } else {
+                    self.get_expr_type(arg)
+                };
                 let value = lowered(self);
                 // Preserve constant immediates even at O0: a numeric C
                 // conversion must not turn a valid immediate into an SSA value.
