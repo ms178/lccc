@@ -1,0 +1,82 @@
+{
+  "provision": {
+    "release_line": "2026.2",
+    "semver": "2026.2.1",
+    "repository": "https://apt.repos.intel.com/oneapi",
+    "key_url": "https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB",
+    "key_sha256": "db932ba032a71f732dc415eef5f4f185fc7ae768487d7a357bc2772746b6c48c",
+    "packages": [
+      {
+        "Package": "intel-oneapi-dpcpp-cpp-2026.2",
+        "Version": "2026.2.1-990",
+        "Architecture": "amd64",
+        "Filename": "pool/main/intel-oneapi-dpcpp-cpp-2026.2-2026.2.1-990_amd64.deb",
+        "SHA256": "0857c153ad3d098e8639c6da4a3f45e199525c8448389e44c4d29c1c3eb336c9"
+      },
+      {
+        "Package": "intel-oneapi-compiler-shared-runtime-2026.2",
+        "Version": "2026.2.1-990",
+        "Architecture": "amd64",
+        "Filename": "pool/main/intel-oneapi-compiler-shared-runtime-2026.2-2026.2.1-990_amd64.deb",
+        "SHA256": "22c4329d220ea5b588c32d9844e3cb6f7b11fb94747f50042703926d11471a29"
+      },
+      {
+        "Package": "intel-oneapi-compiler-shared-2026.2",
+        "Version": "2026.2.1-990",
+        "Architecture": "amd64",
+        "Filename": "pool/main/intel-oneapi-compiler-shared-2026.2-2026.2.1-990_amd64.deb",
+        "SHA256": "6cf46bc2a1ea6acc70fa54e0afdc39d5f05a60e6347f6f3b99f98527eb0a96ee"
+      },
+      {
+        "Package": "intel-oneapi-compiler-dpcpp-cpp-common-2026.2",
+        "Version": "2026.2.1-990",
+        "Architecture": "all",
+        "Filename": "pool/main/intel-oneapi-compiler-dpcpp-cpp-common-2026.2-2026.2.1-990_all.deb",
+        "SHA256": "7b279a5c7c215f3dbac1a4182fbdf3c2cf65105e885ae6d4d0048197ff91b15f"
+      },
+      {
+        "Package": "intel-oneapi-compiler-shared-common-2026.2",
+        "Version": "2026.2.1-990",
+        "Architecture": "all",
+        "Filename": "pool/main/intel-oneapi-compiler-shared-common-2026.2-2026.2.1-990_all.deb",
+        "SHA256": "7ff2da0e9b137a19b354889cd07b0d7521e597901b28adfa8d035b5feadb92b4"
+      }
+    ],
+    "apt_metadata_sha256": {
+      "apt.repos.intel.com_oneapi_dists_all_main_binary-amd64_Packages": "d0de3f754e88b1bec147a436ad9fe5ebebd1489868641709d3a37daff6b9b505",
+      "apt.repos.intel.com_oneapi_dists_all_main_binary-all_Packages": "f72ebe43fc98f3da29f9c6df11d9eba8a904d28b99c3e82d67611c004d0a35d1",
+      "apt.repos.intel.com_oneapi_dists_all_InRelease": "2d41634becf75840324d2b963b47554626d63514c93dc8378da8df58b6b8952d"
+    },
+    "binary": "opt/intel/oneapi/compiler/2026.2/bin/icx",
+    "binary_sha256": "91ec5016b4a4fef52406e9286f3d932f8bea2da98b3a22228909f908df27832c"
+  },
+  "macro": "20260201",
+  "rows": [
+    {
+      "source": "tests/regression/compound_unsigned_widening.c",
+      "exit": 0,
+      "stdout": ""
+    },
+    {
+      "source": "tests/regression/declarator_point_of_scope.c",
+      "exit": 0,
+      "stdout": ""
+    },
+    {
+      "source": "tests/regression/preprocessor_ternary_type.c",
+      "exit": 0,
+      "stdout": ""
+    },
+    {
+      "source": "tests/benchmark/programs/zlib_ng_crc32_combine.c",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-DPASSES=128"
+      ],
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n"
+    }
+  ],
+  "note": "Native ICX 2026.2.1, not CE cicxlatest (which reported 20240000)."
+}

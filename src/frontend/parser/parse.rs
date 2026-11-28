@@ -219,6 +219,8 @@ pub(super) mod parsed_attr_flag {
     /// (measured 2026-10-30: a same-TU definition still gets `R_X86_64_PLT32`).
     pub const NOPLT: u64 = 1 << 37;
     pub const DESIGNATED_INIT: u64 = 1 << 38;
+    /// C23 `auto` inferred type specifier (as distinct from GNU `__auto_type`).
+    pub const C23_AUTO: u64 = 1 << 40;
     /// The storage-class specifiers a declaration carries (C11 6.7.1; GNU
     /// `auto` is NESTED_FN). `register` is not tracked.
     pub const STORAGE_CLASSES: u64 =
@@ -646,6 +648,10 @@ impl ParsedDeclAttrs {
     pub fn parsing_uninitialized(&self) -> bool {
         self.flags & parsed_attr_flag::UNINITIALIZED != 0
     }
+    #[inline]
+    pub fn parsing_c23_auto(&self) -> bool {
+        self.flags & parsed_attr_flag::C23_AUTO != 0
+    }
 
     // --- flag setters ---
 
@@ -778,6 +784,10 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn set_cold(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::COLD, v)
+    }
+    #[inline]
+    pub fn set_c23_auto(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::C23_AUTO, v)
     }
 
     #[inline]
@@ -989,6 +999,9 @@ pub struct Parser {
     pub(super) enum_scope_log: Vec<(String, Option<i64>, bool)>,
     /// Compound-statement nesting: zero at file scope, where nothing is undone.
     pub(super) block_depth: u32,
+    /// Parameter-list nesting: non-zero inside `( ... )` parameter lists so
+    /// inline enums and enumerator/typedef shadowing undo at the closing `)`.
+    pub(super) param_list_depth: u32,
     /// True while parsing the body of a function that GCC re-instantiates after
     /// expansion (`inline`, `__inline__`, `always_inline`, `gnu_inline`).  The
     /// parser judges an `asm` immediate operand strictly (`constness` returns
@@ -1236,6 +1249,7 @@ impl Parser {
             unevaluable_enum_constants: FxHashSet::default(),
             enum_scope_log: Vec::new(),
             block_depth: 0,
+            param_list_depth: 0,
             asm_deferred_instantiation: false,
             local_constants: FxHashMap::default(),
             deferred_static_asserts: Vec::new(),

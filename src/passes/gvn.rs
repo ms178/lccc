@@ -1217,12 +1217,18 @@ fn find_volatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
 fn cross_block_renamable(inst: &Instruction, cast_rename: bool) -> bool {
     match inst {
         // Pointer materialization and floating-point conversions remain site-local.
+        // Signed widening integer casts (`from_ty.is_signed() && to_ty.size() > from_ty.size()`,
+        // e.g. `movslq` before array indexing inside dominated branches) avoid redundant
+        // sign-extensions and GEP recomputation by default; unsigned widening, narrowing, and
+        // same-width casts remain gated behind `CCC_CAST_RENAME=1` because zero-extension is
+        // free on x86-64 loads and extending their live ranges can add spills or moves
+        // (`zstd_double_fast`, `expat_xml_scan`, `hash_table`).
         Instruction::Cast { from_ty, to_ty, .. } => {
-            cast_rename
-                && from_ty.is_integer()
+            from_ty.is_integer()
                 && to_ty.is_integer()
                 && !from_ty.is_128bit()
                 && !to_ty.is_128bit()
+                && (cast_rename || (from_ty.is_signed() && to_ty.size() > from_ty.size()))
         }
         Instruction::BinOp {
             op: IrBinOp::Mul,
@@ -3347,10 +3353,89 @@ mod tests {
             &cast_inst(2, 0, IrType::Void, IrType::I64),
             true
         ));
-        assert!(!cross_block_renamable(
+        // Default GVN (`cast_rename = false`) renames signed widening casts
+        // (e.g. `I32 -> I64` `movslq` in dominated branches) while leaving
+        // unsigned widening, narrowing, and same-width integer casts gated.
+        assert!(cross_block_renamable(
             &cast_inst(2, 0, IrType::I32, IrType::I64),
             false
         ));
+        assert!(cross_block_renamable(
+            &cast_inst(2, 0, IrType::I16, IrType::I64),
+            false
+        ));
+        assert!(cross_block_renamable(
+            &cast_inst(2, 0, IrType::I8, IrType::I32),
+            false
+        ));
+        assert!(!cross_block_renamable(
+            &cast_inst(2, 0, IrType::U32, IrType::I64),
+            false
+        ));
+        assert!(!cross_block_renamable(
+            &cast_inst(2, 0, IrType::I64, IrType::I32),
+            false
+        ));
+        assert!(!cross_block_renamable(
+            &cast_inst(2, 0, IrType::I32, IrType::U32),
+            false
+        ));
+        assert!(!cross_block_renamable(
+            &cast_inst(2, 0, IrType::I64, IrType::I128),
+            true
+        ));
+    }
+
+    #[test]
+    fn signed_widening_cast_renamed_by_default_unsigned_widening_kept() {
+        let signed_mod_fn = chain(vec![
+            blk(
+                0,
+                vec![cast_inst(2, 0, IrType::I32, IrType::I64)],
+                Terminator::Branch(BlockId(1)),
+                vec![],
+            ),
+            blk(
+                1,
+                vec![
+                    cast_inst(3, 0, IrType::I32, IrType::I64),
+                    mul_inst(4, 3, 3, IrType::I64),
+                ],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+                vec![],
+            ),
+        ]);
+        let mut signed_mod = module_of(signed_mod_fn);
+        signed_mod.for_each_function(run_gvn_function);
+        assert_eq!(signed_mod.functions[0].blocks[1].instructions.len(), 1);
+        assert!(matches!(
+            &signed_mod.functions[0].blocks[1].instructions[0],
+            Instruction::BinOp {
+                lhs: Operand::Value(Value(2)),
+                ..
+            }
+        ));
+
+        let unsigned_mod_fn = chain(vec![
+            blk(
+                0,
+                vec![cast_inst(2, 0, IrType::U32, IrType::I64)],
+                Terminator::Branch(BlockId(1)),
+                vec![],
+            ),
+            blk(
+                1,
+                vec![
+                    cast_inst(3, 0, IrType::U32, IrType::I64),
+                    mul_inst(4, 3, 3, IrType::I64),
+                ],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+                vec![],
+            ),
+        ]);
+        let mut unsigned_mod = module_of(unsigned_mod_fn);
+        unsigned_mod.for_each_function(run_gvn_function);
+        assert_eq!(unsigned_mod.functions[0].blocks[1].instructions.len(), 2);
     }
 
     #[test]

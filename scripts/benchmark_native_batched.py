@@ -10,7 +10,11 @@ the main symbol in that object without recompiling. A strict ELF
 comparison requires all code/data/relocations and resolved symbol entries to
 remain identical (except that one global entry name). This avoids recompiling
 main as an ordinary function, which genuinely changed GCC's matmul epilogue.
-Link with one unchanged GCC driver; no cross-TU inlining or LTO. Check every
+Link with one unchanged GCC driver; no cross-TU inlining or LTO. Optional
+``--runtime-library LABEL=ARCHIVE`` supplies content-pinned static compiler
+runtimes (e.g. ICX libirc.a) only to the named arm, not to other compilers.
+These are part of the experiment identity and both link paths; no compiler
+optimization is disabled merely to avoid a runtime dependency. Check every
 repeated stdout against the original oracle. A common count targets the fastest
 arm but is capped by the slowest; attained durations are reported explicitly.
 
@@ -40,7 +44,36 @@ sys.path.insert(0,str(ROOT/'scripts'))
 from benchmark_elf_identity import object_identity, rename_entry
 
 
-def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+def sha(p):
+    with Path(p).open('rb') as stream:
+        return hashlib.file_digest(stream,'sha256').hexdigest()
+
+
+def runtime_library_inputs(specifications, compilers):
+    """Explicit, content-pinned static runtimes; never change the common driver."""
+    libraries={key:[] for key in compilers}
+    for value in specifications:
+        if '=' not in value:
+            raise ValueError('runtime library must be LABEL=ARCHIVE')
+        label,filename=value.split('=',1)
+        if label not in libraries or not filename:
+            raise ValueError('runtime library has an unknown label or empty path')
+        path=Path(filename).expanduser().resolve(strict=True)
+        with path.open('rb') as stream:
+            if stream.read(8)!=b'!<arch>\n':
+                # A thin archive's digest does not identify its external members.
+                raise ValueError('runtime library must be a self-contained static archive')
+        libraries[label].append(dict(path=str(path),sha256=sha(path)))
+    return libraries
+
+
+def runtime_library_paths(libraries, key):
+    paths=[]
+    for library in libraries[key]:
+        if sha(library['path'])!=library['sha256']:
+            raise ValueError('runtime library changed during the experiment')
+        paths.append(library['path'])
+    return paths
 
 
 def publish(path,data):
@@ -124,6 +157,8 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--compiler',action='append',required=True,help='label=executable')
     ap.add_argument('--reference',default='gcc')
+    ap.add_argument('--runtime-library',action='append',default=[],metavar='LABEL=ARCHIVE',
+                    help='explicit self-contained static compiler runtime; repeatable, hashed, arm-specific')
     ap.add_argument('--gcc',default='gcc-16',help='neutral driver compiler and builtin-header provider')
     ap.add_argument('--out',type=Path,required=True)
     ap.add_argument('--only',help='comma-separated registry IDs')
@@ -154,6 +189,10 @@ def main():
         if resolved is None:ap.error('missing compiler '+path)
         compilers[label]=str(Path(resolved).resolve())
     if args.reference not in compilers:ap.error('reference compiler missing')
+    try:
+        libraries=runtime_library_inputs(args.runtime_library,compilers)
+    except (OSError,ValueError) as error:
+        ap.error(str(error))
     known={b.name:b for b in bench.BENCHMARKS}
     names=args.only.split(',') if args.only else list(known)
     if not names or len(names)!=len(set(names)) or set(names)-set(known):ap.error('invalid corpus selection')
@@ -163,7 +202,7 @@ def main():
     out=args.out.resolve();out.mkdir(parents=True,exist_ok=True)
     driver=ROOT/'tests/benchmark/batched_driver.c'
     identity=dict(compilers={k:dict(path=v,sha256=sha(v),version=bench.command_version(v)) for k,v in compilers.items()},
-                  flags=flags,object_mode=args.object_mode,driver_sha256=sha(driver),object_protocol_sha256=sha(ROOT/'scripts/benchmark_elf_identity.py'),header_provider=bench.command_version(args.gcc),
+                  flags=flags,runtime_libraries=libraries,object_mode=args.object_mode,driver_sha256=sha(driver),object_protocol_sha256=sha(ROOT/'scripts/benchmark_elf_identity.py'),header_provider=bench.command_version(args.gcc),
                   sources={name:dict(sha256=sha(bench.source_for(known[name])),flags=known[name].extra_flags) for name in names})
     if args.relink_driver:
         prior=json.loads((out/'build.json').read_text())
@@ -187,7 +226,7 @@ def main():
         for name in names:
             for key in compilers:
                 directory=out/name/key
-                execute([args.gcc,'-no-pie',out/'driver.o',directory/'work.o','-lm','-o',directory/'program'],directory/'link.json')
+                execute([args.gcc,'-no-pie',out/'driver.o',directory/'work.o',*runtime_library_paths(libraries,key),'-lm','-o',directory/'program'],directory/'link.json')
                 prior['binaries'][name][key]=sha(directory/'program')
         prior.update(complete=True,identity=identity);publish(out/'build.json',prior)
         args.reuse_build=True
@@ -216,10 +255,10 @@ def main():
                 if object_identity(original_object,'main') != object_identity(renamed_object,'benchmark_entry'):
                     raise ValueError(f'object rename changed code/data/relocations: {name}/{key}')
                 build['body_checks'][name][key]=dict(original_object=sha(directory/'original.o'),renamed_object=sha(directory/'work.o'),whole_object_identity=True)
-                execute([args.gcc,'-no-pie',out/'driver.o',directory/'work.o','-lm','-o',directory/'program'],directory/'link.json')
+                execute([args.gcc,'-no-pie',out/'driver.o',directory/'work.o',*runtime_library_paths(libraries,key),'-lm','-o',directory/'program'],directory/'link.json')
                 # The single-run oracle links the exact measured object.
                 oracle_input=directory/'original.o' if args.object_mode=='direct' else plain
-                execute([cc,oracle_input,'-lm','-o',directory/'original'],directory/'original-link.json')
+                execute([cc,oracle_input,*runtime_library_paths(libraries,key),'-lm','-o',directory/'original'],directory/'original-link.json')
                 original=execute([directory/'original'],directory/'original-run.json')
                 build['binaries'][name][key]=sha(directory/'program')
                 (directory/'expected.stdout').write_text(original['stdout'])

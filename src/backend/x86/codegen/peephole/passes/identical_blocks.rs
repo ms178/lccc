@@ -195,6 +195,102 @@ fn blocks_ending_at(blocks: &[(usize, usize, String, u32)]) -> FxHashMap<usize, 
     ending
 }
 
+/// Entry CFI CFA offset per block (`None` if unknown or obscured by CFI state
+/// directives or any path-sensitive `.cfi_*` inside the function body).
+fn compute_block_cfa_offsets(
+    store: &LineStore,
+    infos: &[LineInfo],
+    blocks: &[(usize, usize, String, u32)],
+) -> Vec<Option<i64>> {
+    let mut line_to_bidx: FxHashMap<usize, usize> = FxHashMap::default();
+    for (bidx, &(start, _, _, _)) in blocks.iter().enumerate() {
+        line_to_bidx.insert(start, bidx);
+    }
+    let mut out = vec![None; blocks.len()];
+    let mut cfa: Option<i64> = Some(0);
+    let mut entered_body = false;
+    let mut fn_blocks: Vec<usize> = Vec::new();
+    for (i, info) in infos.iter().enumerate() {
+        if info.is_nop() {
+            continue;
+        }
+        if let Some(&bidx) = line_to_bidx.get(&i) {
+            out[bidx] = cfa;
+            fn_blocks.push(bidx);
+        }
+        let t = info.trimmed(store.get(i));
+        if info.kind == LineKind::Label {
+            let name = t.trim_end_matches(':');
+            if !name.starts_with(".L") {
+                cfa = Some(0);
+                entered_body = false;
+                fn_blocks.clear();
+            } else {
+                entered_body = true;
+            }
+            continue;
+        }
+        if info.kind == LineKind::Directive && super::helpers::directive_emits_data(t) {
+            cfa = None;
+            for &bidx in &fn_blocks {
+                out[bidx] = None;
+            }
+            entered_body = true;
+            continue;
+        }
+        // DIRECTIVE-LAW: selecting — only `.cfi_*` directives adjust CFA tracking;
+        // data-emitting directives above invalidate CFA across the function.
+        if info.kind == LineKind::Directive && t.starts_with(".cfi_") {
+            if t == ".cfi_startproc" {
+                cfa = Some(0);
+                entered_body = false;
+                fn_blocks.clear();
+            } else if t == ".cfi_endproc" {
+                cfa = None;
+                entered_body = false;
+                fn_blocks.clear();
+            } else if entered_body {
+                cfa = None;
+                for &bidx in &fn_blocks {
+                    out[bidx] = None;
+                }
+            } else if let Some(rest) = t.strip_prefix(".cfi_def_cfa_offset ") {
+                cfa = rest.trim_ascii().parse::<i64>().ok();
+            } else if let Some(rest) = t.strip_prefix(".cfi_adjust_cfa_offset ") {
+                let delta = rest.trim_ascii().parse::<i64>().ok();
+                cfa = match (cfa, delta) {
+                    (Some(c), Some(d)) => c.checked_add(d),
+                    _ => None,
+                };
+            } else if t.starts_with(".cfi_offset ")
+                || t.starts_with(".cfi_rel_offset ")
+                || t.starts_with(".cfi_register ")
+                || t.starts_with(".cfi_restore ")
+                || t.starts_with(".cfi_same_value ")
+                || t.starts_with(".cfi_undefined ")
+                || t.starts_with(".cfi_personality")
+                || t.starts_with(".cfi_lsda")
+            {
+                // Unwind register location annotations leave CFA offset untouched.
+            } else {
+                cfa = None;
+            }
+            continue;
+        }
+        if matches!(
+            info.kind,
+            LineKind::Jmp
+                | LineKind::JmpIndirect
+                | LineKind::CondJmp
+                | LineKind::Ret
+                | LineKind::InlineAsm
+        ) {
+            entered_body = true;
+        }
+    }
+    out
+}
+
 pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     if len < 10 {
@@ -331,6 +427,10 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             break;
         }
     }
+    let mut first_lbb_of_func: FxHashMap<u32, usize> = FxHashMap::default();
+    for &(start, _, _, fid) in &blocks {
+        first_lbb_of_func.entry(fid).or_insert(start);
+    }
     // Scan all jumps/cond-jumps; add source block to target's preds.
     for i in 0..len {
         if infos[i].is_nop() {
@@ -351,10 +451,15 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                             .or_default()
                             .insert(src_label.clone());
                     } else {
-                        // Jump from a function's entry region: attribute it
-                        // to that function's pseudo entry label. The edge is
-                        // an explicit (rewritable) jump.
-                        let pseudo = entry_pseudo_label(func_id_of_line[i]);
+                        // Only attribute jumps BEFORE the first .LBB block to the
+                        // function's entry region; post-directive orphan fragments
+                        // receive distinct gap ids so they never alias entry preds.
+                        let fid = func_id_of_line[i];
+                        let pseudo = if first_lbb_of_func.get(&fid).is_none_or(|&first| i < first) {
+                            entry_pseudo_label(fid)
+                        } else {
+                            format!("\0gap_{i}")
+                        };
                         preds.entry(target.clone()).or_default().insert(pseudo);
                     }
                 }
@@ -627,13 +732,20 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                         all_clean = false;
                         break;
                     }
+                } else if pl.starts_with("\0gap_") {
+                    all_clean = false;
+                    break;
                 }
             }
         }
         preds_clean[bi] = all_clean;
     }
 
-    // Phase 3: Merge only truly-identical blocks with IDENTICAL predecessor sets.
+    // Phase 3: Merge identical blocks. Blocks with identical predecessor sets
+    // merge freely; tail-terminated blocks (`ret` or unconditional `jmp`) with
+    // distinct non-empty predecessor sets also merge when both are clean,
+    // non-flag-dependent, and share identical entry CFI CFA depth.
+    let block_cfa = compute_block_cfa_offsets(store, infos, &blocks);
     let mut changed = false;
     let mut redirects: FxHashMap<String, String> = FxHashMap::default(); // old_label → canonical_label
 
@@ -641,7 +753,38 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         if group.len() < 2 {
             continue;
         }
-        let canonical_idx = group[0];
+        // Prefer a clean, non-flag-dep, non-empty-pred canonical candidate.
+        // Protected blocks (fall-through targets, jump-table targets,
+        // address-taken labels) can serve as the surviving canonical target
+        // for tail-merging, while never themselves being deleted.
+        let Some(&canonical_idx) = group
+            .iter()
+            .find(|&&bi| {
+                let lbl = &blocks[bi].2;
+                !flag_dep[bi]
+                    && clean[bi]
+                    && preds_clean[bi]
+                    && preds.get(lbl).is_some_and(|p| !p.is_empty())
+                    && (fallthrough_entries.contains(lbl.as_str())
+                        || jump_table_targets.contains(lbl)
+                        || address_taken_labels.contains(lbl))
+                    && matches!(block_terminator[bi], LineKind::Ret | LineKind::Jmp)
+                    && fallthrough[bi].is_none()
+            })
+            .or_else(|| {
+                group.iter().find(|&&bi| {
+                    let lbl = &blocks[bi].2;
+                    !flag_dep[bi]
+                        && clean[bi]
+                        && preds_clean[bi]
+                        && preds.get(lbl).is_some_and(|p| !p.is_empty())
+                        && !jump_table_targets.contains(lbl)
+                        && !address_taken_labels.contains(lbl)
+                })
+            })
+        else {
+            continue;
+        };
         let (can_start, can_end, _, _) = &blocks[canonical_idx];
         let canonical_label = blocks[canonical_idx].2.clone();
         let canonical_preds = preds.get(&canonical_label).cloned().unwrap_or_default();
@@ -651,32 +794,45 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             .map(|j| store.get(j).to_string())
             .collect();
 
-        // SOUNDNESS: skip if the canonical block is flag-dependent, not
-        // clean, has a non-clean predecessor, or is a jump-table target.
-        if flag_dep[canonical_idx]
+        if canonical_preds.is_empty()
+            || flag_dep[canonical_idx]
             || !clean[canonical_idx]
             || !preds_clean[canonical_idx]
-            || jump_table_targets.contains(&canonical_label)
-            || address_taken_labels.contains(&canonical_label)
         {
             continue;
         }
 
-        for &other_idx in &group[1..] {
-            let (other_start, other_end, ref other_label, _) = blocks[other_idx];
-            let other_preds = preds.get(other_label).cloned().unwrap_or_default();
-            // SOUNDNESS: require identical predecessor sets.
-            if canonical_preds != other_preds {
+        let canonical_is_tail = matches!(
+            block_terminator[canonical_idx],
+            LineKind::Ret | LineKind::Jmp
+        ) && fallthrough[canonical_idx].is_none();
+
+        for &other_idx in group {
+            if other_idx == canonical_idx {
                 continue;
             }
+            let (other_start, other_end, ref other_label, _) = blocks[other_idx];
+            let other_preds = preds.get(other_label).cloned().unwrap_or_default();
             // SOUNDNESS (defense in depth): never merge a block whose recorded
-            // predecessor set is EMPTY. An empty set means either genuinely
-            // dead code (merging is pointless) or — as happened with
-            // alignment directives severing fall-through edges — an entry the
-            // edge model could not see. The identical-predecessors guarantee
-            // only holds when the model sees every edge, so empty is treated
-            // as "unknown", never as "unreachable".
-            if canonical_preds.is_empty() {
+            // predecessor set is EMPTY (dead or unknown positional entry).
+            if other_preds.is_empty() {
+                continue;
+            }
+            let same_preds = canonical_preds == other_preds;
+            if !same_preds {
+                let other_is_tail =
+                    matches!(block_terminator[other_idx], LineKind::Ret | LineKind::Jmp)
+                        && fallthrough[other_idx].is_none();
+                if !canonical_is_tail
+                    || !other_is_tail
+                    || block_cfa[canonical_idx].is_none()
+                    || block_cfa[canonical_idx] != block_cfa[other_idx]
+                {
+                    continue;
+                }
+            } else if jump_table_targets.contains(&canonical_label)
+                || address_taken_labels.contains(&canonical_label)
+            {
                 continue;
             }
             // SOUNDNESS: the DELETED block must not have a fall-through
@@ -1383,5 +1539,51 @@ mod tests {
         assert!(is_alignment_directive(".balign 8"));
         assert!(!is_alignment_directive(".loc 1 2 0"));
         assert!(!is_alignment_directive("movl $1, %eax"));
+    }
+
+    #[test]
+    fn distinct_pred_tail_blocks_merge_when_cfa_matches_and_refuse_when_different() {
+        let same_cfa = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    testl %edi, %edi\n",
+            "    je .LBB2\n",
+            ".LBB1:\n",
+            "    testl %esi, %esi\n",
+            "    jne .LBB3\n",
+            "    jmp .LBB4\n",
+            ".LBB2:\n",
+            "    movl $2, %eax\n",
+            "    ret\n",
+            ".LBB3:\n",
+            "    movl $2, %eax\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        assert_eq!(survivors_after_isolated_merge(same_cfa, "movl $2, %eax"), 1);
+
+        let diff_cfa = concat!(
+            "g:\n",
+            ".cfi_startproc\n",
+            "    testl %edi, %edi\n",
+            "    je .LBB2\n",
+            ".LBB1:\n",
+            "    pushq %rbx\n",
+            "    .cfi_adjust_cfa_offset 8\n",
+            "    popq %rbx\n",
+            "    jmp .LBB3\n",
+            ".LBB2:\n",
+            "    movl $2, %eax\n",
+            "    ret\n",
+            "    .cfi_adjust_cfa_offset 8\n",
+            ".LBB3:\n",
+            "    movl $2, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        assert_eq!(survivors_after_isolated_merge(diff_cfa, "movl $2, %eax"), 2);
     }
 }

@@ -756,5 +756,169 @@ printf 'D layer 3: %d runtime fixtures x (-O0..-O3 + %d oracle controls) = %d ch
     "${#d_runtime[@]}" "${#d_oracles[@]}" "$d_rt_checks"
 check "D host-CPU execution + oracle control ($d_rt_checks checks, -O0..-O3)" "$d_rt_bad"
 
+# ── E. GNU __auto_type deferred object binding + C23 auto parity ────────────
+# GNU C (`-std=gnu11`): `__auto_type name = init;` binds `name` AFTER `init` is
+# parsed/typed so `outer` in `init` still resolves to an outer declaration
+# (including `&outer` address-taking, array/function decay, volatile/const
+# stripping, aggregates, and nested block restoration).  Standard C23 `auto`
+# must keep standard early-binding refusal (matching GCC 16.2).
+cat >"$tmp/auto_rt.c" <<'C'
+int outer = 41;
+int ls = 99;
+int g_arr[2] = {12, 34};
+static __auto_type g_ptr = &outer;
+static __auto_type g_aptr = g_arr;
+int fn_inc(int x) { return x + 1; }
+struct Pair { int a; long b; };
+
+int main(void) {
+    int sum = 0;
+    if (*g_ptr != 41 || g_aptr[1] != 34) return 1;
+
+    {
+        __auto_type outer = &outer;
+        if (sizeof(outer) != sizeof(int *)) return 2;
+        *outer += 1;
+        sum += *outer;
+    }
+    if (sizeof(outer) != sizeof(int) || outer != 42) return 3;
+
+    {
+        static __auto_type ls = &ls;
+        if (sizeof(ls) != sizeof(int *)) return 4;
+        sum += *ls;
+    }
+    if (sizeof(ls) != sizeof(int) || ls != 99) return 5;
+
+    int c = 5;
+    {
+        const __auto_type c = c + 10;
+        if (c != 15) return 6;
+        sum += c;
+    }
+
+    volatile int v = 7;
+    {
+        __auto_type v = v + 2;
+        if (v != 9) return 7;
+        v += 1;
+        sum += v;
+    }
+
+    int arr[4] = {10, 20, 30, 40};
+    {
+        __auto_type arr = arr;
+        if (sizeof(arr) != sizeof(int *) || arr[2] != 30) return 8;
+        sum += arr[2];
+    }
+    if (sizeof(arr) != 4 * sizeof(int)) return 9;
+
+    {
+        __auto_type fn_inc = fn_inc;
+        if (sizeof(fn_inc) != sizeof(int (*)(int)) || fn_inc(4) != 5) return 10;
+        sum += fn_inc(4);
+    }
+
+    struct Pair p = {11, 22};
+    {
+        __auto_type p = p;
+        if (sizeof(p) != sizeof(struct Pair) || p.a != 11 || p.b != 22) return 11;
+        p.a = 99;
+        sum += p.a;
+    }
+    if (p.a != 11) return 12;
+
+    int x = 1;
+    {
+        __auto_type x = x + 10;
+        {
+            __auto_type x = &x;
+            *x += 5;
+        }
+        if (x != 16) return 13;
+        sum += x;
+    }
+    if (x != 1) return 14;
+
+    return sum == 316 ? 0 : 15;
+}
+C
+
+e_rt_bad=0
+e_rt_checks=0
+for opt in 0 1 2 3 s; do
+    out=$("$CCC" -std=gnu11 -O"$opt" -c "$tmp/auto_rt.c" -o "$tmp/auto_rt.o" 2>&1) && rc=0 || rc=$?
+    e_rt_checks=$((e_rt_checks + 1))
+    if [ "$rc" -ne 0 ] || grep -q 'error:\|warning:' <<<"$out"; then
+        printf 'FAIL: E runtime -O%s diagnostic: %s\n' "$opt" "$out"
+        e_rt_bad=$((e_rt_bad + 1)); continue
+    fi
+    if ! "$GCC" "$tmp/auto_rt.o" -o "$tmp/auto_rt.bin" >"$tmp/auto_rt.link" 2>&1; then
+        printf 'FAIL: E runtime -O%s link: %s\n' "$opt" "$(cat "$tmp/auto_rt.link")"
+        e_rt_bad=$((e_rt_bad + 1)); continue
+    fi
+    if ! "$tmp/auto_rt.bin"; then
+        printf 'FAIL: E runtime -O%s wrong exit\n' "$opt"
+        e_rt_bad=$((e_rt_bad + 1))
+    fi
+done
+if [ -x "$CCC_I686" ]; then
+    for opt in 0 2; do
+        out=$("$CCC_I686" -std=gnu11 -O"$opt" -c "$tmp/auto_rt.c" -o "$tmp/auto_rt32.o" 2>&1) && rc=0 || rc=$?
+        e_rt_checks=$((e_rt_checks + 1))
+        if [ "$rc" -ne 0 ] || grep -q 'error:\|warning:' <<<"$out"; then
+            printf 'FAIL: E i686 -O%s diagnostic: %s\n' "$opt" "$out"
+            e_rt_bad=$((e_rt_bad + 1))
+        fi
+    done
+fi
+e_rt_checks=$((e_rt_checks + 1))
+if ! "$GCC" -std=gnu11 -O2 -c "$tmp/auto_rt.c" -o "$tmp/auto_gcc.o" >"$tmp/auto_gcc.log" 2>&1 \
+   || ! "$GCC" "$tmp/auto_gcc.o" -o "$tmp/auto_gcc.bin" >>"$tmp/auto_gcc.log" 2>&1 \
+   || ! "$tmp/auto_gcc.bin"; then
+    printf 'FAIL: E GCC oracle control failed: %s\n' "$(cat "$tmp/auto_gcc.log")"
+    e_rt_bad=$((e_rt_bad + 1))
+fi
+check "E GNU __auto_type object-binding runtime + i686 + oracle ($e_rt_checks checks)" "$e_rt_bad"
+
+e_neg_cases=(
+  'gnu11|__auto_type u = u;|err'
+  'gnu11|__auto_type pu = &pu;|err'
+  'gnu11|int outer = 1; int f(void) { __auto_type outer = &outer; return outer != 0; }|ok'
+  'gnu11|int outer = 1; int f(void) { auto outer = &outer; return outer != 0; }|err'
+  'c23|int outer = 1; int f(void) { __auto_type outer = &outer; return outer != 0; }|ok'
+  'c23|int outer = 1; int f(void) { auto outer = &outer; return outer != 0; }|err'
+  'c23|int outer = 1; int f(void) { auto outer = ({ int y = outer; y; }); return outer; }|err'
+  'c23|int outer = 1; int f(void) { auto outer = ({ auto outer = 5; outer; }); return outer == 5; }|ok'
+  'c23|int outer = 1; int f(void) { __auto_type outer = ({ int y = outer; y; }); return outer; }|ok'
+  'c23|int f(void) { auto p = &p; return p != 0; }|err'
+)
+e_neg_bad=0
+e_neg_checks=0
+for entry in "${e_neg_cases[@]}"; do
+    std=${entry%%|*}
+    rest=${entry#*|}
+    src=${rest%%|*}
+    want=${rest##*|}
+    printf '%s\n' "$src" >"$tmp/auto_neg.c"
+    for cc in "$CCC" "$CCC_I686"; do
+        [ -x "$cc" ] || continue
+        "$cc" -std="$std" -O2 -c "$tmp/auto_neg.c" -o "$tmp/auto_neg.o" >"$tmp/auto_neg.err" 2>&1 && lrc="ok" || lrc="err"
+        e_neg_checks=$((e_neg_checks + 1))
+        if [ "$lrc" != "$want" ]; then
+            printf 'FAIL: E %s -std=%s got=%s want=%s: %s (%s)\n' \
+                "$(basename "$cc")" "$std" "$lrc" "$want" "$src" "$(cat "$tmp/auto_neg.err")"
+            e_neg_bad=$((e_neg_bad + 1))
+        fi
+    done
+    "$GCC" -std="$std" -O2 -c "$tmp/auto_neg.c" -o "$tmp/auto_neg_g.o" >"$tmp/auto_neg_g.err" 2>&1 && grc="ok" || grc="err"
+    e_neg_checks=$((e_neg_checks + 1))
+    if [ "$grc" != "$want" ]; then
+        printf 'FAIL: E GCC oracle -std=%s got=%s want=%s: %s\n' "$std" "$grc" "$want" "$src"
+        e_neg_bad=$((e_neg_bad + 1))
+    fi
+done
+check "E GNU __auto_type / C23 auto verdict parity vs GCC 16.2 ($e_neg_checks checks)" "$e_neg_bad"
+
 printf 'check_gnu_declaration_corners: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

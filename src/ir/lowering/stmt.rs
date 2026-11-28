@@ -173,7 +173,7 @@ impl Lowerer {
                 }
             }
             self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
-            da.apply_decl_vector_type(decl);
+            self.apply_decl_vector_type(&mut da, decl);
             self.fixup_unsized_array(&mut da, type_spec, &declarator.derived, &declarator.init);
 
             let is_complex = !da.is_pointer && !da.is_array && self.is_type_complex(type_spec);
@@ -246,21 +246,36 @@ impl Lowerer {
                 )
             };
 
-            self.register_local_var(
-                decl,
-                declarator,
-                type_spec,
-                &da,
-                alloca,
-                alloca_align,
-                vla_size,
-            );
-            if let Some(layout) = typeof_layout {
-                if let Some(info) = self.func_mut().locals.get_mut(&declarator.name) {
-                    info.vla_strides = layout.strides;
+            // C23 `auto` and GNU `__auto_type` declare the identifier AFTER
+            // its initializer, so `auto x = &outer;` / `__auto_type x = x;`
+            // must evaluate the initializer before registering `x` in locals
+            // (and before shadowing any outer local/static/const binding).
+            let is_auto_type = matches!(decl.type_spec, TypeSpecifier::AutoType);
+            let cached_auto_const = if is_auto_type && vla_size.is_none() {
+                declarator
+                    .init
+                    .as_ref()
+                    .and_then(|init| self.eval_local_const_init(init, decl, &da, is_complex))
+            } else {
+                None
+            };
+            if !is_auto_type {
+                self.register_local_var(
+                    decl,
+                    declarator,
+                    type_spec,
+                    &da,
+                    alloca,
+                    alloca_align,
+                    vla_size,
+                );
+                if let Some(layout) = typeof_layout.as_ref() {
+                    if let Some(info) = self.func_mut().locals.get_mut(&declarator.name) {
+                        info.vla_strides = layout.strides.clone();
+                    }
                 }
+                self.track_fptr_sig(declarator, type_spec);
             }
-            self.track_fptr_sig(declarator, type_spec);
 
             if let Some(ref init) = declarator.init {
                 if let Some(vla_size_val) = vla_size {
@@ -279,12 +294,35 @@ impl Lowerer {
                         alloca,
                         is_complex,
                         &complex_elem_ctype,
+                        type_spec,
+                        !is_auto_type,
                     );
                 }
             } else if !declarator.attrs.is_uninitialized() {
                 let scalar_ty = (!da.is_array && !da.is_struct && !is_complex)
                     .then_some((da.var_ty, da.is_bool));
                 self.auto_init_local_var(alloca, scalar_ty, da.actual_alloc_size, vla_size);
+            }
+
+            if is_auto_type {
+                self.register_local_var(
+                    decl,
+                    declarator,
+                    type_spec,
+                    &da,
+                    alloca,
+                    alloca_align,
+                    vla_size,
+                );
+                if let Some(layout) = typeof_layout {
+                    if let Some(info) = self.func_mut().locals.get_mut(&declarator.name) {
+                        info.vla_strides = layout.strides;
+                    }
+                }
+                self.track_fptr_sig(declarator, type_spec);
+                if let Some(coerced) = cached_auto_const {
+                    self.insert_const_local_scoped(declarator.name.clone(), coerced);
+                }
             }
         }
     }
@@ -356,7 +394,9 @@ impl Lowerer {
                 &declarator.derived,
             );
             if !resolved_ctype.is_vector() {
-                if let Some(vector_ctype) = decl.resolve_vector_ctype(resolved_ctype.clone()) {
+                if let Some(vector_ctype) =
+                    self.resolve_decl_vector_ctype(decl, resolved_ctype.clone())
+                {
                     resolved_ctype = vector_ctype;
                 }
             }
@@ -666,6 +706,49 @@ impl Lowerer {
         }
     }
 
+    fn eval_local_const_init(
+        &self,
+        init: &Initializer,
+        decl: &Declaration,
+        da: &DeclAnalysis,
+        is_complex: bool,
+    ) -> Option<i64> {
+        let Initializer::Expr(expr) = init else {
+            return None;
+        };
+        // A `const volatile` local is never cached: each read must load
+        // (C11 6.7.3p7), so it is not a compile-time constant.
+        if !(decl.is_const()
+            && !da.base_type_volatile
+            && !da.object_volatile
+            && !da.is_pointer
+            && !da.is_array
+            && !da.is_struct
+            && !is_complex)
+        {
+            return None;
+        }
+        let const_val = self.eval_const_expr(expr)?;
+        if da.is_bool {
+            return Some(i64::from(const_val.is_nonzero()));
+        }
+        let ival = self.const_to_i64(&const_val)?;
+        // Coerce the constant to the declared type before caching it
+        // in const_local_values.
+        let coerced = match da.var_ty {
+            IrType::I8 => ival as i8 as i64,
+            IrType::U8 => ival as u8 as i64,
+            IrType::I16 => ival as i16 as i64,
+            IrType::U16 => ival as u16 as i64,
+            IrType::I32 => ival as i32 as i64,
+            IrType::U32 => ival as u32 as i64,
+            _ => ival,
+        };
+        let cacheable = !matches!(da.var_ty, IrType::I128 | IrType::U128)
+            || (ival >= 0 && const_val.to_i128() == Some(ival as i128));
+        cacheable.then_some(coerced)
+    }
+
     fn lower_local_var_init(
         &mut self,
         init: &Initializer,
@@ -675,58 +758,17 @@ impl Lowerer {
         alloca: Value,
         is_complex: bool,
         complex_elem_ctype: &Option<CType>,
+        type_spec: &TypeSpecifier,
+        record_const: bool,
     ) {
+        if record_const {
+            if let Some(coerced) = self.eval_local_const_init(init, decl, da, is_complex) {
+                self.insert_const_local_scoped(declarator.name.clone(), coerced);
+            }
+        }
         match init {
             Initializer::Expr(expr) => {
-                // A `const volatile` local is never cached: each read must load
-                // (C11 6.7.3p7), so it is not a compile-time constant.
-                if decl.is_const()
-                    && !da.base_type_volatile
-                    && !da.object_volatile
-                    && !da.is_pointer
-                    && !da.is_array
-                    && !da.is_struct
-                    && !is_complex
-                {
-                    if let Some(const_val) = self.eval_const_expr(expr) {
-                        if let Some(ival) = self.const_to_i64(&const_val) {
-                            // Coerce the constant to the declared type before caching it
-                            // in const_local_values. Otherwise `const char c = 220` caches
-                            // +220 instead of -36 (char is signed on x86), so `c < 0`
-                            // wrongly folds false and a following `|| (g = 9)` side effect
-                            // runs (Regehr yarpgen regress_const_local_char_init_coercion).
-                            // Match the sign/width of the declared IR type.
-                            let coerced = match da.var_ty {
-                                IrType::I8 => ival as i8 as i64,
-                                IrType::U8 => ival as u8 as i64,
-                                IrType::I16 => ival as i16 as i64,
-                                IrType::U16 => ival as u16 as i64,
-                                IrType::I32 => ival as i32 as i64,
-                                IrType::U32 => ival as u32 as i64,
-                                _ => ival, // I64/U64 already full-width
-                            };
-                            // A 128-bit initializer cannot, in general, live in the
-                            // i64 const-local cache: the cache is read back as
-                            // `IrConst::I64(cached)` and widened by the consumer's own
-                            // context, so anything but an exact round trip folds every
-                            // read of the variable to ONE HALF of the value
-                            // (`const unsigned __int128 c = (u128)3<<100 | 3` cached
-                            // low=3; a later `c >> 64` folded to
-                            // 3i64.wrapping_shr(64 & 63 = 0) = 3 — the high half read
-                            // the LOW value and the shift masked away). Cache only
-                            // values that survive both widenings bit-exactly:
-                            // non-negative and equal to the full 128-bit constant.
-                            // Everything else stays uncached and reads take the
-                            // (correct) alloca path — a missed fold, never a wrong one.
-                            let cacheable = !matches!(da.var_ty, IrType::I128 | IrType::U128)
-                                || (ival >= 0 && const_val.to_i128() == Some(ival as i128));
-                            if cacheable {
-                                self.insert_const_local_scoped(declarator.name.clone(), coerced);
-                            }
-                        }
-                    }
-                }
-                self.lower_local_init_expr(expr, alloca, da, is_complex, decl);
+                self.lower_local_init_expr(expr, alloca, da, is_complex, decl, type_spec);
             }
             Initializer::List(items) => {
                 self.lower_local_init_list(
@@ -760,16 +802,15 @@ impl Lowerer {
             super::global_decl::TlsAttrSubject::object(decl.is_thread_local()),
         );
 
-        // Register the bare name -> mangled name mapping before processing the initializer
-        // so that &x in another static's initializer can resolve to the mangled name.
-        self.insert_static_local_scoped(declarator.name.clone(), static_name.clone());
-
-        // Register the global before evaluating its initializer so that
-        // self-referential initializers (e.g., static struct work w = { .entry = { &w.entry, &w.entry } })
-        // can resolve &w.entry via resolve_chained_member_access -> self.globals.get().
-        // This mirrors the same pattern used in lower_global_decl().
-        let ginfo = GlobalInfo::from_analysis(da);
-        self.globals.insert(static_name.clone(), ginfo);
+        let is_auto_type = matches!(decl.type_spec, TypeSpecifier::AutoType);
+        if !is_auto_type {
+            // Register the bare name -> mangled name mapping before processing the initializer
+            // so that &x in another static's initializer can resolve to the mangled name,
+            // and self-referential initializers (`static struct work w = { &w.entry }`) resolve.
+            self.insert_static_local_scoped(declarator.name.clone(), static_name.clone());
+            let ginfo = GlobalInfo::from_analysis(da);
+            self.globals.insert(static_name.clone(), ginfo);
+        }
 
         // Determine initializer (evaluated at compile time for static locals)
         // For pointer arrays and scalar pointers, use Ptr as the base type for
@@ -806,6 +847,12 @@ impl Lowerer {
         } else {
             GlobalInit::Zero
         };
+
+        if is_auto_type {
+            self.insert_static_local_scoped(declarator.name.clone(), static_name.clone());
+            let ginfo = GlobalInfo::from_analysis(da);
+            self.globals.insert(static_name.clone(), ginfo);
+        }
 
         // File- and block-scope statics share object alignment rules; do not
         // let the pointer IR carrier over-align small vector objects.

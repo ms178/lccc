@@ -2379,12 +2379,66 @@ impl FileLiveness {
 
     /// Resolve the codegen's jump-table dispatch sites to their static
     /// successor sets. Returns a slot per line (`None` = not a resolved
-    /// table dispatch). See the call site for the shape being matched:
-    /// `leaq .LjtN(%rip), %rB; movslq (%rB,%rA,4), %rT; addq %rB, %rT;
-    /// jmpq *%rT` with the table `.LjtN: .long target - .LjtN …` emitted
-    /// inline. The match is deliberately exact: a computed goto or a tail
-    /// call sharing a register with a nearby leaq must NOT be mistaken
-    /// for a table (that would invent CFG edges).
+    /// table dispatch). Matches both:
+    /// * PIC/retpoline dispatches: `leaq .LjtN(%rip), %rB;
+    ///   movslq (%rB,%rA,4), %rT; addq %rB, %rT; jmpq *%rT` (or
+    ///   `jmp __x86_indirect_thunk_rT`) with `.LjtN: .long target - .LjtN`;
+    /// * non-PIC absolute table dispatches: `jmpq *.Ljt_N(,%rA,8)` (or
+    ///   4-byte scale) with `.Ljt_N: .quad target` (or `.long target`)
+    ///   emitted inline as an interleaved `.rodata` island.
+    ///
+    /// The match is deliberately exact: a computed goto, a user-defined
+    /// function-pointer table, or a tail call sharing a register with a
+    /// nearby `leaq` must NOT be mistaken for a switch table (that would
+    /// invent CFG edges).
+    fn parse_jump_table_entries(
+        store: &LineStore,
+        infos: &[LineInfo],
+        resolve: &dyn Fn(&str) -> Option<usize>,
+        tbl_line: usize,
+        end: usize,
+        allow_quad: bool,
+    ) -> Option<Vec<usize>> {
+        let mut targets: Vec<usize> = Vec::new();
+        let mut k = tbl_line + 1;
+        let mut ok = true;
+        while k < end {
+            if infos[k].is_nop() {
+                k += 1;
+                continue;
+            }
+            let kt = infos[k].trimmed(store.get(k));
+            let entry = kt
+                .strip_prefix(".long ")
+                .or_else(|| allow_quad.then(|| kt.strip_prefix(".quad ")).flatten());
+            if let Some(entry) = entry {
+                // `.long .LBBa - .LjtN` or plain `.quad .LBBa` / `.long .LBBa`.
+                let sym = entry.split('-').next().unwrap_or(entry).trim_ascii();
+                if sym.contains('+') || sym.contains(char::is_whitespace) {
+                    ok = false;
+                    break;
+                }
+                match resolve(sym) {
+                    Some(idx) => targets.push(idx),
+                    None => {
+                        ok = false;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+                k += 1;
+                continue;
+            }
+            if kt.starts_with('.') {
+                // `.section .text`, `.align` — table island boundaries.
+                break;
+            }
+            break;
+        }
+        (ok && !targets.is_empty()).then_some(targets)
+    }
+
     fn resolve_jump_tables(
         store: &LineStore,
         infos: &[LineInfo],
@@ -2414,6 +2468,30 @@ impl FileLiveness {
                 continue;
             }
             let t = infos[n].trimmed(store.get(n));
+            // Non-PIC switch table: `jmpq *.Ljt_N(,%rA,8)` (or `jmp *` / scale 4).
+            if let Some(rest) = t.strip_prefix("jmpq *").or_else(|| t.strip_prefix("jmp *"))
+                && let Some((tbl_raw, mem_rest)) = rest.split_once('(')
+                && let Some(mem_inner) = mem_rest.trim_ascii().strip_suffix(')')
+            {
+                let table_name = tbl_raw.trim_ascii();
+                let mut parts = mem_inner.split(',').map(str::trim_ascii);
+                let base_empty = parts.next().is_some_and(str::is_empty);
+                let idx_is_reg = parts.next().is_some_and(|r| r.starts_with('%'));
+                let scale_ok = parts.next().is_some_and(|s| matches!(s, "4" | "8"));
+                let no_extra = parts.next().is_none();
+                if table_name.starts_with(".Ljt")
+                    && base_empty
+                    && idx_is_reg
+                    && scale_ok
+                    && no_extra
+                    && let Some(tbl_line) = resolve(table_name)
+                    && let Some(targets) =
+                        Self::parse_jump_table_entries(store, infos, &resolve, tbl_line, end, true)
+                {
+                    out[n - start] = Some(targets);
+                }
+                continue;
+            }
             // `jmpq *%rT` — take the target register. The thunk-extern
             // retpoline form `jmp __x86_indirect_thunk_rT` dispatches
             // through the same %rT (read by the thunk symbol): the
@@ -2492,40 +2570,11 @@ impl FileLiveness {
             let Some(tbl_line) = resolve(table_name) else {
                 continue;
             };
-            let mut targets: Vec<usize> = Vec::new();
-            let mut k = tbl_line + 1;
-            let mut ok = true;
-            while k < end {
-                if infos[k].is_nop() {
-                    k += 1;
-                    continue;
-                }
-                let kt = infos[k].trimmed(store.get(k));
-                if let Some(entry) = kt.strip_prefix(".long ") {
-                    // `.long .LBBa - .LjtN` (the subtractand is the table
-                    // itself; accept the plain `.long .LBBa` spelling too).
-                    let sym = entry.split('-').next().unwrap_or(entry).trim_ascii();
-                    match resolve(sym) {
-                        Some(idx) => targets.push(idx),
-                        None => {
-                            ok = false;
-                        }
-                    }
-                    if !ok {
-                        break;
-                    }
-                    k += 1;
-                    continue;
-                }
-                if kt.starts_with('.') {
-                    // `.section .text`, `.align` — table island boundaries.
-                    break;
-                }
-                break;
-            }
-            if !ok || targets.is_empty() {
+            let Some(targets) =
+                Self::parse_jump_table_entries(store, infos, &resolve, tbl_line, end, false)
+            else {
                 continue;
-            }
+            };
             out[n - start] = Some(targets);
         }
         out
@@ -4001,6 +4050,46 @@ mod tests {
             Some(true),
             "the thunk reads %rdx: the staging write stays live"
         );
+    }
+
+    #[test]
+    fn non_pic_switch_jump_table_is_analysable_and_tracks_live_regs() {
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl (%rdi), %eax\n",
+            "    movl %eax, %r11d\n",
+            "    cmpl $1, %eax\n",
+            "    jae .Ldef\n",
+            "    jmpq *.Ljt_0(,%r11,8)\n",
+            ".section .rodata\n",
+            ".align 8\n",
+            ".Ljt_0:\n",
+            "    .quad .Lc0\n",
+            "    .quad .Lc1\n",
+            ".section .text,\"ax\",@progbits\n",
+            ".Lc0:\n",
+            "    movl $10, %eax\n",
+            "    ret\n",
+            ".Lc1:\n",
+            "    movl %ecx, %eax\n",
+            "    ret\n",
+            ".Ldef:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let cmp = line_of(&store, "cmpl $1, %eax");
+        assert_eq!(lv.live_after(cmp, 11), Some(true));
+        assert_eq!(lv.live_after(cmp, 1), Some(true));
+        let jmp = line_of(&store, "jmpq *.Ljt_0(,%r11,8)");
+        assert_eq!(lv.live_after(jmp, 11), Some(false));
+        assert_eq!(lv.live_after(jmp, 1), Some(true));
+
+        let non_jt = asm.replace("jmpq *.Ljt_0(,%r11,8)", "jmpq *fn_tbl(,%r11,8)");
+        let (_s2, _i2, lv2) = build(&non_jt);
+        assert!(lv2.live_after(cmp, 11).is_none());
     }
 
     #[test]

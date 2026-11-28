@@ -1,0 +1,18 @@
+{
+  "compiler_id": "cicxlatest",
+  "metadata": {
+    "id": "cicxlatest",
+    "name": "x86-64 icx (latest)",
+    "semver": "(latest)",
+    "compilerType": "clang-intel"
+  },
+  "source": "int intel_llvm_version(void) { return __INTEL_LLVM_COMPILER; }\n",
+  "source_sha256": "01636c1ff1bed161245236fe0379c0e48ac5f5bf50a4f9fea3e12530b1b625dd",
+  "assembly": [
+    "intel_llvm_version:",
+    "  movl $20240000, %eax",
+    "  retq",
+    ""
+  ],
+  "scope": "remote channel macro probe; not an attestation of a particular compiler binary"
+}

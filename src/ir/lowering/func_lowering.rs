@@ -113,6 +113,7 @@ impl Lowerer {
         self.func_mut().is_inline_candidate =
             func.attrs.is_always_inline() || func.attrs.is_inline() || func.attrs.is_static();
         self.push_scope();
+        self.collect_enum_constants_scoped(&func.return_type);
 
         // Step 1: Compute ABI-adjusted return type
         let return_type = self.compute_function_return_type(func);
@@ -650,6 +651,7 @@ impl Lowerer {
         // Phase 2 & 3: Process each original parameter by kind
         for (orig_idx, kind) in info.param_kinds.iter().enumerate() {
             let orig_param = &func.params[orig_idx];
+            self.collect_enum_constants_scoped(&orig_param.type_spec);
             match kind {
                 ParamKind::Normal(ir_idx) => {
                     self.register_normal_param(

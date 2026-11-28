@@ -711,6 +711,17 @@ pub(crate) fn relayout_blocks_static_chain(
                 if rare_zero[s] == Some(func.blocks[t].label.0) {
                     return 1;
                 }
+                if let Terminator::Switch { default, .. } = &func.blocks[s].terminator
+                    && func.blocks[t].label == *default
+                    && func.blocks[t].instructions.len() <= 8
+                    && !matches!(
+                        func.blocks[t].terminator,
+                        Terminator::Return(_) | Terminator::Unreachable
+                    )
+                    && succs[t].contains(&loops[li].header)
+                {
+                    return 10; // switch default loop latch: keep hot continuation adjacent
+                }
                 9 // stays inside the loop: the iteration path
             } else if depth[t] > depth[s] {
                 8 // enters a deeper nest (cannot be an exit of `s`'s loop)
@@ -2180,5 +2191,35 @@ mod asm_goto_layout_tests {
             blk(3, ret()),
         ]);
         assert_eq!(layout_branch_cost(&label_first), 1);
+    }
+
+    #[test]
+    fn switch_default_loop_latch_is_placed_adjacent_to_switch_header() {
+        let f = func_of(vec![
+            blk(0, br(1)),
+            blk(
+                1,
+                Terminator::Switch {
+                    val: Operand::Const(IrConst::I32(0)),
+                    cases: vec![(0, BlockId(3)), (1, BlockId(2))],
+                    default: BlockId(4),
+                    ty: IrType::I32,
+                },
+            ),
+            blk(2, ret()),
+            blk(3, cond(1, 5)),
+            blk(4, cond(1, 5)),
+            blk(5, ret()),
+        ]);
+        let mut out = f;
+        relayout_blocks_static_chain(&mut out, DualLayout::ChainOnly);
+        let pos_switch = out.blocks.iter().position(|b| b.label.0 == 1).unwrap();
+        let pos_default = out.blocks.iter().position(|b| b.label.0 == 4).unwrap();
+        assert_eq!(
+            pos_default,
+            pos_switch + 1,
+            "default loop latch must follow switch header: {:?}",
+            out.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>()
+        );
     }
 }

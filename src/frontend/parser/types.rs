@@ -562,6 +562,7 @@ impl Parser {
             // the initializer, exactly as GNU `__auto_type` (arrays and
             // functions decay). Before C23 it is implicit int.
             if saw_auto && self.c23 {
+                self.attrs.set_c23_auto(true);
                 return Some(TypeSpecifier::AutoType);
             }
             if any_storage_class {
@@ -1275,11 +1276,9 @@ impl Parser {
         is_packed = is_packed || packed2;
         let underlying = self.parse_enum_underlying_type();
         let variants = if matches!(self.peek(), TokenKind::LBrace) {
-            let v = self.parse_enum_variants();
-            // Register enum constant values so that later constant expressions
-            // (e.g., in __attribute__((aligned(1 << ENUM_CONST)))) can resolve them.
-            self.register_enum_constants(&v);
-            Some(v)
+            // Enumerators are registered incrementally inside parse_enum_variants
+            // as each enumerator's own initializer finishes, matching C11 6.2.1p7.
+            Some(self.parse_enum_variants())
         } else {
             None
         };
@@ -2050,6 +2049,11 @@ impl Parser {
             // Parse any additional trailing GCC __attribute__ (e.g., after bitfield width)
             let (extra_packed, extra_aligned, _, _, _) = self.parse_gcc_attributes();
             let counted_by = self.attrs.parsing_counted_by.take().or(pre_decl_counted_by);
+            let decl_vector_size_expr = self
+                .attrs
+                .parsing_vector_size_expr
+                .take()
+                .or_else(|| vector_size_expr.clone());
 
             // The strictest of every alignment source applies (C11 6.7.5p6;
             // GCC's `aligned` attribute on a member only ever raises it).
@@ -2076,6 +2080,7 @@ impl Parser {
                     TypeSpecifier::Void
                 })
             });
+            let base = self.apply_pending_vector_attr(base);
             let (mut field_type, field_derived) = Self::fold_simple_derived(base, &derived);
             self.check_field_designated_attribute(&field_type, declarator_span);
             self.check_struct_field_space(
@@ -2114,7 +2119,7 @@ impl Parser {
                 object_volatile: decl_object_volatile,
                 object_const: field_object_const,
                 counted_by,
-                vector_size_expr: vector_size_expr.clone(),
+                vector_size_expr: decl_vector_size_expr,
             });
 
             if !self.consume_if(&TokenKind::Comma) {
@@ -2271,6 +2276,7 @@ impl Parser {
     /// Parse enum variant declarations inside braces.
     pub(super) fn parse_enum_variants(&mut self) -> Vec<EnumVariant> {
         let mut variants = Vec::with_capacity(8);
+        let mut next_value: Option<i64> = Some(0);
         let open = self.peek_span();
         self.expect_context(&TokenKind::LBrace, "for enum body");
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
@@ -2297,7 +2303,14 @@ impl Parser {
                 } else {
                     None
                 };
-                variants.push(EnumVariant { name, value, span });
+                let variant = EnumVariant { name, value, span };
+                // C11 6.2.1p7: an enumerator's scope begins immediately after
+                // its defining enumerator (including its optional `= expr`).
+                // Registering incrementally ensures `enum { T = sizeof(T), U = (T) + 10 }`
+                // resolves `sizeof(T)` against the outer scope while `(T) + 10`
+                // sees the new enumerator rather than an outer typedef or enum.
+                self.register_single_enum_constant(&variant, &mut next_value);
+                variants.push(variant);
                 self.consume_if(&TokenKind::Comma);
             } else {
                 self.advance();
@@ -2307,38 +2320,131 @@ impl Parser {
         variants
     }
 
+    fn register_single_enum_constant(
+        &mut self,
+        variant: &super::ast::EnumVariant,
+        next_value: &mut Option<i64>,
+    ) {
+        self.register_single_enum_constant_scoped(variant, next_value, false);
+    }
+
+    fn register_single_enum_constant_scoped(
+        &mut self,
+        variant: &super::ast::EnumVariant,
+        next_value: &mut Option<i64>,
+        force_scope: bool,
+    ) {
+        let evaluated = if let Some(ref expr) = variant.value {
+            let tag_aligns = if self.struct_tag_alignments.is_empty() {
+                None
+            } else {
+                Some(&self.struct_tag_alignments)
+            };
+            Self::eval_const_int_expr_with_enums(expr, Some(&self.enum_constants), tag_aligns)
+        } else {
+            *next_value
+        };
+        if force_scope || self.block_depth > 0 || self.param_list_depth > 0 {
+            self.hide_enum_constant(&variant.name);
+            if self.typedefs.contains(&variant.name)
+                && !self.shadowed_typedefs.contains(&variant.name)
+            {
+                self.shadowed_typedefs.insert(variant.name.clone());
+            }
+        }
+        if let Some(val) = evaluated {
+            self.enum_constants.insert(variant.name.clone(), val);
+            *next_value = val.checked_add(1);
+        } else {
+            // Value not evaluable at parse time (e.g., sizeof(struct)).
+            // Don't store in the value map, but record the name so that
+            // expr_has_non_const_identifier knows this is a constant (not a variable).
+            self.unevaluable_enum_constants.insert(variant.name.clone());
+            *next_value = None;
+        }
+    }
+
+    fn register_inline_enum_from_spec_scoped(
+        &mut self,
+        ts: &TypeSpecifier,
+        shadowed_added: &mut Vec<String>,
+    ) {
+        match ts {
+            TypeSpecifier::Enum(_, Some(variants), ..) => {
+                let mut next_value: Option<i64> = Some(0);
+                for variant in variants {
+                    if self.typedefs.contains(&variant.name)
+                        && !self.shadowed_typedefs.contains(&variant.name)
+                    {
+                        shadowed_added.push(variant.name.clone());
+                    }
+                    self.register_single_enum_constant_scoped(variant, &mut next_value, true);
+                }
+            }
+            TypeSpecifier::Pointer(inner, _)
+            | TypeSpecifier::Array(inner, _)
+            | TypeSpecifier::Vector(inner, _)
+            | TypeSpecifier::TypeofType(inner, _)
+            | TypeSpecifier::FunctionPointer(inner, ..)
+            | TypeSpecifier::BareFunction(inner, ..) => {
+                self.register_inline_enum_from_spec_scoped(inner, shadowed_added);
+            }
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), ..) => {
+                for f in fields {
+                    self.register_inline_enum_from_spec_scoped(&f.type_spec, shadowed_added);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Enter function-definition parameter scope: re-expose any inline enum
+    /// constants declared in `params` before hiding parameter names themselves,
+    /// recording both in `enum_scope_log` and `shadowed_added` so leaving the
+    /// body restores the enclosing file/block scope cleanly.
+    pub(super) fn enter_function_param_scope(
+        &mut self,
+        params: &[super::ast::ParamDecl],
+    ) -> (usize, Vec<String>) {
+        let enum_mark = self.enum_scope_log.len();
+        let mut shadowed_added = Vec::new();
+        for param in params {
+            self.register_inline_enum_from_spec_scoped(&param.type_spec, &mut shadowed_added);
+        }
+        for param in params {
+            if let Some(ref pname) = param.name {
+                if self.is_parser_enum_constant(pname) {
+                    self.hide_enum_constant(pname);
+                }
+                if self.typedefs.contains(pname) && !self.shadowed_typedefs.contains(pname) {
+                    self.shadowed_typedefs.insert(pname.clone());
+                    shadowed_added.push(pname.clone());
+                }
+            }
+        }
+        (enum_mark, shadowed_added)
+    }
+
+    pub(super) fn leave_function_param_scope(
+        &mut self,
+        enum_mark: usize,
+        shadowed_added: Vec<String>,
+    ) {
+        for n in shadowed_added {
+            self.shadowed_typedefs.remove(&n);
+        }
+        self.restore_enum_scope(enum_mark);
+    }
+
     /// Register enum constant values from parsed variants into the parser's
     /// enum_constants map. This allows later constant expressions (e.g., in
     /// __attribute__((aligned(1 << ENUM_CONST)))) to resolve these identifiers.
+    #[allow(dead_code)]
     pub(super) fn register_enum_constants(&mut self, variants: &[super::ast::EnumVariant]) {
         let mut next_value: Option<i64> = Some(0);
         for variant in variants {
-            let evaluated = if let Some(ref expr) = variant.value {
-                // Evaluate the explicit value expression.
-                // Use eval_const_int_expr_with_enums so references to previously
-                // defined enum constants are resolved.
-                let tag_aligns = if self.struct_tag_alignments.is_empty() {
-                    None
-                } else {
-                    Some(&self.struct_tag_alignments)
-                };
-                Self::eval_const_int_expr_with_enums(expr, Some(&self.enum_constants), tag_aligns)
-            } else {
-                next_value
-            };
-            if self.block_depth > 0 {
-                self.hide_enum_constant(&variant.name);
-            }
-            if let Some(val) = evaluated {
-                self.enum_constants.insert(variant.name.clone(), val);
-                next_value = Some(val + 1);
-            } else {
-                // Value not evaluable at parse time (e.g., sizeof(struct)).
-                // Don't store in the value map, but record the name so that
-                // expr_has_non_const_identifier knows this is a constant (not a variable).
-                self.unevaluable_enum_constants.insert(variant.name.clone());
-                next_value = None;
-            }
+            self.register_single_enum_constant(variant, &mut next_value);
         }
     }
 

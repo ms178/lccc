@@ -1350,35 +1350,13 @@ fn select_inline_site(
         // Attribute/section/PGO cases keep their stronger correctness or
         // profile-driven policy.
         if aggregate_frame_should_stay_outlined(callee_data, site.pgo_force, size_optimized)
-            || template_wrapper_should_wait_for_specialization(
+            || wrapper_or_loop_clone_should_stay_outlined(
                 callee_data,
                 callee_inst_count,
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
-            )
-            || multisite_loop_wrapper_should_stay_outlined(
-                callee_data,
-                callee_inst_count,
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
-            )
-            || (!const_trip_admitted
-                && nested_loop_multisite_static_should_stay_outlined(
-                    callee_data,
-                    callee_inst_count,
-                    loop_blocks.contains(&site.block_idx),
-                    caller_has_section,
-                    site.pgo_force,
-                    size_optimized,
-                ))
-            || repeated_small_loop_clone_should_stay_outlined(
-                callee_data,
-                callee_inst_count,
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
+                call_sites,
+                site,
+                loop_blocks,
+                (const_trip_admitted, caller_has_section, size_optimized),
             )
         {
             continue;
@@ -1489,35 +1467,13 @@ fn select_inline_site(
             .map(|b| b.instructions.len())
             .sum();
         if aggregate_frame_should_stay_outlined(callee_data, site.pgo_force, size_optimized)
-            || template_wrapper_should_wait_for_specialization(
+            || wrapper_or_loop_clone_should_stay_outlined(
                 callee_data,
                 callee_inst_count,
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
-            )
-            || multisite_loop_wrapper_should_stay_outlined(
-                callee_data,
-                callee_inst_count,
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
-            )
-            || (!const_trip_admitted
-                && nested_loop_multisite_static_should_stay_outlined(
-                    callee_data,
-                    callee_inst_count,
-                    loop_blocks.contains(&site.block_idx),
-                    caller_has_section,
-                    site.pgo_force,
-                    size_optimized,
-                ))
-            || repeated_small_loop_clone_should_stay_outlined(
-                callee_data,
-                callee_inst_count,
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
+                call_sites,
+                site,
+                loop_blocks,
+                (const_trip_admitted, caller_has_section, size_optimized),
             )
         {
             continue;
@@ -4335,12 +4291,125 @@ struct CalleeContext {
     semantic_interposition: bool,
 }
 
+fn live_reachable_function_names<'a>(
+    module: &'a IrModule,
+    value_referenced: &FxHashSet<String>,
+    asm_templates: &[String],
+    asm_context: &crate::common::asm_scan::AsmSymbolContext,
+) -> Option<FxHashSet<&'a str>> {
+    let mut alias_to_name: FxHashMap<&'a str, Vec<&'a str>> = FxHashMap::default();
+    let mut by_name: FxHashMap<&'a str, &'a IrFunction> = FxHashMap::default();
+    for f in &module.functions {
+        if !f.is_declaration {
+            by_name.insert(f.name.as_str(), f);
+            alias_to_name
+                .entry(f.name.as_str())
+                .or_default()
+                .push(f.name.as_str());
+            if let Some(alias) = module.asm_labels.get(&f.name) {
+                alias_to_name
+                    .entry(alias.as_str())
+                    .or_default()
+                    .push(f.name.as_str());
+            }
+        }
+    }
+    let has_toplevel_asm = !module.toplevel_asm.is_empty();
+    let mut roots: Vec<&'a str> = Vec::new();
+    for f in &module.functions {
+        if f.is_declaration {
+            continue;
+        }
+        let asm_alias = module
+            .asm_labels
+            .get(&f.name)
+            .filter(|a| a.as_str() != f.name.as_str())
+            .map(String::as_str);
+        let addr_ref = callee_is_address_referenced(
+            &f.name,
+            asm_alias,
+            value_referenced,
+            asm_templates,
+            asm_context,
+        );
+        let toplevel_ref = has_toplevel_asm
+            && (asm_context.any_blob_references(&module.toplevel_asm, &f.name)
+                || asm_alias
+                    .is_some_and(|a| asm_context.any_blob_references(&module.toplevel_asm, a)));
+        let is_ctor_or_dtor = module.constructors.iter().any(|c| c == &f.name)
+            || module.destructors.iter().any(|d| d == &f.name)
+            || module
+                .aliases
+                .iter()
+                .any(|(a, t, _)| a == &f.name || t == &f.name)
+            || module
+                .ifuncs
+                .iter()
+                .any(|(i, r, _, _)| i == &f.name || r == &f.name);
+        if !f.is_static
+            || f.is_used
+            || f.name == "main"
+            || addr_ref
+            || toplevel_ref
+            || is_ctor_or_dtor
+        {
+            roots.push(f.name.as_str());
+        }
+    }
+    if roots.is_empty() {
+        return None;
+    }
+    let mut live: FxHashSet<&'a str> = FxHashSet::default();
+    let mut worklist: Vec<&'a str> = Vec::new();
+    for r in roots {
+        if live.insert(r) {
+            worklist.push(r);
+        }
+    }
+    while let Some(name) = worklist.pop() {
+        let Some(f) = by_name.get(name) else {
+            continue;
+        };
+        for block in &f.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Call {
+                    func: callee_name, ..
+                } = inst
+                {
+                    if let Some(targets) = alias_to_name.get(callee_name.as_str()) {
+                        for &target in targets {
+                            if live.insert(target) {
+                                worklist.push(target);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(live)
+}
+
 fn callee_context(module: &IrModule) -> CalleeContext {
     let (value_referenced, asm_templates) = collect_value_referenced_functions(module);
     let asm_context = module.asm_symbol_context();
+    // Dead static functions left behind after Pass 1 inlined their callers
+    // still sit in `module.functions` until Phase 11 dead-statics cleanup.
+    // Excluding unreachable static bodies keeps their dead call sites from
+    // inflating `direct_calls` and locking out `loop_guard` targets (`sqlite_get_varint`).
+    let live_funcs =
+        live_reachable_function_names(module, &value_referenced, &asm_templates, &asm_context);
+    let is_live = |f: &IrFunction| {
+        live_funcs
+            .as_ref()
+            .is_none_or(|live| live.contains(f.name.as_str()))
+    };
     let mut call_site_counts: FxHashMap<String, usize> = FxHashMap::default();
     let mut sole_caller: FxHashMap<String, String> = FxHashMap::default();
     for f in &module.functions {
+        if !is_live(f) {
+            continue;
+        }
         for block in &f.blocks {
             for inst in &block.instructions {
                 if let Instruction::Call {
@@ -4433,6 +4502,9 @@ fn callee_context(module: &IrModule) -> CalleeContext {
         // once-called functions (to classify the enclosing caller as cold).
         let mut needs_loop_info_for_census: FxHashSet<usize> = FxHashSet::default();
         for (idx, f) in module.functions.iter().enumerate() {
+            if !is_live(f) {
+                continue;
+            }
             if f.blocks.iter().any(|block| {
                 block.instructions.iter().any(|inst| {
                     matches!(inst, Instruction::Call { func: callee_name, .. }
@@ -4446,6 +4518,9 @@ fn callee_context(module: &IrModule) -> CalleeContext {
         // classification, but only if they actually contain loops.
         let mut sole_caller_indices: FxHashMap<&str, usize> = FxHashMap::default();
         for (idx, f) in module.functions.iter().enumerate() {
+            if !is_live(f) {
+                continue;
+            }
             sole_caller_indices.insert(f.name.as_str(), idx);
         }
         let once_called_names: Vec<String> = module
@@ -4837,11 +4912,11 @@ fn callee_data_for(
                 && inst_count_for_static <= MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
                 && func.blocks.len() <= medium_block_limit)
                 || (has_loops
-                    && fits_static_loop_inline_limits(
+                    && (fits_static_loop_inline_limits(
                         inst_count_for_static,
                         func.blocks.len(),
                         direct_call_count,
-                    )));
+                    ) || is_pure_alu_loop_helper_blocks(&func.blocks, inst_count_for_static))));
         // A static (non-inline) function with exactly one call site in the
         // module is dead after inlining (net code shrink), so GCC -O2 inlines
         // it even when it exceeds the multi-call-site static limits above.
@@ -4993,7 +5068,8 @@ fn callee_data_for(
         ) || (is_static_like
             && !func.is_inline
             && has_loops
-            && fits_static_loop_inline_limits(inst_count, func.blocks.len(), direct_call_count))
+            && (fits_static_loop_inline_limits(inst_count, func.blocks.len(), direct_call_count)
+                || is_pure_alu_loop_helper_blocks(&func.blocks, inst_count)))
             // GNU89 `extern inline __attribute__((gnu_inline))` bodies exist
             // ONLY for inlining (no out-of-line copy is emitted in this TU);
             // a rejected site leaves a call to an external symbol that may
@@ -5533,6 +5609,231 @@ fn repeated_small_loop_clone_should_stay_outlined(
         && data.blocks.len() <= MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS
         && !caller_has_section
         && !pgo_force
+}
+
+fn is_pure_alu_inst(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::BinOp { op, .. } => !op.can_trap(),
+        Instruction::UnaryOp { .. }
+        | Instruction::Cmp { .. }
+        | Instruction::Cast { .. }
+        | Instruction::Copy { .. }
+        | Instruction::Select { .. }
+        | Instruction::Phi { .. }
+        | Instruction::ParamRef { .. } => true,
+        _ => false,
+    }
+}
+
+fn safe_param_home_allocas(blocks: &[BasicBlock]) -> FxHashSet<Value> {
+    let Some(entry) = blocks.first() else {
+        return FxHashSet::default();
+    };
+    let mut param_refs: FxHashSet<Value> = FxHashSet::default();
+    let mut candidates: FxHashSet<Value> = FxHashSet::default();
+    for inst in &entry.instructions {
+        match inst {
+            Instruction::ParamRef { dest, .. } => {
+                param_refs.insert(*dest);
+            }
+            Instruction::Alloca {
+                dest,
+                volatile: false,
+                semantic_volatile: false,
+                ..
+            } => {
+                candidates.insert(*dest);
+            }
+            _ => {}
+        }
+    }
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let mut stored_once: FxHashSet<Value> = FxHashSet::default();
+    let mut disqualified: FxHashSet<Value> = FxHashSet::default();
+    for (b_idx, block) in blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Alloca { dest, .. } if b_idx == 0 && candidates.contains(dest) => {}
+                Instruction::Load {
+                    ptr,
+                    volatile: false,
+                    ..
+                } if candidates.contains(ptr) => {}
+                Instruction::Store {
+                    val: Operand::Value(v),
+                    ptr,
+                    volatile: false,
+                    ..
+                } if b_idx == 0
+                    && candidates.contains(ptr)
+                    && param_refs.contains(v)
+                    && *ptr != *v
+                    && stored_once.insert(*ptr) => {}
+                _ => {
+                    inst.for_each_used_value(|u| {
+                        if candidates.contains(&Value(u)) {
+                            disqualified.insert(Value(u));
+                        }
+                    });
+                }
+            }
+        }
+        block.terminator.for_each_used_value(|u| {
+            if candidates.contains(&Value(u)) {
+                disqualified.insert(Value(u));
+            }
+        });
+    }
+    candidates.retain(|v| !disqualified.contains(v));
+    candidates
+}
+
+fn is_pure_alu_inst_with_param_allocas(
+    inst: &Instruction,
+    b_idx: usize,
+    param_allocas: &FxHashSet<Value>,
+) -> bool {
+    if is_pure_alu_inst(inst) {
+        return true;
+    }
+    match inst {
+        Instruction::Alloca { dest, .. } => b_idx == 0 && param_allocas.contains(dest),
+        Instruction::Load {
+            ptr,
+            volatile: false,
+            ..
+        } => param_allocas.contains(ptr),
+        Instruction::Store {
+            ptr,
+            volatile: false,
+            ..
+        } => b_idx == 0 && param_allocas.contains(ptr),
+        _ => false,
+    }
+}
+
+fn is_pure_alu_loop_helper_blocks(blocks: &[BasicBlock], raw_inst_count: usize) -> bool {
+    if raw_inst_count == 0 || raw_inst_count > 48 || blocks.len() > 16 {
+        return false;
+    }
+    let param_allocas = safe_param_home_allocas(blocks);
+    blocks.iter().enumerate().all(|(b_idx, b)| {
+        b.instructions
+            .iter()
+            .all(|inst| is_pure_alu_inst_with_param_allocas(inst, b_idx, &param_allocas))
+    })
+}
+
+fn is_small_readonly_loop_helper_blocks(
+    blocks: &[BasicBlock],
+    raw_inst_count: usize,
+    direct_call_count: usize,
+) -> bool {
+    if raw_inst_count == 0
+        || raw_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS
+        || blocks.len() > MAX_INLINE_BLOCKS
+        || direct_call_count > MAX_SMALL_STATIC_LOOP_INLINE_CLONES
+    {
+        return false;
+    }
+    let param_allocas = safe_param_home_allocas(blocks);
+    blocks.iter().enumerate().all(|(b_idx, b)| {
+        b.instructions.iter().all(|inst| {
+            is_pure_alu_inst_with_param_allocas(inst, b_idx, &param_allocas)
+                || matches!(
+                    inst,
+                    Instruction::GetElementPtr { .. }
+                        | Instruction::Load {
+                            volatile: false,
+                            ..
+                        }
+                )
+        })
+    })
+}
+
+fn wrapper_or_loop_clone_should_stay_outlined(
+    callee_data: &CalleeData,
+    callee_inst_count: usize,
+    call_sites: &[InlineCallSite],
+    site: &InlineCallSite,
+    loop_blocks: &FxHashSet<usize>,
+    (const_trip_admitted, caller_has_section, size_optimized): (bool, bool, bool),
+) -> bool {
+    if template_wrapper_should_wait_for_specialization(
+        callee_data,
+        callee_inst_count,
+        caller_has_section,
+        site.pgo_force,
+        size_optimized,
+    ) || multisite_loop_wrapper_should_stay_outlined(
+        callee_data,
+        callee_inst_count,
+        caller_has_section,
+        site.pgo_force,
+        size_optimized,
+    ) {
+        return true;
+    }
+    if small_loop_helper_site_exempt(
+        callee_data,
+        callee_inst_count,
+        call_sites,
+        site,
+        loop_blocks,
+    ) {
+        return false;
+    }
+    (!const_trip_admitted
+        && nested_loop_multisite_static_should_stay_outlined(
+            callee_data,
+            callee_inst_count,
+            loop_blocks.contains(&site.block_idx),
+            caller_has_section,
+            site.pgo_force,
+            size_optimized,
+        ))
+        || repeated_small_loop_clone_should_stay_outlined(
+            callee_data,
+            callee_inst_count,
+            caller_has_section,
+            site.pgo_force,
+            size_optimized,
+        )
+}
+
+fn small_loop_helper_exempt(data: &CalleeData, raw_inst_count: usize) -> bool {
+    is_pure_alu_loop_helper_blocks(&data.blocks, raw_inst_count)
+        || is_small_readonly_loop_helper_blocks(
+            &data.blocks,
+            raw_inst_count,
+            data.direct_call_count,
+        )
+}
+
+fn small_loop_helper_site_exempt(
+    data: &CalleeData,
+    raw_inst_count: usize,
+    call_sites: &[InlineCallSite],
+    site: &InlineCallSite,
+    loop_blocks: &FxHashSet<usize>,
+) -> bool {
+    if !small_loop_helper_exempt(data, raw_inst_count) {
+        return false;
+    }
+    let mut caller_sites = 0usize;
+    let mut caller_loop_sites = 0usize;
+    for s in call_sites {
+        if s.callee_name == site.callee_name {
+            caller_sites += 1;
+            if loop_blocks.contains(&s.block_idx) {
+                caller_loop_sites += 1;
+            }
+        }
+    }
+    caller_loop_sites <= 1 && caller_sites <= 2
 }
 
 /// Return whether a descendant is selected by the inliner's unconditional
@@ -8954,6 +9255,128 @@ mod inline_limit_tests {
         helper.is_plain_static = false;
         assert!(!repeated_small_loop_clone_should_stay_outlined(
             &helper, 27, false, false, false
+        ));
+    }
+
+    #[test]
+    fn small_loop_helper_exemption_admits_pure_alu_and_small_readonly_only() {
+        let mut alu = loop_helper_data(8, 34);
+        alu.is_plain_static = true;
+        alu.is_static_inline = false;
+        alu.direct_call_count = 5;
+        assert!(small_loop_helper_exempt(&alu, 34));
+        assert!(!small_loop_helper_exempt(&alu, 49));
+
+        // Adding a non-volatile load keeps a <=20-inst / <=6-blk / <=4-site
+        // helper exempt, but disqualifies the 34-inst or 5-site helper.
+        let load = Instruction::Load {
+            dest: Value(1),
+            ptr: Value(0),
+            ty: crate::common::types::IrType::U32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        alu.blocks[0].instructions[0] = load.clone();
+        assert!(!small_loop_helper_exempt(&alu, 34));
+
+        let mut ro = loop_helper_data(6, 19);
+        ro.is_plain_static = true;
+        ro.is_static_inline = false;
+        ro.direct_call_count = 4;
+        ro.blocks[0].instructions[0] = load;
+        assert!(small_loop_helper_exempt(&ro, 19));
+        ro.direct_call_count = 5;
+        assert!(!small_loop_helper_exempt(&ro, 19));
+
+        // Any store or trapping op fails closed.
+        let mut with_store = loop_helper_data(4, 10);
+        with_store.direct_call_count = 2;
+        with_store.blocks[0].instructions[0] = Instruction::Store {
+            val: Operand::Const(IrConst::I32(1)),
+            ptr: Value(0),
+            ty: crate::common::types::IrType::U32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        assert!(!small_loop_helper_exempt(&with_store, 10));
+
+        // Dead/param-only allocas in block 0 (unpromoted or post-mem2reg residue)
+        // stay exempt, whereas an escaping or mutably stored alloca fails closed.
+        let mut with_param_alloca = loop_helper_data(8, 35);
+        with_param_alloca.is_plain_static = true;
+        with_param_alloca.is_static_inline = false;
+        with_param_alloca.direct_call_count = 4;
+        with_param_alloca.blocks[0].instructions[0] = Instruction::Alloca {
+            dest: Value(10),
+            ty: crate::common::types::IrType::U32,
+            size: 4,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        with_param_alloca.blocks[0].instructions[1] = Instruction::ParamRef {
+            dest: Value(11),
+            param_idx: 0,
+            ty: crate::common::types::IrType::U32,
+        };
+        with_param_alloca.blocks[0].instructions[2] = Instruction::Store {
+            val: Operand::Value(Value(11)),
+            ptr: Value(10),
+            ty: crate::common::types::IrType::U32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        with_param_alloca.blocks[1].instructions[0] = Instruction::Load {
+            dest: Value(12),
+            ptr: Value(10),
+            ty: crate::common::types::IrType::U32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        assert!(small_loop_helper_exempt(&with_param_alloca, 35));
+
+        with_param_alloca.blocks[1].instructions[1] = Instruction::Store {
+            val: Operand::Const(IrConst::I32(2)),
+            ptr: Value(10),
+            ty: crate::common::types::IrType::U32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        assert!(!small_loop_helper_exempt(&with_param_alloca, 35));
+
+        let mk_site = |block_idx: usize, inst_idx: usize| InlineCallSite {
+            block_idx,
+            inst_idx,
+            callee_name: "helper".to_string(),
+            dest: None,
+            args: Vec::new(),
+            pgo_force: false,
+            arg_meta: CallArgMeta::default(),
+        };
+        let mut alu_site = loop_helper_data(8, 33);
+        alu_site.is_plain_static = true;
+        alu_site.is_static_inline = false;
+        alu_site.direct_call_count = 4;
+        let loop_blocks: FxHashSet<usize> = [1].into_iter().collect();
+        // Single loop site + single non-loop site in a caller stays exempt
+        // (e.g. x2nmodp/zng_crc32_combine calling multmodp).
+        let sites_ok = [mk_site(1, 0), mk_site(2, 0)];
+        assert!(small_loop_helper_site_exempt(
+            &alu_site,
+            33,
+            &sites_ok,
+            &sites_ok[0],
+            &loop_blocks
+        ));
+        // Repeated loop call sites inside one caller (e.g. clz_safe_guards ref)
+        // stay outlined to avoid per-site loop bloat.
+        let sites_multi_loop = [mk_site(1, 0), mk_site(1, 1)];
+        assert!(!small_loop_helper_site_exempt(
+            &alu_site,
+            33,
+            &sites_multi_loop,
+            &sites_multi_loop[0],
+            &loop_blocks
         ));
     }
 }

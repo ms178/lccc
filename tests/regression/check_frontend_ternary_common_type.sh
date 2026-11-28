@@ -56,6 +56,26 @@ int main(void)
 }
 C
 status=0
+# The preprocessor has a separate evaluator and intmax_t/uintmax_t carriers.
+# C-expression tests alone cannot catch a wrong #if branch. Keep -Wundef fatal
+# to check that type propagation through inactive arms preserves suppression.
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+for compiler in "$CCC" gcc-16 clang; do
+    if ! command -v "$compiler" >/dev/null 2>&1; then
+        if [ "$compiler" = "$CCC" ]; then
+            echo "FAIL: requested compiler $CCC is unavailable" >&2
+            exit 1
+        fi
+        echo "SKIP: optional preprocessing oracle $compiler is unavailable" >&2
+        continue
+    fi
+    if ! "$compiler" -E -P -Wundef -Werror "$here/preprocessor_ternary_type.c" \
+        >"$tmp/pp.out" 2>"$tmp/pp.err"; then
+        echo "FAIL: $compiler preprocessor ternary types/grammar" >&2
+        cat "$tmp/pp.err" >&2
+        status=1
+    fi
+done
 for level in -O0 -O1 -O2 -O3 -Os; do
     if ! "$CCC" "$level" "$tmp/t.c" -o "$tmp/t" >"$tmp/build.log" 2>&1; then
         echo "FAIL: $level did not compile" >&2

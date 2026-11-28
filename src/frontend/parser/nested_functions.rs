@@ -390,16 +390,8 @@ impl Parser {
         def_attrs.zero_call_used_regs = self.attrs.parsing_zero_call_used_regs.take();
         def_attrs.no_sanitize = self.attrs.parsing_no_sanitize.take();
 
-        // Shadow typedef names used as parameter names (same as file scope).
-        let mut shadowed_added: Vec<String> = Vec::new();
-        for param in &final_params {
-            if let Some(ref pname) = param.name {
-                if self.typedefs.contains(pname) && !self.shadowed_typedefs.contains(pname) {
-                    self.shadowed_typedefs.insert(pname.clone());
-                    shadowed_added.push(pname.clone());
-                }
-            }
-        }
+        // Shadow typedef names and enumerators used as parameter names (same as file scope).
+        let (enum_mark, shadowed_added) = self.enter_function_param_scope(&final_params);
         let return_base_const = self.attrs.parsing_const();
         self.attrs.set_noreturn(false);
         let open = self.peek_span();
@@ -409,9 +401,7 @@ impl Parser {
         let body = self.parse_compound_stmt();
         self.asm_immediate_validation_deferred = prior_asm_immediate_defer;
         let body_span = self.through_previous_token(open);
-        for n in shadowed_added {
-            self.shadowed_typedefs.remove(&n);
-        }
+        self.leave_function_param_scope(enum_mark, shadowed_added);
 
         let attrs = crate::frontend::parser::ast::FunctionAttributes::for_definition(
             &def_attrs,

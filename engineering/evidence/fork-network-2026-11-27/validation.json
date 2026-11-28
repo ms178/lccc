@@ -1,0 +1,218 @@
+{
+  "scope": "targeted validation only; no ci_local.sh run",
+  "baseline": "7604253fa62bbce385b740ea33d7ce573f21cf5a",
+  "python_unittest_cases": 136,
+  "commands": [
+    {
+      "command": [
+        "python3",
+        "tests/corpus/test_fork_network_audit.py"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 0.4176426589983748,
+      "unittest_count": 11
+    },
+    {
+      "command": [
+        "python3",
+        "tests/corpus/test_llvm_oracle_slice.py"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 0.09822406499915814,
+      "unittest_count": 6
+    },
+    {
+      "command": [
+        "python3",
+        "tests/corpus/test_codegen_comparison_contract.py"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 0.11111391299891693,
+      "unittest_count": 12
+    },
+    {
+      "command": [
+        "python3",
+        "tests/corpus/test_oracle_arch_guard.py"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 0.08173225399877992,
+      "unittest_count": 12
+    },
+    {
+      "command": [
+        "python3",
+        "scripts/test_codegen_oracle.py"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 0.09252408799875411,
+      "unittest_count": 14
+    },
+    {
+      "command": [
+        "python3",
+        "tests/corpus/test_batched_benchmark.py"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 0.06943763200069952,
+      "unittest_count": 17
+    },
+    {
+      "command": [
+        "python3",
+        "tests/benchmark/test_benchmark_harness.py"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 0.18387934200109157,
+      "unittest_count": 20
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests/corpus",
+        "-p",
+        "test_mold_oracle_mode.py"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 1.1490044250003848,
+      "unittest_count": 5
+    },
+    {
+      "command": [
+        "python3",
+        "scripts/test_local_oracles.py"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 1.3353930250013946,
+      "unittest_count": 24
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests/corpus",
+        "-p",
+        "test_parallel_ci_layout.py"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 1.9049534189998667,
+      "unittest_count": 15
+    },
+    {
+      "command": [
+        "python3",
+        "scripts/check_ci_gate_parity.py"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 1.6934109930007253,
+      "unittest_count": null
+    },
+    {
+      "command": [
+        "python3",
+        "scripts/frontend_expression_fuzz.py",
+        "--lccc",
+        "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+        "--cases",
+        "32",
+        "--seed",
+        "178",
+        "--levels",
+        "0,2",
+        "--mode",
+        "mixed"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 4.87500622799962,
+      "unittest_count": null
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/run_regression_suite.sh",
+        "compound_unsigned_widening"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 3.0429306339992763,
+      "unittest_count": null
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/run_regression_suite.sh",
+        "declarator_point_of_scope"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 2.713277143000596,
+      "unittest_count": null
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/run_regression_suite.sh",
+        "declarator_inferred_scope"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 2.6160994680012664,
+      "unittest_count": null
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/run_regression_suite.sh",
+        "preprocessor_ternary_type"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 2.6160491030004778,
+      "unittest_count": null
+    },
+    {
+      "command": [
+        "bash",
+        "tests/regression/check_frontend_ternary_common_type.sh"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 0.18890500899942708,
+      "unittest_count": null
+    },
+    {
+      "command": [
+        "bash",
+        "tests/regression/check_type_attr_and_static_init.sh"
+      ],
+      "exit": 0,
+      "elapsed_seconds": 1.371335806999923,
+      "unittest_count": null
+    }
+  ],
+  "rust_source_sha256": {
+    "src/frontend/parser/declarations.rs": "ed396d26dfca85c0e9e8d4d04ab373a4be4f3c45aa6497e7eea038a141d00bd0",
+    "src/frontend/preprocessor/conditionals.rs": "01af32356f29d7c6a982094bca1818ef462bc700e3d5884d4159bbdb59d4938a",
+    "src/ir/lowering/expr_assign.rs": "6410500ef561feb2cd2cfa5e5a7ff5b60148493f797e26a0a61486de53690aa5"
+  },
+  "earlier_rust_groups": {
+    "preprocessor": 15,
+    "declarations": 21,
+    "typedef_scope": 3
+  },
+  "clippy": "fastbuild --lib -j2 -D warnings PASS",
+  "data_checks": [
+    "all retained JSON parses",
+    "current workload/source/driver/harness hashes match measurement records",
+    "all 21 paired rounds complete",
+    "before/current measured executable identities equal",
+    "new documentation links resolve"
+  ],
+  "known_non_passes": [
+    "five external fork heads unavailable (census exits 2)",
+    "pre-existing GNU inferred object-binding witness remains unfixed"
+  ],
+  "latest_fuzz_oracle": "clang version 23.1.6 (https://github.com/llvm/llvm-project 5b10d2d74929eae78912771222c9855af97496f4)"
+}

@@ -1,0 +1,147 @@
+{
+  "commit": "7604253fa62bbce385b740ea33d7ce573f21cf5a",
+  "groups": {
+    ".cargo": {
+      "bytes": 652,
+      "files": 1
+    },
+    ".github": {
+      "bytes": 459745,
+      "files": 20
+    },
+    "_layouts": {
+      "bytes": 5984,
+      "files": 2
+    },
+    "artifacts": {
+      "bytes": 844992,
+      "files": 103
+    },
+    "assets": {
+      "bytes": 17134,
+      "files": 1
+    },
+    "docs": {
+      "bytes": 5099439,
+      "files": 99
+    },
+    "engineering": {
+      "bytes": 85610214,
+      "files": 3805
+    },
+    "ideas": {
+      "bytes": 91234,
+      "files": 27
+    },
+    "include": {
+      "bytes": 461304,
+      "files": 28
+    },
+    "projects": {
+      "bytes": 4754,
+      "files": 1
+    },
+    "root": {
+      "bytes": 263397,
+      "files": 19
+    },
+    "scripts": {
+      "bytes": 7059543,
+      "files": 454
+    },
+    "src": {
+      "bytes": 44806,
+      "files": 4
+    },
+    "src/backend": {
+      "bytes": 4109132,
+      "files": 29
+    },
+    "src/backend/arm": {
+      "bytes": 2805517,
+      "files": 58
+    },
+    "src/backend/elf": {
+      "bytes": 710144,
+      "files": 15
+    },
+    "src/backend/elf_writer_common": {
+      "bytes": 66710,
+      "files": 1
+    },
+    "src/backend/i686": {
+      "bytes": 3518620,
+      "files": 53
+    },
+    "src/backend/linker_common": {
+      "bytes": 1026030,
+      "files": 43
+    },
+    "src/backend/location_alloc": {
+      "bytes": 223564,
+      "files": 6
+    },
+    "src/backend/regalloc": {
+      "bytes": 31318,
+      "files": 1
+    },
+    "src/backend/riscv": {
+      "bytes": 1999008,
+      "files": 59
+    },
+    "src/backend/stack_layout": {
+      "bytes": 581149,
+      "files": 12
+    },
+    "src/backend/x86": {
+      "bytes": 12523063,
+      "files": 142
+    },
+    "src/bin": {
+      "bytes": 63655,
+      "files": 5
+    },
+    "src/common": {
+      "bytes": 1290190,
+      "files": 39
+    },
+    "src/driver": {
+      "bytes": 911581,
+      "files": 9
+    },
+    "src/frontend": {
+      "bytes": 4238740,
+      "files": 58
+    },
+    "src/ir": {
+      "bytes": 4299637,
+      "files": 78
+    },
+    "src/passes": {
+      "bytes": 13445290,
+      "files": 194
+    },
+    "src/pgo": {
+      "bytes": 234208,
+      "files": 9
+    },
+    "tests": {
+      "bytes": 38789176,
+      "files": 5309
+    },
+    "third_party_licenses": {
+      "bytes": 83865,
+      "files": 9
+    },
+    "tools": {
+      "bytes": 207762,
+      "files": 22
+    }
+  },
+  "manifest_sha256": "34a5ad4d9c6666684384a4ad0c5e0040a7af6ca54262bb40c902f12a3340d5e4",
+  "rust_files": 785,
+  "schema": "lccc-tree-inventory-v1",
+  "scope": "tracked blob inventory only; not line-by-line semantic verification",
+  "submodules_not_traversed": [],
+  "tracked_blobs": 10715
+}

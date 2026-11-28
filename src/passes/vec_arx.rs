@@ -1616,7 +1616,7 @@ fn install_exit_materialization(
         let d_src = fresh();
         let dist = fresh();
         let dist_e = fresh();
-        let overlap = fresh();
+        let no_overlap = fresh();
         let guard = [
             Instruction::Cast {
                 dest: d_out,
@@ -1645,8 +1645,8 @@ fn install_exit_materialization(
                 ty: IrType::I64,
             },
             Instruction::Cmp {
-                dest: overlap,
-                op: IrCmpOp::Ult,
+                dest: no_overlap,
+                op: IrCmpOp::Uge,
                 lhs: Operand::Value(dist_e),
                 rhs: Operand::Const(IrConst::I64(span)),
                 ty: IrType::I64,
@@ -1710,9 +1710,9 @@ fn install_exit_materialization(
             block.insert_insts(0, head.into_iter().chain(spilled_here), Span::dummy());
             block.extend_insts(guard, Span::dummy());
             block.terminator = Terminator::CondBranch {
-                cond: Operand::Value(overlap),
-                true_label: scalar_target,
-                false_label: fast_label,
+                cond: Operand::Value(no_overlap),
+                true_label: fast_label,
+                false_label: scalar_target,
             };
         }
         if let Some(sl) = spill_label {

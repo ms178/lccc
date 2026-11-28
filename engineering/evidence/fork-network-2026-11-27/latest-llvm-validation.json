@@ -1,0 +1,170 @@
+{
+  "scope": "targeted C regressions, current sanitizer runtime, and native x86-64/i686 constructor/printf linker smoke; not linker performance",
+  "llvm_version": "23.1.6",
+  "rows": [
+    {
+      "source": "tests/regression/compound_unsigned_widening.c",
+      "compiler": "Clang 23.1.6",
+      "flags": [
+        "-O2"
+      ],
+      "exit": 0
+    },
+    {
+      "source": "tests/regression/declarator_point_of_scope.c",
+      "compiler": "Clang 23.1.6",
+      "flags": [
+        "-O2"
+      ],
+      "exit": 0
+    },
+    {
+      "source": "tests/regression/preprocessor_ternary_type.c",
+      "compiler": "Clang 23.1.6",
+      "flags": [
+        "-O2"
+      ],
+      "exit": 0
+    },
+    {
+      "source": "tests/benchmark/programs/zlib_ng_crc32_combine.c",
+      "compiler": "Clang 23.1.6",
+      "flags": [
+        "-O1",
+        "-DPASSES=128",
+        "-fsanitize=address,undefined"
+      ],
+      "exit": 0,
+      "stdout": "zlib_ng_crc32_combine: f13e1784\n",
+      "stderr": ""
+    },
+    {
+      "linker": "lccc-ld",
+      "bits": 64,
+      "command": [
+        "/tmp/lccc-research/llvm-23.1.6-complete/bin/clang",
+        "-m64",
+        "-no-pie",
+        "--ld-path=/tmp/lccc-research/lccc/target/fastbuild/lccc-ld",
+        "/tmp/lccc-research/evidence/llvm-final-validation/link-64.o",
+        "-o",
+        "/tmp/lccc-research/evidence/llvm-final-validation/lccc-ld-64"
+      ],
+      "exit": 0,
+      "stdout": "linker-smoke=42/8\n",
+      "object_sha256": "2104af80f307a685b54a0ccdd4582f740f0b23b79cb1c68b0924d653a03a292c"
+    },
+    {
+      "linker": "bfd-2.47",
+      "bits": 64,
+      "command": [
+        "/tmp/lccc-research/llvm-23.1.6-complete/bin/clang",
+        "-m64",
+        "-no-pie",
+        "--ld-path=/tmp/lccc-research/toolchains/bin/ld.bfd",
+        "/tmp/lccc-research/evidence/llvm-final-validation/link-64.o",
+        "-o",
+        "/tmp/lccc-research/evidence/llvm-final-validation/bfd-2.47-64"
+      ],
+      "exit": 0,
+      "stdout": "linker-smoke=42/8\n",
+      "object_sha256": "2104af80f307a685b54a0ccdd4582f740f0b23b79cb1c68b0924d653a03a292c"
+    },
+    {
+      "linker": "mold-3.0.0",
+      "bits": 64,
+      "command": [
+        "/tmp/lccc-research/llvm-23.1.6-complete/bin/clang",
+        "-m64",
+        "-no-pie",
+        "--ld-path=/tmp/lccc-research/toolchains/bin/mold",
+        "/tmp/lccc-research/evidence/llvm-final-validation/link-64.o",
+        "-o",
+        "/tmp/lccc-research/evidence/llvm-final-validation/mold-3.0.0-64"
+      ],
+      "exit": 0,
+      "stdout": "linker-smoke=42/8\n",
+      "object_sha256": "2104af80f307a685b54a0ccdd4582f740f0b23b79cb1c68b0924d653a03a292c"
+    },
+    {
+      "linker": "lld-23.1.6",
+      "bits": 64,
+      "command": [
+        "/tmp/lccc-research/llvm-23.1.6-complete/bin/clang",
+        "-m64",
+        "-no-pie",
+        "--ld-path=/tmp/lccc-research/llvm-23.1.6-complete/bin/ld.lld",
+        "/tmp/lccc-research/evidence/llvm-final-validation/link-64.o",
+        "-o",
+        "/tmp/lccc-research/evidence/llvm-final-validation/lld-23.1.6-64"
+      ],
+      "exit": 0,
+      "stdout": "linker-smoke=42/8\n",
+      "object_sha256": "2104af80f307a685b54a0ccdd4582f740f0b23b79cb1c68b0924d653a03a292c"
+    },
+    {
+      "linker": "lccc-ld",
+      "bits": 32,
+      "command": [
+        "/tmp/lccc-research/llvm-23.1.6-complete/bin/clang",
+        "-m32",
+        "-no-pie",
+        "--ld-path=/tmp/lccc-research/lccc/target/fastbuild/lccc-ld",
+        "/tmp/lccc-research/evidence/llvm-final-validation/link-32.o",
+        "-o",
+        "/tmp/lccc-research/evidence/llvm-final-validation/lccc-ld-32"
+      ],
+      "exit": 0,
+      "stdout": "linker-smoke=42/4\n",
+      "object_sha256": "0a37475f1fc8fb1347091d0ca84f1d078d5211d339331b582f736e0dc23a5419"
+    },
+    {
+      "linker": "bfd-2.47",
+      "bits": 32,
+      "command": [
+        "/tmp/lccc-research/llvm-23.1.6-complete/bin/clang",
+        "-m32",
+        "-no-pie",
+        "--ld-path=/tmp/lccc-research/toolchains/bin/ld.bfd",
+        "/tmp/lccc-research/evidence/llvm-final-validation/link-32.o",
+        "-o",
+        "/tmp/lccc-research/evidence/llvm-final-validation/bfd-2.47-32"
+      ],
+      "exit": 0,
+      "stdout": "linker-smoke=42/4\n",
+      "object_sha256": "0a37475f1fc8fb1347091d0ca84f1d078d5211d339331b582f736e0dc23a5419"
+    },
+    {
+      "linker": "mold-3.0.0",
+      "bits": 32,
+      "command": [
+        "/tmp/lccc-research/llvm-23.1.6-complete/bin/clang",
+        "-m32",
+        "-no-pie",
+        "--ld-path=/tmp/lccc-research/toolchains/bin/mold",
+        "/tmp/lccc-research/evidence/llvm-final-validation/link-32.o",
+        "-o",
+        "/tmp/lccc-research/evidence/llvm-final-validation/mold-3.0.0-32"
+      ],
+      "exit": 0,
+      "stdout": "linker-smoke=42/4\n",
+      "object_sha256": "0a37475f1fc8fb1347091d0ca84f1d078d5211d339331b582f736e0dc23a5419"
+    },
+    {
+      "linker": "lld-23.1.6",
+      "bits": 32,
+      "command": [
+        "/tmp/lccc-research/llvm-23.1.6-complete/bin/clang",
+        "-m32",
+        "-no-pie",
+        "--ld-path=/tmp/lccc-research/llvm-23.1.6-complete/bin/ld.lld",
+        "/tmp/lccc-research/evidence/llvm-final-validation/link-32.o",
+        "-o",
+        "/tmp/lccc-research/evidence/llvm-final-validation/lld-23.1.6-32"
+      ],
+      "exit": 0,
+      "stdout": "linker-smoke=42/4\n",
+      "object_sha256": "0a37475f1fc8fb1347091d0ca84f1d078d5211d339331b582f736e0dc23a5419"
+    }
+  ]
+}

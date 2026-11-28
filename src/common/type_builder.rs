@@ -122,6 +122,17 @@ pub trait TypeConvertContext {
     /// bound rules, in which case the implementation has emitted a diagnostic.
     fn eval_array_bound_len(&self, expr: &Expr, elem: &CType) -> Option<usize>;
 
+    /// Convert a parameter list into `(CType, Option<name>)` pairs.
+    /// Implementors with lexical parameter scope override this so earlier
+    /// parameters and inline enums are visible to later parameters' bounds.
+    fn convert_param_decls(&self, params: &[ParamDecl]) -> Vec<(CType, Option<String>)> {
+        convert_param_decls_to_ctypes_with(
+            &|ts| self.resolve_type_spec_to_ctype(ts),
+            &|ts, written| self.specifier_cvr(ts, written),
+            params,
+        )
+    }
+
     /// Convert a TypeSpecifier to a CType.
     ///
     /// This default implementation handles all shared cases (22 primitive types,
@@ -221,19 +232,7 @@ pub trait TypeConvertContext {
             }
             TypeSpecifier::FunctionPointer(return_type, params, variadic, has_prototype, abi) => {
                 let ret_ctype = self.resolve_type_spec_to_ctype(return_type);
-                let param_ctypes: Vec<(CType, Option<String>)> = params
-                    .iter()
-                    .map(|p| {
-                        (
-                            param_decl_to_ctype_qualified(
-                                &|ts| self.resolve_type_spec_to_ctype(ts),
-                                &|ts, written| self.specifier_cvr(ts, written),
-                                p,
-                            ),
-                            p.name.clone(),
-                        )
-                    })
-                    .collect();
+                let param_ctypes = self.convert_param_decls(params);
                 CType::Pointer(
                     Box::new(CType::Function(Box::new(FunctionType {
                         calling_convention: *abi,
@@ -249,19 +248,7 @@ pub trait TypeConvertContext {
                 // Bare function type (no pointer wrapper) — produced by typeof on
                 // function names. Resolves to CType::Function, NOT Pointer(Function).
                 let ret_ctype = self.resolve_type_spec_to_ctype(return_type);
-                let param_ctypes: Vec<(CType, Option<String>)> = params
-                    .iter()
-                    .map(|p| {
-                        (
-                            param_decl_to_ctype_qualified(
-                                &|ts| self.resolve_type_spec_to_ctype(ts),
-                                &|ts, written| self.specifier_cvr(ts, written),
-                                p,
-                            ),
-                            p.name.clone(),
-                        )
-                    })
-                    .collect();
+                let param_ctypes = self.convert_param_decls(params);
                 CType::Function(Box::new(FunctionType {
                     calling_convention: *abi,
                     return_type: ret_ctype,
@@ -594,9 +581,10 @@ fn find_function_pointer_core(derived: &[DerivedDeclarator]) -> Option<usize> {
 /// (`int (*xStress)(void*, PgHdr*)` typed as `int *`); it was fixed on one side
 /// of the duplication and not the other. Both sides now call this.
 pub fn param_decl_to_ctype(ctx: &dyn TypeConvertContext, param: &ParamDecl) -> CType {
-    param_decl_to_ctype_qualified(
+    param_decl_to_ctype_with_conv(
         &|ts| ctx.resolve_type_spec_to_ctype(ts),
         &|ts, written| ctx.specifier_cvr(ts, written),
+        Some(&|p| ctx.convert_param_decls(p)),
         param,
     )
 }
@@ -626,7 +614,16 @@ pub fn param_decl_to_ctype_qualified(
     spec_cvr: &dyn Fn(&TypeSpecifier, u8) -> Option<u8>,
     param: &ParamDecl,
 ) -> CType {
-    let mut ty = param_ctype_unrecorded(resolve, spec_cvr, param);
+    param_decl_to_ctype_with_conv(resolve, spec_cvr, None, param)
+}
+
+fn param_decl_to_ctype_with_conv(
+    resolve: &dyn Fn(&TypeSpecifier) -> CType,
+    spec_cvr: &dyn Fn(&TypeSpecifier, u8) -> Option<u8>,
+    convert_params: Option<&dyn Fn(&[ParamDecl]) -> Vec<(CType, Option<String>)>>,
+    param: &ParamDecl,
+) -> CType {
+    let mut ty = param_ctype_unrecorded(resolve, spec_cvr, convert_params, param);
     if param.fptr_params.is_some() {
         return ty;
     }
@@ -824,6 +821,7 @@ fn is_derived_spec(spec: &TypeSpecifier) -> bool {
 fn param_ctype_unrecorded(
     resolve: &dyn Fn(&TypeSpecifier) -> CType,
     spec_cvr: &dyn Fn(&TypeSpecifier, u8) -> Option<u8>,
+    convert_params: Option<&dyn Fn(&[ParamDecl]) -> Vec<(CType, Option<String>)>>,
     param: &ParamDecl,
 ) -> CType {
     if let Some(ref fptr_params) = param.fptr_params {
@@ -872,15 +870,10 @@ fn param_ctype_unrecorded(
                 );
             }
         }
-        let param_types: Vec<(CType, Option<String>)> = fptr_params
-            .iter()
-            .map(|p| {
-                (
-                    param_decl_to_ctype_qualified(resolve, spec_cvr, p),
-                    p.name.clone(),
-                )
-            })
-            .collect();
+        let param_types: Vec<(CType, Option<String>)> = match convert_params {
+            Some(conv) => conv(fptr_params),
+            None => convert_param_decls_to_ctypes_with(resolve, spec_cvr, fptr_params),
+        };
         let func_type = CType::Function(Box::new(FunctionType {
             calling_convention: param.fptr_calling_convention,
             return_type: actual_return,
@@ -1028,13 +1021,14 @@ pub fn build_qualified_ctype_with_base(
     base_cvr: Option<u8>,
     derived: &[DerivedDeclarator],
 ) -> CType {
-    build_qualified_ctype_with_callbacks(
+    build_qualified_ctype_with_param_conv(
         base,
         base_cvr,
         derived,
         &|ts| ctx.resolve_type_spec_to_ctype(ts),
         &|e, elem| ctx.eval_array_bound_len(e, elem),
         &|ts, written| ctx.specifier_cvr(ts, written),
+        Some(&|p| ctx.convert_param_decls(p)),
     )
 }
 
@@ -1047,6 +1041,20 @@ pub fn build_qualified_ctype_with_callbacks(
     resolve: &dyn Fn(&TypeSpecifier) -> CType,
     eval_bound: &dyn Fn(&Expr, &CType) -> Option<usize>,
     spec_cvr: &dyn Fn(&TypeSpecifier, u8) -> Option<u8>,
+) -> CType {
+    build_qualified_ctype_with_param_conv(
+        base, base_cvr, derived, resolve, eval_bound, spec_cvr, None,
+    )
+}
+
+fn build_qualified_ctype_with_param_conv(
+    base: CType,
+    base_cvr: Option<u8>,
+    derived: &[DerivedDeclarator],
+    resolve: &dyn Fn(&TypeSpecifier) -> CType,
+    eval_bound: &dyn Fn(&Expr, &CType) -> Option<usize>,
+    spec_cvr: &dyn Fn(&TypeSpecifier, u8) -> Option<u8>,
+    convert_params: Option<&dyn Fn(&[ParamDecl]) -> Vec<(CType, Option<String>)>>,
 ) -> CType {
     let fptr_idx = find_function_pointer_core(derived);
 
@@ -1105,8 +1113,10 @@ pub fn build_qualified_ctype_with_callbacks(
                         abi,
                     )) = derived.get(i + 1)
                     {
-                        let param_types =
-                            convert_param_decls_to_ctypes_with(resolve, spec_cvr, params);
+                        let param_types = match convert_params {
+                            Some(conv) => conv(params),
+                            None => convert_param_decls_to_ctypes_with(resolve, spec_cvr, params),
+                        };
                         let func_type = CType::Function(Box::new(FunctionType {
                             calling_convention: abi.unwrap_or_default(),
                             return_type: result,
@@ -1128,7 +1138,10 @@ pub fn build_qualified_ctype_with_callbacks(
                     }
                 }
                 DerivedDeclarator::FunctionPointer(params, variadic, has_prototype, abi) => {
-                    let param_types = convert_param_decls_to_ctypes_with(resolve, spec_cvr, params);
+                    let param_types = match convert_params {
+                        Some(conv) => conv(params),
+                        None => convert_param_decls_to_ctypes_with(resolve, spec_cvr, params),
+                    };
                     let func_type = CType::Function(Box::new(FunctionType {
                         calling_convention: abi.unwrap_or_default(),
                         return_type: result,
@@ -1140,7 +1153,10 @@ pub fn build_qualified_ctype_with_callbacks(
                     i += 1;
                 }
                 DerivedDeclarator::Function(params, variadic, has_prototype, abi) => {
-                    let param_types = convert_param_decls_to_ctypes_with(resolve, spec_cvr, params);
+                    let param_types = match convert_params {
+                        Some(conv) => conv(params),
+                        None => convert_param_decls_to_ctypes_with(resolve, spec_cvr, params),
+                    };
                     let func_type = CType::Function(Box::new(FunctionType {
                         calling_convention: abi.unwrap_or_default(),
                         return_type: result,

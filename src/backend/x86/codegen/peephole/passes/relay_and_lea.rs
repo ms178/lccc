@@ -846,6 +846,31 @@ impl LazyDeadness {
         provably_dead_lv(lv, store, infos, use_idx, fam, owned)
     }
 
+    /// Is `fam` provably dead after `use_idx` when reads/writes of `fam` on
+    /// `lo..=hi` are ignored? Fails closed (`false`) if `FileLiveness`
+    /// declines the enclosing function (e.g. unresolvable indirect branches).
+    pub(super) fn dead_after_dropping_region(
+        &mut self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        use_idx: usize,
+        lo: usize,
+        hi: usize,
+        fam: RegId,
+    ) -> bool {
+        if fam > REG_GP_MAX {
+            return false;
+        }
+        let lv = self
+            .lv
+            .get_or_insert_with(|| FileLiveness::new(store, infos));
+        for start in self.dirty.drain(..) {
+            lv.refresh_at(store, infos, start);
+        }
+        lv.live_after_dropping_region(store, infos, use_idx, lo, hi, 1u16 << fam)
+            .is_some_and(|live| live & (1u16 << fam) == 0)
+    }
+
     /// Record that line `idx` (and so its function) was rewritten.  A fold
     /// extends the live ranges of the registers it substitutes in, so cached
     /// answers for that function are stale until the next query refreshes it.

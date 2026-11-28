@@ -321,22 +321,48 @@ impl Preprocessor {
                     };
 
                     let name_start = i;
-                    while i < len && is_ident_cont_byte(bytes[i]) {
+                    if i < len && is_ident_start_byte(bytes[i]) {
                         i += 1;
+                        while i < len && is_ident_cont_byte(bytes[i]) {
+                            i += 1;
+                        }
                     }
                     let name = bytes_to_str(bytes, name_start, i);
 
-                    if has_paren {
+                    if name.is_empty() {
+                        self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                            kind: Some(crate::common::error::WarningKind::Cpp),
+                            file: self.current_file(),
+                            line: diag_line,
+                            col: 1,
+                            message: "operator \"defined\" requires an identifier".to_string(),
+                        });
+                        if has_paren && i < len && bytes[i] == b')' {
+                            i += 1;
+                        }
+                        result.push('0');
+                    } else if has_paren {
                         while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
                             i += 1;
                         }
                         if i < len && bytes[i] == b')' {
                             i += 1;
+                            let is_def = self.macros.is_defined(name);
+                            result.push_str(if is_def { "1" } else { "0" });
+                        } else {
+                            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                                kind: Some(crate::common::error::WarningKind::Cpp),
+                                file: self.current_file(),
+                                line: diag_line,
+                                col: 1,
+                                message: "missing ')' after \"defined\"".to_string(),
+                            });
+                            result.push('0');
                         }
+                    } else {
+                        let is_def = self.macros.is_defined(name);
+                        result.push_str(if is_def { "1" } else { "0" });
                     }
-
-                    let is_def = self.macros.is_defined(name);
-                    result.push_str(if is_def { "1" } else { "0" });
                 } else if ident == "__has_builtin" {
                     let val = self.resolve_has_builtin_call_bytes(bytes, &mut i, diag_line);
                     result.push_str(val);

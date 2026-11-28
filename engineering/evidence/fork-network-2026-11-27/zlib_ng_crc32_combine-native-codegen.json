@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "scope": "static-assembly-only",
+  "source": "/tmp/lccc-research/lccc/tests/benchmark/programs/zlib_ng_crc32_combine.c",
+  "source_sha256": "152e8b9d5e8266b90aebcac40a0f18142662f3db533fc731cf59b0f62e8636d3",
+  "remote_source_sha256": "152e8b9d5e8266b90aebcac40a0f18142662f3db533fc731cf59b0f62e8636d3",
+  "function": "zng_crc32_combine",
+  "remote_flags": "-O2 -march=x86-64-v3 -DPASSES=128",
+  "local_flags": "-O2 -march=x86-64-v3 -DPASSES=128",
+  "oracles": [
+    {
+      "key": "lccc",
+      "name": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0",
+      "launcher": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+      "launcher_sha256": "6735d19fc09625d15a3aca94bc3b75a287e59eb29a88cce21c3cd82be5f747f8",
+      "identity_scope": "launcher only; wrapper targets are not pinned",
+      "id": "/tmp/lccc-research/lccc/target/fastbuild/lccc-x86",
+      "flags": "-O2 -march=x86-64-v3 -DPASSES=128",
+      "instructions": 55
+    },
+    {
+      "key": "gcc162",
+      "name": "gcc-16 (GCC) 16.2.0",
+      "launcher": "/tmp/lccc-research/toolchains/bin/gcc-16",
+      "launcher_sha256": "9e00ecfe9775454880df184c1d45ce724aa46868dd9c13806b47e483657941fe",
+      "identity_scope": "launcher only; wrapper targets are not pinned",
+      "id": "local:gcc162",
+      "compilerType": "explicit-local",
+      "target": "x86_64",
+      "pointer_bits": 64,
+      "flags": "-O2 -march=x86-64-v3 -DPASSES=128",
+      "instructions": 55
+    },
+    {
+      "key": "clang2316",
+      "name": "clang version 23.1.6 (https://github.com/llvm/llvm-project 5b10d2d74929eae78912771222c9855af97496f4)",
+      "launcher": "/tmp/lccc-research/llvm-23.1.6-complete/bin/clang-23",
+      "launcher_sha256": "1b281b7c46c55ec5ce743cc848d52b6652b65eae595650d302925c44a68e9797",
+      "identity_scope": "launcher only; wrapper targets are not pinned",
+      "id": "local:clang2316",
+      "compilerType": "explicit-local",
+      "target": "x86_64",
+      "pointer_bits": 64,
+      "flags": "-O2 -march=x86-64-v3 -DPASSES=128",
+      "instructions": 59
+    },
+    {
+      "key": "icx202621",
+      "name": "Intel(R) oneAPI DPC++/C++ Compiler 2026.2.1 (2026.2.1.20261118)",
+      "launcher": "/tmp/lccc-research/icx-2026.2/opt/intel/oneapi/compiler/2026.2/bin/icx",
+      "launcher_sha256": "91ec5016b4a4fef52406e9286f3d932f8bea2da98b3a22228909f908df27832c",
+      "identity_scope": "launcher only; wrapper targets are not pinned",
+      "id": "local:icx202621",
+      "compilerType": "explicit-local",
+      "target": "x86_64",
+      "pointer_bits": 64,
+      "flags": "-O2 -march=x86-64-v3 -DPASSES=128",
+      "instructions": 56
+    }
+  ]
+}

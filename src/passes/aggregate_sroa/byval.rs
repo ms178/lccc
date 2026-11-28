@@ -456,6 +456,83 @@ fn find_interference(
     None
 }
 
+/// Blocks reachable from `start`'s successors, stopping expansion at `cut`
+/// (while still marking `cut` itself reachable if reached).
+fn reach_after(
+    succs: &crate::ir::analysis::FlatAdj,
+    start: usize,
+    cut: usize,
+    n: usize,
+) -> Vec<bool> {
+    let mut seen = vec![false; n];
+    let mut stack = Vec::with_capacity(n);
+    for &s in succs.row(start) {
+        let s = s as usize;
+        if s < n && !seen[s] {
+            seen[s] = true;
+            if s != cut {
+                stack.push(s);
+            }
+        }
+    }
+    while let Some(b) = stack.pop() {
+        for &s in succs.row(b) {
+            let s = s as usize;
+            if s < n && !seen[s] {
+                seen[s] = true;
+                if s != cut {
+                    stack.push(s);
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Prove that no write to `D` can reach any subsequent use of `S` (including
+/// re-entering the copy on a loop backedge without first proving `S` killed).
+fn find_write_to_src_interference(
+    s_uses: &[(usize, usize)],
+    d_writes: &[(usize, usize)],
+    mb: usize,
+    mi: usize,
+    succs: &crate::ir::analysis::FlatAdj,
+    n: usize,
+) -> Option<(usize, usize)> {
+    if s_uses.is_empty() || d_writes.is_empty() {
+        return None;
+    }
+    let mut from_db: FxHashMap<usize, Vec<bool>> = FxHashMap::default();
+    for &(db, di) in d_writes {
+        for &(wb, wi) in s_uses {
+            if wb == db && wi > di {
+                return Some((wb, wi));
+            }
+        }
+        let reach = from_db
+            .entry(db)
+            .or_insert_with(|| reach_after(succs, db, mb, n));
+        for &(wb, wi) in s_uses {
+            if wb == mb {
+                if reach[mb] && wi <= mi {
+                    return Some((wb, wi));
+                }
+                continue;
+            }
+            if wb == db {
+                if reach[db] && wi <= di {
+                    return Some((wb, wi));
+                }
+                continue;
+            }
+            if reach[wb] {
+                return Some((wb, wi));
+            }
+        }
+    }
+    None
+}
+
 /// The value-substitution step is the whole rename, so the analysis insists on
 /// plain, non-volatile, exact-size storage on both sides.  Returns the object's
 /// effective alignment (a declared `0` means "natural", which for the sizes this
@@ -585,11 +662,32 @@ pub(super) fn run_function(
             }
             continue;
         }
-        // ...and S must have no observer after the copy.
+        // ...and S must have no observer after the copy, nor after any write
+        // to D (merging D into S turns writes to D into writes to S).
         if let Some(w) = find_interference(&u.s_uses, &uses_of_d, mb, mi, &succs, &preds, n) {
             if dbg {
                 lccc::cli::stderr_line(format_args!(
                     "[byval] copy b{mb}/{mi}: S is still used at b{}/{}",
+                    w.0, w.1
+                ));
+            }
+            continue;
+        }
+        let d_writes: Vec<(usize, usize)> = u
+            .d_accesses
+            .iter()
+            .filter(|a| {
+                matches!(
+                    func.blocks[a.block].instructions[a.index],
+                    Instruction::Store { .. }
+                )
+            })
+            .map(|a| (a.block, a.index))
+            .collect();
+        if let Some(w) = find_write_to_src_interference(&u.s_uses, &d_writes, mb, mi, &succs, n) {
+            if dbg {
+                lccc::cli::stderr_line(format_args!(
+                    "[byval] copy b{mb}/{mi}: S is used after D write at b{}/{}",
                     w.0, w.1
                 ));
             }
@@ -697,4 +795,74 @@ fn ptr_at(plan: &mut Plan, next: &mut u32, sink: (usize, usize), base: u32, off:
         },
     });
     g
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrModule, Terminator};
+
+    #[test]
+    fn refuses_coalesce_when_src_is_read_after_dest_write() {
+        // S (v0) initialized; D (v1) = memcpy(S); D written (v1.a = 99);
+        // S read afterwards (return S.a) with no intervening D use after S read.
+        let mut f = IrFunction::new("s_read_after_d_write".into(), IrType::I32, vec![], false);
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::Ptr,
+                    size: 16,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 16,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(11)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 16,
+                },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(99)),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Load {
+                    dest: Value(2),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        }];
+        let mut m = IrModule::new();
+        m.functions.push(f);
+        assert_eq!(crate::passes::aggregate_sroa::run(&mut m), 0);
+        assert!(matches!(
+            m.functions[0].blocks[0].instructions[3],
+            Instruction::Memcpy { .. }
+        ));
+    }
 }

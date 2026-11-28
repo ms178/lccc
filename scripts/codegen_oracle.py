@@ -53,7 +53,7 @@ readable)::
         --json after.json tests/benchmark/programs/*.c
 
 The x86 defaults intentionally include GCC, Clang, ICC and ICX because ICX is
-a moving channel. AArch64 defaults to ARM64 GCC 16.1, GCC trunk, and Clang 22.1
+a moving channel. AArch64 defaults to ARM64 GCC 16.2, GCC trunk, and Clang 23.1
 (with automatic `--target=aarch64-linux-gnu`). Every manifest records the
 architecture and resolved compiler id/name/version.  Pass
 ``--oracles gcc,clang,icc,icx`` to keep the scoreboard's short compiler keys
@@ -384,8 +384,8 @@ def _record_local(req: Request, executable: str) -> dict[str, Any]:
 
 
 # Compiler Explorer ids name one channel each, and channels are per
-# architecture: `gcc16.2` is the x86-64 GCC, `carm64g1610` the AArch64 one,
-# `crv64g1610` the RISC-V one.  Requesting `--arch riscv64` with an x86 id used
+# architecture: `gcc16.2` is the x86-64 GCC, `carm64g1620` the AArch64 one,
+# `crv64g1620` the RISC-V one.  Requesting `--arch riscv64` with an x86 id used
 # to succeed: the x86 assembly came back *labelled* riscv64, entered the
 # manifest with that provenance, and every row below it was an x86 instruction
 # count wearing a RISC-V hat.  A measurement tool that can silently mislabel

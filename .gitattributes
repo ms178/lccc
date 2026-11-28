@@ -55,3 +55,7 @@ Makefile        text eol=lf
 # Historical instrumentation is byte evidence, not formatted source. Preserve
 # Valgrind's trailing spaces and captured terminal blank lines verbatim.
 engineering/evidence/2026-10-14-auipc-range/**/*.txt whitespace=-blank-at-eol,-blank-at-eof
+
+# Raw Callgrind profiles are lossless generated evidence, not source diffs.
+# Keep their intentional spacing byte-exact and avoid noisy textual merges.
+engineering/evidence/**/*.callgrind binary

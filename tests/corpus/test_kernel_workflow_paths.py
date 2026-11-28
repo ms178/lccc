@@ -4,7 +4,10 @@ import re
 from pathlib import Path
 import unittest
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError as exc:  # pragma: no cover - host dependency
+    raise unittest.SkipTest("PyYAML is required (`pip install pyyaml`)") from exc
 
 ROOT = Path(__file__).resolve().parents[2]
 

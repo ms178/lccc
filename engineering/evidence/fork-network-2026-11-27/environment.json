@@ -1,0 +1,40 @@
+{
+  "observed_utc": "2026-11-27T02:07:33.345030+00:00",
+  "baseline": "7604253fa62bbce385b740ea33d7ce573f21cf5a",
+  "versions": {
+    "kernel": "Linux e2b.local 6.1.189+ #1 SMP PREEMPT_DYNAMIC Mon Nov  2 21:08:28 UTC 2026 x86_64 GNU/Linux",
+    "libc": "ldd (Debian GLIBC 2.36-9+deb12u14) 2.36",
+    "rust": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+    "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+    "rustfmt": "rustfmt 1.11.0-stable (0ef1bc3860 2026-11-09)",
+    "clippy": "clippy 0.1.100 (0ef1bc3860 2026-11-09)",
+    "gcc": "gcc-16 (GCC) 16.2.0",
+    "clang_current": "clang version 23.1.6 (https://github.com/llvm/llvm-project 5b10d2d74929eae78912771222c9855af97496f4)",
+    "icx": "Intel(R) oneAPI DPC++/C++ Compiler 2026.2.1 (2026.2.1.20261118)",
+    "lld": "LLD 23.1.6 (https://github.com/llvm/llvm-project 5b10d2d74929eae78912771222c9855af97496f4) (compatible with GNU linkers)",
+    "mold": "mold 3.0.0 (8de38c35a2df16a25f7ff87ac3ad07156a925beb; compatible with GNU ld)",
+    "gas": "GNU assembler (GNU Binutils) 2.47.20260726"
+  },
+  "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/tmp/lccc-research/lccc.swap            file\t\t8388604\t\t7972\t\t-2\n",
+  "affinity": [
+    0,
+    1
+  ],
+  "event_sources": [
+    "breakpoint",
+    "msr",
+    "software",
+    "tracepoint",
+    "uprobe"
+  ],
+  "cpu": {
+    "cpu family": "6",
+    "model": "106",
+    "model name": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+    "stepping": "6",
+    "microcode": "0x1",
+    "flags": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault invpcid_single ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves arat avx512vbmi umip avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid fsrm md_clear arch_capabilities"
+  },
+  "governor": null,
+  "perf_event_paranoid": "2"
+}

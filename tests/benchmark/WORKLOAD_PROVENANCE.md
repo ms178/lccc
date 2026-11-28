@@ -46,6 +46,43 @@ these test-source licenses do not relicense the compiler/runtime.
 | `linux_xxhash64` | `packages/linux-cachymod-6.18/PKGBUILD`, `linux-6.18.58` | `lib/xxhash.c` (`xxh64`, `xxh64_round`, `xxh64_merge_round`, `xxh64_avalanche`) | BSD-2-Clause OR GPL-2.0-only | `xxhash.c`: `1844d67cd0b00978a57561186948b75898c29aeeab56a6e0b4b6523031d25d69` | Keeps the 4-lane 32-byte `v1..v4` rotate-multiply stripe loop, 4-lane merge rounds, 8/4/1-byte tail cascade, and final avalanche over varied alignments and lengths. Self-checks empty/4-byte/48-byte canonical xxHash64 test vectors. |
 | `glibc_dl_hash` | `toolchain-stable/glibc/PKGBUILD`, commit `afd131806b25715a7617ab757db43f0bb610acbf` | `sysdeps/generic/dl-new-hash.h` (`_dl_new_hash`), `string/strchrnul.c` | LGPL-2.1-or-later | `dl-new-hash.h`: `7714a1bcb43037faa582d1a197c08b1a8f0fe9025f8c2d06297e0a476831980a`; `strchrnul.c`: `25d82885a2acbbbd72d4a75caf9fe9884672a1a158d1f2a48adb794c6f09e497` | Keeps the unrolled `_dl_new_hash` (`h * 33 + c`) loop, portable 64-bit SWAR `__strchrnul` magic-bits scan for versioned `@` symbol suffixes, and `.gnu.hash` Bloom + chain lookup. Self-checks canonical `_dl_new_hash` test vectors and lookup table hits/misses. |
 
+## 2026-11-27: CRC concatenation / GF(2) arithmetic
+
+`zlib_ng_crc32_combine` is selected from
+[`packages/zlib-ng/PKGBUILD`](https://github.com/ms178/archpkgbuilds/blob/f705b69e16028cb0699fbb1b1e657ef09e6bca23/packages/zlib-ng/PKGBUILD),
+which selects zlib-ng **2.3.3**. The recipe's own blob SHA-256 is
+`384ef591c6dc1f23a625e86182e6b2b8314390fecc79d8d92f32ccb54bac2e46`.
+The immutable upstream commit is `12731092979c6d07f42da27da673a9f6c7b13586`.
+
+| Selected file | SHA-256 | Extracted boundary |
+|---|---|---|
+| [`crc32_braid_comb.c`](https://github.com/zlib-ng/zlib-ng/blob/12731092979c6d07f42da27da673a9f6c7b13586/crc32_braid_comb.c) | `b996400fb30a700a4f563deb1d33c683a00a8564b1ebb0e440877009f1aca73e` | `crc32_combine_`, renamed `zng_crc32_combine` and marked noinline |
+| [`crc32_braid_comb_p.h`](https://github.com/zlib-ng/zlib-ng/blob/12731092979c6d07f42da27da673a9f6c7b13586/crc32_braid_comb_p.h) | `6c8035e05d30a6241be55467fc59e4d7deda6b618b955a11339ffee08a39c75a` | `multmodp` and `x2nmodp`, arithmetic bodies unchanged |
+
+License: Zlib, including the original attribution; the selected `LICENSE.md`
+is byte-identical to the already checked-in `third_party_licenses/Zlib.txt`
+(SHA-256 `6c9f0d975b41afaa34d22f55bb8986ce69e5cb7ad327cb2b28820cd425edf5ee`).
+These are altered standalone test sources, not a relicensing of the compiler.
+
+The adaptation replaces zlib-ng headers/wrappers with fixed-width C types and
+initializes the 32-entry power table at startup rather than importing the large
+braid-table header. It retains the nonzero-polynomial precondition and uses only
+nonnegative lengths. An independent bitwise CRC checks the canonical `123456789`
+vector and **all 257 splits** of a deterministic 256-byte buffer. A separate
+32x32 GF(2) linear-map implementation checks **320 basis/length pairs**, including
+zero length, lengths beyond 32 bits, and `INT64_MAX`; it does not reuse either
+extracted polynomial helper. The hot recurrence depends on the previous result
+and uses synthetic checksum/length tuples; it does not materialize those
+messages or benchmark the separate precomputed-operator API.
+
+This is a different operation from table-driven byte CRC or Adler composition:
+it stresses data-dependent bit loops, shifts/XORs, branch selection and nested
+integer recurrences. Default `PASSES=262144`; bounded instrumentation uses 128.
+Whole-program timing/counting includes initialization and self-checks. It is
+not a pure hot-function time and does not establish end-to-end compression
+performance. The case is exploratory (`ci_sharded=False`), leaving the existing
+canonical sharded subset unchanged.
+
 ## Archive retrieval record
 
 The extraction artifacts (not committed to LCCC) had these SHA-256 values:

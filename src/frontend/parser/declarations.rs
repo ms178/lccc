@@ -46,6 +46,8 @@ struct DeclContext {
     /// `Parser::spec_names_unused_type`): each declarator of exactly that
     /// type is exempt from the unused warnings.
     spec_type_unused: bool,
+    /// C23 `auto` inferred declaration (6.7.10), as distinct from GNU `__auto_type`.
+    is_c23_auto: bool,
 }
 
 /// Parser-side mirror of `common::type_builder::apply_declaration_address_space`
@@ -195,6 +197,8 @@ impl Parser {
         let type_spec = self
             .parse_type_specifier()
             .or_else(|| self.implicit_int_type_specifier(start))?;
+        let is_c23_auto = self.attrs.parsing_c23_auto();
+        self.attrs.set_c23_auto(false);
         // Read before a declarator's parameter list parses its own specifiers.
         let spec_type_unused = self.spec_names_unused_type(&type_spec);
         // Capture the declaration's named address space before any declarator
@@ -230,7 +234,7 @@ impl Parser {
         // Specifier-position applicability records are settled here, before
         // the declarator (parameters, post-declarator attributes) can add
         // unrelated entries to the pool.
-        let mut spec_attr_targets = std::mem::take(&mut self.attrs.parsing_attr_targets);
+        let spec_attr_targets = std::mem::take(&mut self.attrs.parsing_attr_targets);
 
         let (name, derived, decl_mode, decl_common, decl_aligned, _) =
             self.parse_declarator_with_attrs();
@@ -244,149 +248,33 @@ impl Parser {
         let declarator_base_volatile = self.attrs.declarator_base_volatile;
         let declarator_base_atomic = self.attrs.declarator_base_atomic;
         let declarator_base_restrict = self.attrs.declarator_base_restrict;
-        let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
-            self.parse_asm_and_attributes();
-        // Applicability is a property of the declaration, not of where the
-        // attribute was written: `int x __attribute__((noreturn));` is the
-        // same mistake as `__attribute__((noreturn)) int x;`, and GCC
-        // diagnoses both. Every position feeds one pool, and the verdict is
-        // taken once the declarator kind is known.
-        spec_attr_targets.extend(std::mem::take(&mut self.attrs.parsing_attr_targets));
-        self.check_attribute_targets(&type_spec, &derived, &spec_attr_targets, start);
-        // `cleanup` names a function to run when a *block* scope ends. A
-        // file-scope object never ends one, so GCC ignores the attribute
-        // there (measured: `'cleanup' attribute ignored`); the generic
-        // object/function rule cannot see the difference.
-        // Same location rule as the kind check above: GCC reports at the
-        // declaration, a leading attribute list included.
-        let decl_loc = match self.attrs.first_attr_span {
-            Some(attr) if attr.start < start.start => attr,
-            _ => start,
-        };
-        // A `cleanup` list with the wrong number of arguments is an error and
-        // gcc reports only that error, so the applicability warning is
-        // suppressed for it (measured).
-        let cleanup_arity_error = self.cleanup_diagnoses.iter().any(|(d, _)| {
-            matches!(
-                d,
-                crate::frontend::parser::parse::CleanupDiagnosis::WrongArgumentCount(_)
-            )
-        });
-        for (attr_name, attr_span, _) in &spec_attr_targets {
-            if attr_name == "cleanup" && !cleanup_arity_error {
-                // One verdict per written attribute: gcc reports
-                // `int x __attribute__((noreturn)) __attribute__((noreturn));`
-                // twice, and `cleanup` behaves the same way (measured).
-                self.diagnostics.warning_with_kind_salted(
-                    "'cleanup' attribute ignored",
-                    decl_loc,
-                    crate::common::error::WarningKind::Attributes,
-                    Self::attribute_dedup_salt(*attr_span),
-                );
-            }
-        }
-        let mode_kind = decl_mode.or(post_mode);
-        let is_common = decl_common || post_common;
-        // Merge alignment from _Alignas (type specifier), declarator attrs, and post-declarator attrs.
-        // Per C11, alignment can only increase (6.7.5), so take the maximum.
-        let mut merged_alignment = self.attrs.parsed_alignas.take();
-        let alignas_type = self.attrs.parsed_alignas_type.take();
-        let alignment_sizeof_type = self.attrs.parsed_alignment_sizeof_type.take();
-        for a in [decl_aligned, post_aligned].iter().copied().flatten() {
-            merged_alignment = Some(merged_alignment.map_or(a, |prev| prev.max(a)));
-        }
-        // Merge all sources of constructor/destructor: type-level attrs, declarator-level attrs, post-declarator attrs
-        let is_constructor = type_level_ctor || self.attrs.parsing_constructor() || post_ctor;
-        let is_destructor = type_level_dtor || self.attrs.parsing_destructor() || post_dtor;
-        // Capture alias/ifunc/weak/visibility/section/error attributes
-        let is_weak = self.attrs.parsing_weak();
-        let alias_target = self.attrs.parsing_alias_target.take();
-        let ifunc_target = self.attrs.parsing_ifunc_target.take();
-        // Use explicit __attribute__((visibility(...))) if present, otherwise fall back
-        // to the current #pragma GCC visibility default (if any).
-        let visibility = self
-            .attrs
-            .parsing_visibility
-            .take()
-            .or_else(|| self.pragma_default_visibility.clone());
-        let section = self.attrs.parsing_section.take();
-        let tls_model = self.attrs.parsing_tls_model.take();
-        let is_error_attr = self.attrs.parsing_error_attr();
-        let is_noreturn = self.attrs.parsing_noreturn();
-        let cleanup_fn = self.attrs.parsing_cleanup_fn.take();
-        let symver = self.attrs.parsing_symver.take();
-        let target = self.attrs.parsing_target.take();
-        let target_clones = self.attrs.parsing_target_clones.take();
-        let is_uninitialized = self.attrs.parsing_uninitialized();
-        self.attrs.set_uninitialized(false);
-        let diagnose_as = self.attrs.parsing_diagnose_as.take();
-        let is_used = self.attrs.parsing_used();
-        let is_maybe_unused = self.attrs.parsing_maybe_unused();
-        let is_fastcall = self.attrs.parsing_fastcall();
-        let regparm = self.attrs.parsing_regparm;
-        let is_naked = self.attrs.parsing_naked();
-        let no_instrument = self.attrs.parsing_no_instrument();
-        let is_noinline = self.attrs.parsing_noinline();
-        let is_pure = self.attrs.parsing_pure();
-        let is_const_attr = self.attrs.parsing_const_attr();
-        let is_cold = self.attrs.parsing_cold();
-        let is_stack_protect = self.attrs.parsing_stack_protect;
-        self.attrs.parsing_stack_protect = false;
-        let is_no_stack_protector = self.attrs.parsing_no_stack_protector;
-        self.attrs.parsing_no_stack_protector = false;
-        let externally_visible = self.attrs.parsing_externally_visible;
-        self.attrs.parsing_externally_visible = false;
-        let zero_call_used_regs = self.attrs.parsing_zero_call_used_regs.take();
-        let no_sanitize = self.attrs.parsing_no_sanitize.take();
-
-        // Build per-declarator attributes struct from the collected flags
-        let mut decl_attrs = DeclAttributes::default();
-        decl_attrs.parsing_attr_targets = spec_attr_targets;
-        decl_attrs.object_space = declarator_object_space;
-        decl_attrs.object_volatile = declarator_object_volatile;
-        decl_attrs.pointer_const = declarator_pointer_const;
-        (decl_attrs.object_restrict, decl_attrs.object_atomic) = declarator_object_quals;
-        decl_attrs.base_volatile = declarator_base_volatile;
-        decl_attrs.base_atomic = declarator_base_atomic;
-        decl_attrs.base_restrict = declarator_base_restrict;
-        decl_attrs.set_constructor(is_constructor);
-        decl_attrs.set_destructor(is_destructor);
-        decl_attrs.set_weak(is_weak);
-        decl_attrs.set_error_attr(is_error_attr);
-        decl_attrs.set_noreturn(is_noreturn);
-        decl_attrs.set_used(is_used);
-        decl_attrs.set_maybe_unused(is_maybe_unused);
-        decl_attrs.set_fastcall(is_fastcall);
-        decl_attrs.regparm = regparm;
-        decl_attrs.set_naked(is_naked);
-        decl_attrs.set_no_instrument(no_instrument);
-        decl_attrs.set_pure(is_pure);
-        decl_attrs.set_const_attr(is_const_attr);
-        decl_attrs.set_cold(is_cold);
-        decl_attrs.set_uninitialized(is_uninitialized);
-        decl_attrs.set_stack_protect(is_stack_protect);
-        decl_attrs.set_no_stack_protector(is_no_stack_protector);
-        decl_attrs.set_retain(self.attrs.parsing_retain());
-        decl_attrs.set_noplt(self.attrs.parsing_noplt());
-        decl_attrs.set_noinit(self.attrs.parsing_noinit());
-        decl_attrs.set_persistent(self.attrs.parsing_persistent());
-        decl_attrs.set_nocommon(self.attrs.parsing_nocommon());
-        decl_attrs.set_nested_fn(self.attrs.parsing_nested_fn());
-        decl_attrs.alias_target = alias_target;
-        decl_attrs.ifunc_target = ifunc_target;
-        decl_attrs.visibility = visibility;
-        decl_attrs.tls_model = tls_model;
-        decl_attrs.section = section;
-        decl_attrs.tls_model = tls_model;
-        decl_attrs.asm_register = first_asm_reg;
-        decl_attrs.cleanup_fn = cleanup_fn;
-        decl_attrs.symver = symver;
-        decl_attrs.target = target;
-        decl_attrs.target_clones = target_clones;
-        decl_attrs.diagnose_as = diagnose_as;
-        decl_attrs.externally_visible = externally_visible;
-        decl_attrs.zero_call_used_regs = zero_call_used_regs;
-        decl_attrs.no_sanitize = no_sanitize;
+        let (
+            decl_attrs,
+            is_noinline,
+            mode_kind,
+            is_common,
+            merged_alignment,
+            alignas_type,
+            alignment_sizeof_type,
+        ) = self.collect_external_decl_attrs(
+            &type_spec,
+            &derived,
+            spec_attr_targets,
+            type_level_ctor,
+            type_level_dtor,
+            decl_mode,
+            decl_common,
+            decl_aligned,
+            declarator_object_space,
+            declarator_object_volatile,
+            declarator_pointer_const,
+            declarator_object_quals,
+            declarator_base_volatile,
+            declarator_base_atomic,
+            declarator_base_restrict,
+            start,
+        );
+        let is_noinline = is_noinline || spec_noinline;
 
         // Apply __attribute__((mode(...))): transform type to specified
         // bit-width.  A POINTER declarator is different (measured gcc 16.2):
@@ -448,6 +336,7 @@ impl Parser {
                 spec_persistent,
                 spec_nocommon,
                 spec_type_unused,
+                is_c23_auto,
             };
             self.parse_declaration_rest(type_spec, name, derived, start, ctx)
         }
@@ -569,19 +458,162 @@ impl Parser {
         }
     }
 
-    /// An OBJECT declaration hides any same-named function: after
-    /// `void f(void);` a block-scope `int f;` makes `"i"(f)` an ordinary
-    /// object value, exactly as it hides a typedef name.  A declaration whose
-    /// last declarator is a function still names the function entity (a
-    /// redeclaration or definition), so it must not clear the record.
-    fn record_object_shadows(&mut self, declarators: &[InitDeclarator]) {
-        for decl in declarators {
-            if !decl.name.is_empty()
-                && !matches!(decl.derived.last(), Some(DerivedDeclarator::Function(..)))
-            {
-                self.function_names.remove(&decl.name);
+    #[allow(clippy::too_many_arguments)]
+    fn collect_external_decl_attrs(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+        mut spec_attr_targets: Vec<(String, Span, super::attribute_registry::AttributeTarget)>,
+        type_level_ctor: bool,
+        type_level_dtor: bool,
+        decl_mode: Option<crate::frontend::parser::parse::ModeKind>,
+        decl_common: bool,
+        decl_aligned: Option<usize>,
+        declarator_object_space: AddressSpace,
+        declarator_object_volatile: bool,
+        declarator_pointer_const: bool,
+        declarator_object_quals: (bool, bool),
+        declarator_base_volatile: bool,
+        declarator_base_atomic: bool,
+        declarator_base_restrict: bool,
+        start: Span,
+    ) -> (
+        DeclAttributes,
+        bool,
+        Option<crate::frontend::parser::parse::ModeKind>,
+        bool,
+        Option<usize>,
+        Option<TypeSpecifier>,
+        Option<TypeSpecifier>,
+    ) {
+        let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
+            self.parse_asm_and_attributes();
+        spec_attr_targets.extend(std::mem::take(&mut self.attrs.parsing_attr_targets));
+        self.check_attribute_targets(type_spec, derived, &spec_attr_targets, start);
+        let decl_loc = match self.attrs.first_attr_span {
+            Some(attr) if attr.start < start.start => attr,
+            _ => start,
+        };
+        let cleanup_arity_error = self.cleanup_diagnoses.iter().any(|(d, _)| {
+            matches!(
+                d,
+                crate::frontend::parser::parse::CleanupDiagnosis::WrongArgumentCount(_)
+            )
+        });
+        for (attr_name, attr_span, _) in &spec_attr_targets {
+            if attr_name == "cleanup" && !cleanup_arity_error {
+                self.diagnostics.warning_with_kind_salted(
+                    "'cleanup' attribute ignored",
+                    decl_loc,
+                    crate::common::error::WarningKind::Attributes,
+                    Self::attribute_dedup_salt(*attr_span),
+                );
             }
         }
+        let mode_kind = decl_mode.or(post_mode);
+        let is_common = decl_common || post_common;
+        let mut merged_alignment = self.attrs.parsed_alignas.take();
+        let alignas_type = self.attrs.parsed_alignas_type.take();
+        let alignment_sizeof_type = self.attrs.parsed_alignment_sizeof_type.take();
+        for a in [decl_aligned, post_aligned].iter().copied().flatten() {
+            merged_alignment = Some(merged_alignment.map_or(a, |prev| prev.max(a)));
+        }
+        let is_constructor = type_level_ctor || self.attrs.parsing_constructor() || post_ctor;
+        let is_destructor = type_level_dtor || self.attrs.parsing_destructor() || post_dtor;
+        let is_weak = self.attrs.parsing_weak();
+        let alias_target = self.attrs.parsing_alias_target.take();
+        let ifunc_target = self.attrs.parsing_ifunc_target.take();
+        let visibility = self
+            .attrs
+            .parsing_visibility
+            .take()
+            .or_else(|| self.pragma_default_visibility.clone());
+        let section = self.attrs.parsing_section.take();
+        let tls_model = self.attrs.parsing_tls_model.take();
+        let is_error_attr = self.attrs.parsing_error_attr();
+        let is_noreturn = self.attrs.parsing_noreturn();
+        let cleanup_fn = self.attrs.parsing_cleanup_fn.take();
+        let symver = self.attrs.parsing_symver.take();
+        let target = self.attrs.parsing_target.take();
+        let target_clones = self.attrs.parsing_target_clones.take();
+        let is_uninitialized = self.attrs.parsing_uninitialized();
+        self.attrs.set_uninitialized(false);
+        let diagnose_as = self.attrs.parsing_diagnose_as.take();
+        let is_used = self.attrs.parsing_used();
+        let is_maybe_unused = self.attrs.parsing_maybe_unused();
+        let is_fastcall = self.attrs.parsing_fastcall();
+        let regparm = self.attrs.parsing_regparm;
+        let is_naked = self.attrs.parsing_naked();
+        let no_instrument = self.attrs.parsing_no_instrument();
+        let is_noinline = self.attrs.parsing_noinline();
+        let is_pure = self.attrs.parsing_pure();
+        let is_const_attr = self.attrs.parsing_const_attr();
+        let is_cold = self.attrs.parsing_cold();
+        let is_stack_protect = self.attrs.parsing_stack_protect;
+        self.attrs.parsing_stack_protect = false;
+        let is_no_stack_protector = self.attrs.parsing_no_stack_protector;
+        self.attrs.parsing_no_stack_protector = false;
+        let externally_visible = self.attrs.parsing_externally_visible;
+        self.attrs.parsing_externally_visible = false;
+        let zero_call_used_regs = self.attrs.parsing_zero_call_used_regs.take();
+        let no_sanitize = self.attrs.parsing_no_sanitize.take();
+
+        let mut decl_attrs = DeclAttributes::default();
+        decl_attrs.parsing_attr_targets = spec_attr_targets;
+        decl_attrs.object_space = declarator_object_space;
+        decl_attrs.object_volatile = declarator_object_volatile;
+        decl_attrs.pointer_const = declarator_pointer_const;
+        (decl_attrs.object_restrict, decl_attrs.object_atomic) = declarator_object_quals;
+        decl_attrs.base_volatile = declarator_base_volatile;
+        decl_attrs.base_atomic = declarator_base_atomic;
+        decl_attrs.base_restrict = declarator_base_restrict;
+        decl_attrs.set_constructor(is_constructor);
+        decl_attrs.set_destructor(is_destructor);
+        decl_attrs.set_weak(is_weak);
+        decl_attrs.set_error_attr(is_error_attr);
+        decl_attrs.set_noreturn(is_noreturn);
+        decl_attrs.set_used(is_used);
+        decl_attrs.set_maybe_unused(is_maybe_unused);
+        decl_attrs.set_fastcall(is_fastcall);
+        decl_attrs.regparm = regparm;
+        decl_attrs.set_naked(is_naked);
+        decl_attrs.set_no_instrument(no_instrument);
+        decl_attrs.set_pure(is_pure);
+        decl_attrs.set_const_attr(is_const_attr);
+        decl_attrs.set_cold(is_cold);
+        decl_attrs.set_uninitialized(is_uninitialized);
+        decl_attrs.set_stack_protect(is_stack_protect);
+        decl_attrs.set_no_stack_protector(is_no_stack_protector);
+        decl_attrs.set_retain(self.attrs.parsing_retain());
+        decl_attrs.set_noplt(self.attrs.parsing_noplt());
+        decl_attrs.set_noinit(self.attrs.parsing_noinit());
+        decl_attrs.set_persistent(self.attrs.parsing_persistent());
+        decl_attrs.set_nocommon(self.attrs.parsing_nocommon());
+        decl_attrs.set_nested_fn(self.attrs.parsing_nested_fn());
+        decl_attrs.alias_target = alias_target;
+        decl_attrs.ifunc_target = ifunc_target;
+        decl_attrs.visibility = visibility;
+        decl_attrs.tls_model = tls_model;
+        decl_attrs.section = section;
+        decl_attrs.asm_register = first_asm_reg;
+        decl_attrs.cleanup_fn = cleanup_fn;
+        decl_attrs.symver = symver;
+        decl_attrs.target = target;
+        decl_attrs.target_clones = target_clones;
+        decl_attrs.diagnose_as = diagnose_as;
+        decl_attrs.externally_visible = externally_visible;
+        decl_attrs.zero_call_used_regs = zero_call_used_regs;
+        decl_attrs.no_sanitize = no_sanitize;
+
+        (
+            decl_attrs,
+            is_noinline,
+            mode_kind,
+            is_common,
+            merged_alignment,
+            alignas_type,
+            alignment_sizeof_type,
+        )
     }
 
     /// Parse the rest of a function definition after the declarator.
@@ -653,21 +685,9 @@ impl Parser {
             );
         }
 
-        // Shadow typedef names used as parameter names, and hide enumerators
-        // of the same name until the body ends.
-        let enum_mark = self.enum_scope_log.len();
-        let mut shadowed_added: Vec<String> = Vec::new();
-        for param in &final_params {
-            if let Some(ref pname) = param.name {
-                if self.is_parser_enum_constant(pname) {
-                    self.hide_enum_constant(pname);
-                }
-                if self.typedefs.contains(pname) && !self.shadowed_typedefs.contains(pname) {
-                    self.shadowed_typedefs.insert(pname.clone());
-                    shadowed_added.push(pname.clone());
-                }
-            }
-        }
+        // Shadow typedef names used as parameter names (and expose inline enums
+        // defined in parameter types) until the body ends.
+        let (enum_mark, shadowed_added) = self.enter_function_param_scope(&final_params);
         // Clear noreturn so that _Noreturn/noreturn from the function definition
         // does not leak into local declarations inside the body.
         // parse_compound_stmt saves/restores attr flags, so this is safe.
@@ -713,10 +733,7 @@ impl Parser {
         self.asm_deferred_instantiation = saved_asm_deferral;
         self.asm_immediate_validation_deferred = prior_asm_immediate_defer;
         let body_span = self.through_previous_token(open);
-        for n in shadowed_added {
-            self.shadowed_typedefs.remove(&n);
-        }
-        self.restore_enum_scope(enum_mark);
+        self.leave_function_param_scope(enum_mark, shadowed_added);
 
         self.flush_declarator_verdicts(
             start,
@@ -1126,6 +1143,7 @@ impl Parser {
         // casts to segment-qualified pointers clear parsing_address_space
         // before Declaration::new would read it.
         let decl_addr_space = self.attrs.decl_address_space;
+        let is_typedef = self.attrs.parsing_typedef();
         let spec_maybe_unused = ctx.attrs.is_maybe_unused();
         // A type's `unused` reaches the declarators OF that type only: a
         // pointer to it or an array of it is reported as GCC reports it.
@@ -1137,11 +1155,8 @@ impl Parser {
         // declarator of the statement (`__attribute__((noplt)) void f(), g();`
         // marks both, measured against gcc-16.2.0).
         let spec_noplt = ctx.attrs.is_noplt();
-        let init = if self.consume_if(&TokenKind::Assign) {
-            Some(self.parse_initializer())
-        } else {
-            None
-        };
+        let init =
+            self.parse_declarator_initializer(&type_spec, name.as_deref(), &derived, is_typedef);
         let section = ctx.attrs.section.clone();
         declarators.push(InitDeclarator {
             name: name.unwrap_or_default(),
@@ -1272,6 +1287,13 @@ impl Parser {
             self.attrs.parsing_noinline(),
         );
         self.attrs.set_noinline(false);
+        if is_typedef {
+            self.record_typedef_details(
+                &type_spec,
+                std::slice::from_ref(last_decl),
+                decl_addr_space,
+            );
+        }
 
         if nested_fn_decl_level {
             for d in &mut declarators {
@@ -1346,11 +1368,12 @@ impl Parser {
             self.attrs.set_pure(false);
             self.attrs.set_const_attr(false);
             self.attrs.set_error_attr(false);
-            let dinit = if self.consume_if(&TokenKind::Assign) {
-                Some(self.parse_initializer())
-            } else {
-                None
-            };
+            let dinit = self.parse_declarator_initializer(
+                &type_spec,
+                dname.as_deref(),
+                &dderived,
+                is_typedef,
+            );
             // Attributes seen inside an initializer belong to nested syntax,
             // not this object or the next sibling.
             self.attrs.set_retain(false);
@@ -1443,6 +1466,13 @@ impl Parser {
                 self.attrs.parsing_noinline(),
             );
             self.attrs.set_noinline(false);
+            if is_typedef {
+                self.record_typedef_details(
+                    &type_spec,
+                    std::slice::from_ref(last_decl),
+                    decl_addr_space,
+                );
+            }
             // A trailing attribute written on a later sibling is still a
             // declaration-level verdict for GCC: `int a, b __attribute__
             // ((noreturn));` warns once, at the declaration (measured). The
@@ -1455,12 +1485,11 @@ impl Parser {
             }
         }
 
-        // Register typedef names
-        let is_typedef = self.attrs.parsing_typedef();
+        // Names and typedef metadata were installed per declarator.
+        self.attrs.set_typedef(false);
         let is_transparent_union = self.take_transparent_union();
         let is_designated_init = self.attrs.parsing_designated_init();
         self.attrs.set_designated_init(false);
-        self.register_typedefs(&type_spec, &declarators, decl_addr_space);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
         // `-Wstrict-prototypes` is a property of the declared types, so it is
@@ -1488,6 +1517,7 @@ impl Parser {
         d.set_const(self.attrs.parsing_const());
         d.set_constexpr(self.attrs.parsing_constexpr());
         d.set_constexpr_last(self.attrs.parsing_constexpr_last());
+        d.set_c23_auto(ctx.is_c23_auto);
         d.set_volatile(self.attrs.parsing_volatile());
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_common(ctx.is_common);
@@ -1628,38 +1658,61 @@ impl Parser {
         d
     }
 
-    /// Register block-scope typedef names, or record the typedef/object shadows
-    /// introduced by ordinary declarations.  Returns whether the declaration
-    /// was a typedef so the caller can stamp the finished `Declaration`.
-    fn register_local_typedefs(
+    /// Enter one completed declarator into the ordinary-identifier namespace.
+    /// Scope starts before the initializer and before the next comma sibling
+    /// (C11 6.2.1p7), not at the declaration's semicolon.
+    fn declare_declarator_name(
         &mut self,
-        declarators: &[InitDeclarator],
-        decl_addr_space: AddressSpace,
-    ) -> bool {
-        let is_typedef = self.attrs.parsing_typedef();
+        name: Option<&str>,
+        derived: &[DerivedDeclarator],
+        is_typedef: bool,
+    ) {
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            return;
+        };
         if is_typedef {
-            for decl in declarators {
-                if !decl.name.is_empty() {
-                    self.record_typedef_scope_change(&decl.name);
-                }
-            }
-            self.record_typedef_object_spaces(declarators, decl_addr_space);
-            for decl in declarators {
-                if !decl.name.is_empty() {
-                    self.typedefs.insert(decl.name.clone());
-                    self.shadowed_typedefs.remove(&decl.name);
-                }
-            }
-            self.attrs.set_typedef(false);
-        } else {
-            for decl in declarators {
-                if !decl.name.is_empty() && self.typedefs.contains(&decl.name) {
-                    self.shadowed_typedefs.insert(decl.name.clone());
-                }
-            }
-            self.record_object_shadows(declarators);
+            // Log the OLD state exactly once, before installing the new name.
+            self.record_typedef_scope_change(name);
+            self.typedefs.insert(name.to_owned());
+            self.shadowed_typedefs.remove(name);
+        } else if self.block_depth > 0 && self.typedefs.contains(name) {
+            self.shadowed_typedefs.insert(name.to_owned());
         }
-        is_typedef
+        if self.block_depth > 0 {
+            if self.is_parser_enum_constant(name) {
+                self.hide_enum_constant(name);
+            }
+            self.local_constants.remove(name);
+            // An object/typedef hides a function; a function redeclaration
+            // still denotes the function entity (including asm "i" operands).
+            if is_typedef || !DerivedDeclarator::declares_function(derived) {
+                self.function_names.remove(name);
+            }
+        }
+    }
+
+    fn parse_declarator_initializer(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        name: Option<&str>,
+        derived: &[DerivedDeclarator],
+        is_typedef: bool,
+    ) -> Option<Initializer> {
+        // GNU __auto_type / C23 inferred declarations deliberately enter scope
+        // AFTER the initializer; moving every name early would break them.
+        let inferred = matches!(type_spec, TypeSpecifier::AutoType);
+        if !inferred {
+            self.declare_declarator_name(name, derived, is_typedef);
+        }
+        let init = if self.consume_if(&TokenKind::Assign) {
+            Some(self.parse_initializer())
+        } else {
+            None
+        };
+        if inferred {
+            self.declare_declarator_name(name, derived, is_typedef);
+        }
+        init
     }
 
     pub(super) fn parse_local_declaration(&mut self) -> Option<Declaration> {
@@ -1686,6 +1739,7 @@ impl Parser {
         self.attrs.set_inline(false);
         self.attrs.set_const(false);
         self.attrs.set_constexpr(false);
+        self.attrs.set_c23_auto(false);
         self.attrs.set_atomic(false);
         self.attrs.set_restrict(false);
         self.attrs.set_volatile(false);
@@ -1700,6 +1754,8 @@ impl Parser {
         self.attrs.set_nocommon(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let type_spec = self.parse_type_specifier()?;
+        let is_c23_auto = self.attrs.parsing_c23_auto();
+        self.attrs.set_c23_auto(false);
         let spec_type_unused = self.spec_names_unused_type(&type_spec);
         let spec_maybe_unused = self.attrs.parsing_maybe_unused();
         self.attrs.set_maybe_unused(false);
@@ -1744,6 +1800,7 @@ impl Parser {
 
         let is_static = self.attrs.parsing_static();
         let is_extern = self.attrs.parsing_extern();
+        let is_typedef = self.attrs.parsing_typedef();
 
         let mut declarators = Vec::with_capacity(4);
 
@@ -1805,16 +1862,17 @@ impl Parser {
             for a in [decl_aligned, skip_aligned].iter().copied().flatten() {
                 alignment = Some(alignment.map_or(a, |prev| prev.max(a)));
             }
-            let init = if self.consume_if(&TokenKind::Assign) {
-                Some(self.parse_initializer())
-            } else {
-                None
-            };
+            let init = self.parse_declarator_initializer(
+                &type_spec,
+                name.as_deref(),
+                &derived,
+                is_typedef,
+            );
             // Record a block-scope integer constant so an `asm "i"` operand may
             // name it (see `local_constants` in the parser state).  A
             // declaration with no initializer still SHADOWS an outer record.
             if let Some(decl_name) = name.as_ref() {
-                if !decl_name.is_empty() && !self.attrs.parsing_typedef() {
+                if !decl_name.is_empty() && !is_typedef {
                     match init.as_ref() {
                         Some(init) => self.record_local_constant(decl_name, &derived, init),
                         None => {
@@ -1909,6 +1967,13 @@ impl Parser {
             if let Some(a) = post_init_aligned {
                 alignment = Some(alignment.map_or(a, |prev| prev.max(a)));
             }
+            if is_typedef {
+                self.record_typedef_details(
+                    &type_spec,
+                    std::slice::from_ref(last_decl),
+                    decl_addr_space,
+                );
+            }
             if !self.consume_if(&TokenKind::Comma) {
                 break;
             }
@@ -1922,17 +1987,13 @@ impl Parser {
             .collect();
         let type_spec = self.apply_mode_attribute(mode_kind, type_spec, &mode_derived, start);
 
-        // A block-scope declaration hides an enumerator of the same name.
-        if self.block_depth > 0 {
-            for decl in &declarators {
-                if self.is_parser_enum_constant(&decl.name) {
-                    self.hide_enum_constant(&decl.name);
-                }
-            }
+        // Names were bound before their initializers. Refresh typedef details
+        // after the declaration-wide mode attribute has resolved the base type;
+        // do not log another scope change (that would save the new state).
+        if is_typedef {
+            self.record_typedef_details(&type_spec, &declarators, decl_addr_space);
         }
-
-        // Register typedef names or shadow them for variable declarations
-        let is_typedef = self.register_local_typedefs(&declarators, decl_addr_space);
+        self.attrs.set_typedef(false);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
         // The declaration's address space is lexical to it: consume it now
@@ -1987,6 +2048,7 @@ impl Parser {
         d.set_const(self.attrs.parsing_const());
         d.set_constexpr(self.attrs.parsing_constexpr());
         d.set_constexpr_last(self.attrs.parsing_constexpr_last());
+        d.set_c23_auto(is_c23_auto);
         d.set_volatile(self.attrs.parsing_volatile());
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_thread_local(self.attrs.parsing_thread_local());
@@ -2553,28 +2615,36 @@ impl Parser {
         }
     }
 
-    fn register_typedefs(
+    /// Publish a completed typedef's qualifiers and type for later declarators,
+    /// including parser-side sizeof in attributes. Name binding/scope logging
+    /// happens separately, before the initializer.
+    fn record_typedef_details(
         &mut self,
         type_spec: &TypeSpecifier,
         declarators: &[InitDeclarator],
         decl_space: AddressSpace,
     ) {
-        if self.attrs.parsing_typedef() {
-            self.record_typedef_object_spaces(declarators, decl_space);
-            for decl in declarators {
-                if !decl.name.is_empty() {
-                    self.typedefs.insert(decl.name.clone());
-                    // Record the typedef's full type (base spec + derived
-                    // pointer/array layers) so parse-time constant
-                    // expressions can resolve sizeof(typedef) — required for
-                    // e.g. `__attribute__((vector_size(16 * sizeof(int64_t))))`.
-                    self.typedef_type_specs.insert(
-                        decl.name.clone(),
-                        self.typedef_spec_with_derived(type_spec.clone(), &decl.derived),
-                    );
+        self.record_typedef_object_spaces(declarators, decl_space);
+        // Keep block-local types sema-deferred, as before: a spelling-only
+        // alias cache cannot represent which outer binding a local typedef
+        // captured once another declaration shadows that spelling.
+        if self.block_depth > 0 {
+            return;
+        }
+        for decl in declarators {
+            if !decl.name.is_empty() {
+                // A legal same-type redeclaration must not turn T -> int into
+                // the self-cycle T -> T in the parser's size lookup.
+                if decl.derived.is_empty()
+                    && matches!(type_spec, TypeSpecifier::TypedefName(name) if name == &decl.name)
+                {
+                    continue;
                 }
+                self.typedef_type_specs.insert(
+                    decl.name.clone(),
+                    self.typedef_spec_with_derived(type_spec.clone(), &decl.derived),
+                );
             }
-            self.attrs.set_typedef(false);
         }
     }
 
@@ -2643,6 +2713,109 @@ impl Parser {
             message,
             span: assert_span,
         }
+    }
+}
+
+#[cfg(test)]
+mod declarator_scope_tests {
+    use super::*;
+    use crate::frontend::lexer::Lexer;
+
+    fn parse(source: &str) -> (TranslationUnit, Parser) {
+        let mut parser = Parser::new(Lexer::new(source, 0).tokenize());
+        let unit = parser.parse();
+        assert_eq!(parser.error_count, 0, "{source}");
+        (unit, parser)
+    }
+
+    fn initializer<'a>(unit: &'a TranslationUnit, name: &str) -> &'a Expr {
+        let function = unit
+            .decls
+            .iter()
+            .find_map(|decl| match decl {
+                ExternalDecl::FunctionDef(function) => Some(function),
+                _ => None,
+            })
+            .expect("function");
+        let decl = function
+            .body
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                BlockItem::Declaration(decl) => Some(decl),
+                _ => None,
+            })
+            .flat_map(|decl| &decl.declarators)
+            .find(|decl| decl.name == name)
+            .expect("declarator");
+        match decl.init.as_ref().expect("initializer") {
+            Initializer::Expr(expr) => expr,
+            _ => panic!("expression initializer"),
+        }
+    }
+
+    #[test]
+    fn own_and_later_initializers_see_the_object_not_the_typedef() {
+        let (unit, parser) = parse(
+            "typedef char T; int f(void) { int before = sizeof(T), T = sizeof(T), after = sizeof(T), sub = (T) - 1; return 0; }",
+        );
+        assert!(
+            matches!(initializer(&unit, "before"), Expr::Sizeof(arg, _) if matches!(**arg, SizeofArg::Type(_)))
+        );
+        for name in ["T", "after"] {
+            assert!(
+                matches!(initializer(&unit, name), Expr::Sizeof(arg, _) if matches!(**arg, SizeofArg::Expr(_)))
+            );
+        }
+        assert!(matches!(
+            initializer(&unit, "sub"),
+            Expr::BinaryOp(BinOp::Sub, ..)
+        ));
+        assert!(parser.typedefs.contains("T"));
+        assert!(!parser.shadowed_typedefs.contains("T"));
+    }
+
+    #[test]
+    fn inferred_initializer_still_sees_the_outer_typedef() {
+        let (unit, _) =
+            parse("typedef long long T; int f(void) { __auto_type T = (T)7; return T; }");
+        assert!(matches!(initializer(&unit, "T"), Expr::Cast(..)));
+    }
+
+    #[test]
+    fn typedef_is_visible_to_sibling_casts_and_function_parameters() {
+        let (_, parser) = parse(
+            "typedef int A, B[(A)2.5 + 1], (*F)(A); void f(void) { typedef double X, (*Y)(X); }",
+        );
+        for name in ["A", "B", "F"] {
+            assert!(parser.typedefs.contains(name));
+        }
+        assert!(!parser.typedefs.contains("X"));
+        assert!(!parser.typedefs.contains("Y"));
+        assert!(parser.typedef_scope_log.is_empty());
+    }
+
+    #[test]
+    fn local_alias_size_information_stays_sema_deferred() {
+        let (_, parser) = parse(
+            "typedef int T; void f(void) { { typedef volatile long long T, U; } T restored; }",
+        );
+        assert!(matches!(
+            parser.typedef_type_specs.get("T"),
+            Some(TypeSpecifier::Int)
+        ));
+        assert!(!parser.typedef_base_volatile.contains("T"));
+        assert!(!parser.typedefs.contains("U"));
+        assert!(parser.typedef_scope_log.is_empty());
+    }
+
+    #[test]
+    fn same_type_redeclaration_does_not_create_a_size_lookup_cycle() {
+        let (_, parser) = parse("typedef int T; typedef T T;");
+        assert!(matches!(
+            parser.typedef_type_specs.get("T"),
+            Some(TypeSpecifier::Int)
+        ));
     }
 }
 

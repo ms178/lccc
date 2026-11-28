@@ -2752,10 +2752,15 @@ impl X86Codegen {
                 // requests of 16+ (over-aligned allocas, vectors) are honoured
                 // exactly as before.
                 let is_small_alloc = alloc_size <= 4;
+                // System V AMD64 (§3.2.2) gives local objects >= 16 bytes at
+                // least 16-byte alignment so SIMD/16-byte memory operands do
+                // not cross cache-line splits (`16n+8` frames).
                 let effective_align = if align > 0 {
-                    align.max(8)
+                    align.max(if alloc_size >= 16 { 16 } else { 8 })
                 } else if is_small_alloc {
                     4
+                } else if alloc_size >= 16 {
+                    16
                 } else {
                     8
                 };

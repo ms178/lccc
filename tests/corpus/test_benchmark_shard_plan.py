@@ -69,6 +69,7 @@ class BenchmarkShardPlan(unittest.TestCase):
                 # AVX-only stress workload: measured explicitly with its registered
                 # -mavx2 flag, not part of the bounded generic CI shard partition.
                 "avx_fp_private",
+                "zlib_ng_crc32_combine",
                 "gzip_longest_match",
                 "linux_list_sort",
                 "zstd_double_fast",

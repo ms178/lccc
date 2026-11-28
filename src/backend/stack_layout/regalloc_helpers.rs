@@ -658,6 +658,7 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
             phi_chain: FxHashMap::default(),
             eligible: FxHashSet::default(),
             fold_deferred: FxHashMap::default(),
+            indexed_fold_deferred: FxHashMap::default(),
         }
     } else {
         super::super::regalloc::allocate_registers_with_fold_rounds(func, &mut config)

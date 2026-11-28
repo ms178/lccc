@@ -12886,6 +12886,40 @@ impl X86Codegen {
             self.sse_store_dest(dest, "xmm0");
             return;
         }
+        if let Some(dst) = self
+            .dest_xmm_home_name(dest)
+            .filter(|d| self.isa.sse41 || (*d != "xmm0" && *d != "xmm1"))
+        {
+            if self.isa.sse41 {
+                self.operand_to_reg(&args[0], "rax");
+                self.state.emit_fmt(format_args!("    movd %eax, %{}", dst));
+                self.operand_to_reg(&args[1], "rax");
+                self.state
+                    .emit_fmt(format_args!("    pinsrd $1, %eax, %{}", dst));
+                self.operand_to_reg(&args[2], "rax");
+                self.state
+                    .emit_fmt(format_args!("    pinsrd $2, %eax, %{}", dst));
+                self.operand_to_reg(&args[3], "rax");
+                self.state
+                    .emit_fmt(format_args!("    pinsrd $3, %eax, %{}", dst));
+            } else {
+                self.operand_to_reg(&args[0], "rax");
+                self.state.emit_fmt(format_args!("    movd %eax, %{}", dst));
+                self.operand_to_reg(&args[1], "rcx");
+                self.state.emit("    movd %ecx, %xmm1");
+                self.state
+                    .emit_fmt(format_args!("    punpckldq %xmm1, %{}", dst));
+                self.operand_to_reg(&args[2], "rax");
+                self.state.emit("    movd %eax, %xmm1");
+                self.operand_to_reg(&args[3], "rcx");
+                self.state.emit("    movd %ecx, %xmm0");
+                self.state.emit("    punpckldq %xmm0, %xmm1");
+                self.state
+                    .emit_fmt(format_args!("    punpcklqdq %xmm1, %{}", dst));
+            }
+            self.sse_commit_dest_direct(dest, dst);
+            return;
+        }
         self.operand_to_reg(&args[0], "rax");
         self.state.emit("    movd %eax, %xmm0");
         self.operand_to_reg(&args[1], "rcx");

@@ -235,6 +235,102 @@ fn the_wired_pass_rewrites_the_compare256_skeleton() {
 }
 
 #[test]
+fn explicit_zero_compare_respects_sub_use_count() {
+    // Single-use `Sub(a, b) == 0` rewrites in place to `a == b`.
+    let mut single = IrFunction::new("sub1".to_string(), IrType::U32, vec![], false);
+    single.blocks = vec![mk(
+        0,
+        vec![
+            diff_binop(IrBinOp::Sub, 3, IrType::U32),
+            Instruction::Cmp {
+                dest: Value(4),
+                op: IrCmpOp::Eq,
+                lhs: v(3),
+                rhs: Operand::Const(IrConst::I64(0)),
+                ty: IrType::U32,
+            },
+        ],
+        Terminator::Return(Some(v(4))),
+    )];
+    single.next_value_id = 5;
+    assert_eq!(rewrite_diff_zero_branches(&mut single), 1);
+    assert!(matches!(
+        single.blocks[0].instructions[1],
+        Instruction::Cmp {
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(2)),
+            ..
+        }
+    ));
+
+    // Multi-use `Sub(a, 1) == 0` (decrement-and-test loop) keeps `sub + je`
+    // instead of keeping `a` live across `cmp $1` + `mov`.
+    let mut multi = IrFunction::new("sub_multi".to_string(), IrType::U32, vec![], false);
+    multi.blocks = vec![
+        mk(
+            0,
+            vec![
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Sub,
+                    lhs: v(1),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::U32,
+                },
+                Instruction::Cmp {
+                    dest: Value(4),
+                    op: IrCmpOp::Eq,
+                    lhs: v(3),
+                    rhs: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::U32,
+                },
+            ],
+            Terminator::CondBranch {
+                cond: v(4),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+        ),
+        mk(1, vec![], Terminator::Return(Some(v(3)))),
+        mk(
+            2,
+            vec![],
+            Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
+        ),
+    ];
+    multi.next_value_id = 5;
+    assert_eq!(rewrite_diff_zero_branches(&mut multi), 0);
+
+    // Multi-use `Sub(a, const)` directly in `CondBranch` (`if (--n)`) also stays untouched.
+    let mut br_const = IrFunction::new("sub_br_const".to_string(), IrType::U32, vec![], false);
+    br_const.blocks = vec![
+        mk(
+            0,
+            vec![Instruction::BinOp {
+                dest: Value(3),
+                op: IrBinOp::Sub,
+                lhs: v(1),
+                rhs: Operand::Const(IrConst::I64(1)),
+                ty: IrType::U32,
+            }],
+            Terminator::CondBranch {
+                cond: v(3),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+        ),
+        mk(1, vec![], Terminator::Return(Some(v(3)))),
+        mk(
+            2,
+            vec![],
+            Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
+        ),
+    ];
+    br_const.next_value_id = 4;
+    assert_eq!(rewrite_diff_zero_branches(&mut br_const), 0);
+}
+
+#[test]
 fn eight_bit_ring_ground_truth() {
     // The fold's entire claim: over every pair of the 8-bit ring, the
     // difference is zero exactly on the diagonal, for XOR and wrapping SUB.

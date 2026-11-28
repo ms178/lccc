@@ -57,6 +57,7 @@ use crate::ir::reexports::Terminator;
 /// single fusible `cmp` this rewrite is priced on.
 #[derive(Clone, Copy)]
 struct DiffDef {
+    op: IrBinOp,
     lhs: Operand,
     rhs: Operand,
     ty: IrType,
@@ -72,8 +73,14 @@ pub(super) fn rewrite_diff_zero_branches(func: &mut IrFunction) -> usize {
     let max = func.max_value_id() as usize + 1;
     let mut diffs: Vec<Option<DiffDef>> = vec![None; max];
     let mut defined = vec![false; max];
+    let mut uses: Vec<u32> = vec![0; max];
     for block in &func.blocks {
         for inst in &block.instructions {
+            inst.for_each_used_value(|v| {
+                if let Some(cnt) = uses.get_mut(v as usize) {
+                    *cnt = cnt.saturating_add(1);
+                }
+            });
             let Some(dest) = inst.dest() else { continue };
             let idx = dest.0 as usize;
             if idx >= max {
@@ -86,7 +93,7 @@ pub(super) fn rewrite_diff_zero_branches(func: &mut IrFunction) -> usize {
             }
             defined[idx] = true;
             if let Instruction::BinOp {
-                op: IrBinOp::Xor | IrBinOp::Sub,
+                op: op @ (IrBinOp::Xor | IrBinOp::Sub),
                 lhs,
                 rhs,
                 ty,
@@ -95,6 +102,7 @@ pub(super) fn rewrite_diff_zero_branches(func: &mut IrFunction) -> usize {
             {
                 if ty.is_integer() && ty.size() <= 8 {
                     diffs[idx] = Some(DiffDef {
+                        op: *op,
                         lhs: *lhs,
                         rhs: *rhs,
                         ty: *ty,
@@ -102,12 +110,20 @@ pub(super) fn rewrite_diff_zero_branches(func: &mut IrFunction) -> usize {
                 }
             }
         }
+        block.terminator.for_each_used_value(|v| {
+            if let Some(cnt) = uses.get_mut(v as usize) {
+                *cnt = cnt.saturating_add(1);
+            }
+        });
     }
 
     let mut changes = 0;
 
     // Shape 2: `Cmp Eq/Ne(d, 0)` -> `Cmp Eq/Ne(a, b)`, in place. The zero may
     // sit on either side; `Eq`/`Ne` are symmetric so no swap is needed.
+    // For `Sub`, require single-use: when `d = a - b` stays live after the
+    // compare (e.g. `--chain_length != 0`), comparing `a` vs `b` keeps `a` live
+    // across `Sub` and emits `lea -1; cmp $1; jcc; mov` instead of `sub $1; jcc`.
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
             let Instruction::Cmp {
@@ -126,6 +142,9 @@ pub(super) fn rewrite_diff_zero_branches(func: &mut IrFunction) -> usize {
             let Some(d) = diffs.get(value.0 as usize).copied().flatten() else {
                 continue;
             };
+            if d.op == IrBinOp::Sub && uses.get(value.0 as usize).copied().unwrap_or(0) > 1 {
+                continue;
+            }
             // The compare must read the difference at its own width: a
             // narrower compare of a wider difference tests only low bits.
             if !facts::same_width_scalar(d.ty, *ty) {
@@ -138,6 +157,8 @@ pub(super) fn rewrite_diff_zero_branches(func: &mut IrFunction) -> usize {
     }
 
     // Shape 1: `CondBranch(d)` -> append `c = Cmp Ne(a, b)`, branch on `c`.
+    // Skip multi-use `Sub(a, const)` (loop decrement `if (--n)`) for the same
+    // live-range reason as Shape 2.
     let mut next = func.max_value_id().saturating_add(1);
     for block in &mut func.blocks {
         let d = {
@@ -154,8 +175,14 @@ pub(super) fn rewrite_diff_zero_branches(func: &mut IrFunction) -> usize {
                 continue;
             }
             match diffs.get(v.0 as usize).copied().flatten() {
-                Some(d) => d,
-                None => continue,
+                Some(d)
+                    if !(d.op == IrBinOp::Sub
+                        && matches!(d.rhs, Operand::Const(_))
+                        && uses.get(v.0 as usize).copied().unwrap_or(0) > 1) =>
+                {
+                    d
+                }
+                _ => continue,
             }
         };
         let fresh = Value(next);

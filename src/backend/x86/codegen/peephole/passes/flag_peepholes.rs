@@ -5455,11 +5455,15 @@ mod widened_copy_tracking_tests {
             out.contains("movzbl %al, %r8d"),
             "%%r8 definition deleted: {out}"
         );
-        // No fusion: the `test` (and therefore the whole idiom) survives, and
-        // the `cmov` still reads the definition it had.  The input's own
+        // No fusion: the `test` (possibly narrowed from `movzbl %al, %r9d;
+        // testl %r9d, %r9d` to `testb %al, %al` by mask_test) survives, and
+        // the `cmov` still reads the definition it had. The input's own
         // `cmovne` is a SURVIVOR here -- the bug would have been deleting the
         // `%r8d` definition under it, not removing it.
-        assert!(out.contains("testl %r9d, %r9d"), "fusion fired: {out}");
+        assert!(
+            out.contains("testl %r9d, %r9d") || out.contains("testb %al, %al"),
+            "fusion fired: {out}"
+        );
         assert!(
             out.contains("cmovne %r8d, %ebx"),
             "the select changed shape: {out}"

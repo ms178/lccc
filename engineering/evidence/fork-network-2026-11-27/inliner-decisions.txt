@@ -1,0 +1,25 @@
+[INLINE_DEBUG] multmodp skipped: is_static=true, is_inline=false, blocks=13, inst_count=35, has_loops=true, direct_calls=3, medium_block_limit=16, single_site=false, survives_via_reference=false, is_declaration=false
+[INLINE_DEBUG] x2nmodp candidate: blocks=6, inst_count=26, direct_calls=1, is_variadic=false, params=2
+[INLINE_DEBUG] byte_crc skipped: is_static=true, is_inline=false, blocks=9, inst_count=35, has_loops=true, direct_calls=5, medium_block_limit=16, single_site=false, survives_via_reference=false, is_declaration=false
+[INLINE_DEBUG] apply_map candidate: blocks=7, inst_count=21, direct_calls=2, is_variadic=false, params=2
+[INLINE_DEBUG] reference_combine candidate: blocks=25, inst_count=74, direct_calls=1, is_variadic=false, params=3
+[INLINE_DEBUG] main skipped: is_static=false, is_inline=false, blocks=38, inst_count=143, has_loops=true, direct_calls=0, medium_block_limit=6, single_site=false, survives_via_reference=false, is_declaration=false
+[INLINE] Callee map has 3 eligible functions:
+[INLINE]   'reference_combine': 25 blocks, 74 instructions, 3 params
+[INLINE]   'x2nmodp': 6 blocks, 26 instructions, 2 params
+[INLINE]   'apply_map': 7 blocks, 21 instructions, 2 params
+[INLINE] Inlined 'x2nmodp' into 'zng_crc32_combine'
+[INLINE] Inlined 'reference_combine' into 'main'
+[INLINE] Cleaned capped caller 'main': 217 -> 163 instructions
+[INLINE_DEBUG] multmodp candidate: blocks=8, inst_count=33, direct_calls=4, is_variadic=false, params=2
+[INLINE_DEBUG] x2nmodp candidate: blocks=6, inst_count=24, direct_calls=0, is_variadic=false, params=2
+[INLINE_DEBUG] byte_crc candidate: blocks=7, inst_count=33, direct_calls=5, is_variadic=false, params=2
+[INLINE_DEBUG] apply_map candidate: blocks=6, inst_count=19, direct_calls=4, is_variadic=false, params=2
+[INLINE_DEBUG] reference_combine skipped: is_static=true, is_inline=false, blocks=19, inst_count=74, has_loops=true, direct_calls=0, medium_block_limit=16, single_site=false, survives_via_reference=false, is_declaration=false
+[INLINE_DEBUG] main skipped: is_static=false, is_inline=false, blocks=46, inst_count=163, has_loops=true, direct_calls=0, medium_block_limit=6, single_site=false, survives_via_reference=false, is_declaration=false
+[INLINE] Callee map has 4 eligible functions:
+[INLINE]   'multmodp': 8 blocks, 33 instructions, 2 params
+[INLINE]   'x2nmodp': 6 blocks, 24 instructions, 2 params
+[INLINE]   'byte_crc': 7 blocks, 33 instructions, 2 params
+[INLINE]   'apply_map': 6 blocks, 19 instructions, 2 params
+[INLINE] Inlined 'multmodp' into 'zng_crc32_combine'

@@ -2090,6 +2090,7 @@ impl Lowerer {
             Some((bit_offset, bit_width)),
         );
 
+        let is_bool = self.is_bool_lvalue(inner);
         let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
         let wt = widened_op_type(Self::bitfield_arithmetic_type(storage_ty, bit_width));
         let current_casted = self.emit_implicit_cast(current_val, current_ty, wt);
@@ -2100,7 +2101,12 @@ impl Lowerer {
         };
         let result = self.emit_binop_val(ir_op, current_casted, Operand::Const(one), wt);
 
-        let store_val = self.emit_implicit_cast(Operand::Value(result), wt, storage_ty);
+        let store_val = if is_bool {
+            let truth = self.emit_bool_normalize_typed(Operand::Value(result), wt);
+            self.emit_implicit_cast(truth, IrType::I32, storage_ty)
+        } else {
+            self.emit_implicit_cast(Operand::Value(result), wt, storage_ty)
+        };
 
         self.store_bitfield(
             field_addr,

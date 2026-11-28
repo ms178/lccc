@@ -986,263 +986,241 @@ impl Parser {
             }
         }
 
+        // C11 6.2.1p7: each parameter's name (and any inline enum constants in a
+        // parameter specifier) enters scope until the enclosing prototype ends
+        // (or, for a function definition, is re-entered for its body).
+        let enum_mark = self.enum_scope_log.len();
+        let saved_shadowed = self.shadowed_typedefs.clone();
+        self.param_list_depth += 1;
+
         loop {
             if matches!(self.peek(), TokenKind::Ellipsis) {
                 self.advance();
                 variadic = true;
                 break;
             }
-
-            // Save noreturn before skip_gcc_extensions() so that a noreturn attribute
-            // on a function pointer parameter (e.g. `__attribute__((__noreturn__)) fn_ptr_t`)
-            // doesn't leak to the enclosing function declaration.
-            let saved_noreturn = self.attrs.parsing_noreturn();
-            // Parse pre-name GCC attributes (e.g. `__attribute__((aligned(16))) int x`)
-            // instead of skipping them, so a pre-name aligned attribute is
-            // honored exactly like the _Alignas pre-name spelling.
-            let (_, pre_align, _, _, _) = self.parse_gcc_attributes();
-            if let Some(a) = pre_align {
-                self.attrs.parsed_alignas = Some(
-                    self.attrs
-                        .parsed_alignas
-                        .map_or(a, |prev: usize| prev.max(a)),
-                );
-            }
-            // Save and reset parsing_const to detect if this parameter's base type is const.
-            let saved_const = self.attrs.parsing_const();
-            self.attrs.set_const(false);
-            // The pointer-star `const` is per parameter too (`f(int a, int
-            // *const p)` must not leak p's star const into `a`'s declarator);
-            // save the enclosing declaration's state and restore it below
-            // alongside `saved_const`.
-            let saved_pointer_const = self.attrs.parsing_pointer_const();
-            self.attrs.set_pointer_const(false);
-            // Likewise `restrict`: an earlier parameter's star or specifier
-            // (`int *restrict *a, const char **b`) is not `b`'s.
-            let saved_restrict = self.attrs.parsing_restrict();
-            self.attrs.set_restrict(false);
-            // Each parameter's volatile and typedef qualifiers are its own
-            // (`VI p, int y`: `y` is not volatile), so clear them before its
-            // specifiers are parsed. Likewise `_Atomic`.
-            self.attrs.set_volatile(false);
-            self.attrs.set_atomic(false);
-            self.attrs.set_typedef_use(false);
-            self.attrs.set_typedef_object_volatile(false);
-            self.attrs.set_noreturn(saved_noreturn);
-            // Each parameter's named address space is its own: clear the slot so
-            // a qualifier left over from the enclosing declaration cannot be
-            // taken as this parameter's.
-            self.attrs.parsing_address_space = AddressSpace::Default;
-            self.attrs.take_storage_classes();
-            if let Some(mut type_spec) = self.parse_type_specifier() {
-                // Wrap the parameter's OWN vector attribute into its base
-                // spec, before any pointer/array declarator layers (vector-1.c).
-                type_spec = self.apply_param_vector_attr(type_spec);
-                // Snapshot the declaration-level named address space NOW, before
-                // the declarator parser runs (the same rule struct fields follow
-                // in parse_struct_fields). `struct c __seg_gs *p` records
-                // `__seg_gs` in `parsing_address_space`; without this read the
-                // parameter's pointer was built with AddressSpace::Default and
-                // every `p->member` load was emitted without the %gs prefix
-                // (kernel: srcu_read_unlock_fast's per-CPU counter pointer).
-                let param_addr_space = std::mem::take(&mut self.attrs.parsing_address_space);
-                let param_span = self.peek_span();
-                // Capture whether the base type (before pointer declarators) was const.
-                // For `const int *p`, parsing_const is true here; the `*` is handled below.
-                let param_is_const = self.attrs.parsing_const();
-                let param_is_volatile = self.attrs.parsing_volatile();
-                let param_is_atomic = self.attrs.parsing_atomic();
-                let param_base_restrict = self.attrs.parsing_restrict();
-                let (
-                    name,
-                    pointer_depth,
-                    array_dims,
-                    is_func_ptr,
-                    ptr_to_array_dims,
-                    fptr_param_decls,
-                    fptr_variadic,
-                    fptr_has_prototype,
-                    inner_ptr_depth,
-                    param_is_restrict,
-                    paren_ptr_total,
-                    star_quals,
-                    paren_star_quals,
-                    outer_fn_returns,
-                ) = self.parse_param_declarator_full();
-                let adjusted_cvr = self.attrs.param_adjusted_cvr;
-                self.check_parameter_storage(
-                    name.as_deref(),
-                    param_span,
-                    param_addr_space,
-                    pointer_depth == 0
-                        && inner_ptr_depth == 0
-                        && array_dims.is_empty()
-                        && ptr_to_array_dims.is_empty()
-                        && !is_func_ptr,
-                );
-                self.merge_param_post_align();
-                // Direct `__attribute__((aligned(N)))` / `_Alignas(...)`
-                // spellings on the parameter: captured during declarator
-                // parsing. `take()` also prevents leakage into the NEXT
-                // parameter (the save/reset pattern above covers const and
-                // noreturn, but parsed_alignas was never reset here).
-                let param_alignment = self.attrs.parsed_alignas.take();
-                let param_alignas_type = self.attrs.parsed_alignas_type.take();
-                self.skip_gcc_extensions();
-
-                // Apply pointer levels. A named address space qualifies the
-                // memory the INNERMOST pointer points into (GCC: `T __seg_gs **pp`
-                // makes only `*pp` a %gs access), so it lands on the first level
-                // built, exactly as `apply_declaration_address_space` places it
-                // for declarations. The outer levels stay ordinary memory.
-                //
-                // The pointer levels split around a pointee ARRAY suffix.  A
-                // parenthesized pointer-to-array declarator binds its stars from
-                // the OUTSIDE (`(*p)[N]` is `Pointer(Array(T, N))`, and
-                // `(**p)[N]` — the kernel's `const char (**names)[ETH_GSTRING_LEN]`
-                // in net/ethtool/privflags.c — is `Pointer(Pointer(Array(T, N)))`),
-                // while the leading stars bind to the base type from the inside
-                // (`int *(*p)[N]` is `Pointer(Array(Pointer(int), N))`).  Applying
-                // every pointer level first built the first shape as
-                // `Pointer(Array(Pointer(T), N))` — one pointer level attached to
-                // the wrong side of the array — so the kernel rejected a correct
-                // argument to `ethnl_get_priv_flags_info`.
-                let leading_depth = if paren_ptr_total > 0 {
-                    pointer_depth + 1 - paren_ptr_total
-                } else {
-                    pointer_depth
-                };
-                let trailing_depth = if paren_ptr_total > 0 {
-                    paren_ptr_total
-                } else {
-                    0
-                };
-                for level in 0..leading_depth {
-                    // Level L's pointee is the storage of the pointer built by the
-                    // star before it, so it takes that star's qualifier.
-                    let space = if level == 0 {
-                        param_addr_space
-                    } else {
-                        star_quals
-                            .get(level as usize - 1)
-                            .map(|(space, _)| *space)
-                            .unwrap_or(AddressSpace::Default)
-                    };
-                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), space);
-                }
-                // Pointer-to-array: int (*p)[N][M], int (**p)[N][M]
-                if !ptr_to_array_dims.is_empty() {
-                    for dim in ptr_to_array_dims.iter().rev() {
-                        type_spec = TypeSpecifier::Array(Box::new(type_spec), dim.clone());
-                    }
-                }
-                // CVR of each pointer level in creation order: wrap `L` builds
-                // level `L+1`, and the star written at that position owns its
-                // qualifiers (`int *const *p`: level 1 is const). Stars inside
-                // the parenthesised group are counted separately and keep their
-                // own representation; unknown levels stay 0.
-                let mut pointer_quals = vec![0u8; pointer_depth as usize];
-                for (index, (_, cvr)) in star_quals.iter().enumerate() {
-                    if let Some(slot) = pointer_quals.get_mut(index) {
-                        *slot = *cvr;
-                    }
-                }
-                for _ in 0..trailing_depth {
-                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
-                }
-
-                // Wrap any outer return-type function-pointer layers (from outermost
-                // to innermost) before decaying the parameter's own function/array core.
-                for (ret_params, ret_variadic, ret_has_prototype, extra_ptrs) in
-                    outer_fn_returns.into_iter().rev()
-                {
-                    type_spec = TypeSpecifier::FunctionPointer(
-                        Box::new(type_spec),
-                        ret_params,
-                        ret_variadic,
-                        ret_has_prototype,
-                        crate::common::types::CallingConvention::Default,
-                    );
-                    for _ in 0..extra_ptrs {
-                        type_spec =
-                            TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
-                    }
-                }
-
-                // Array params: outermost dimension decays to pointer.
-                // Preserve the outermost dimension expression (if any) so side effects
-                // like `a++` in `int b[a++]` can be evaluated during IR lowering.
-                // (Inner dimensions are preserved in type_spec and evaluated by
-                // compute_vla_param_strides).
-                let mut vla_size_exprs = Vec::with_capacity(2);
-                // The dimension of an adjusted array of pointers to function
-                // or array (`(*h[n++])(void)`): evaluated at entry like any
-                // other, its type lives in the group's stars.
-                if let Some(expr) = self.attrs.param_group_array_dim.take() {
-                    vla_size_exprs.push(expr);
-                }
-                if !array_dims.is_empty() {
-                    if let Some(Some(expr)) = array_dims.first() {
-                        vla_size_exprs.push((**expr).clone());
-                    }
-                    for dim in array_dims.iter().skip(1).rev() {
-                        type_spec = TypeSpecifier::Array(Box::new(type_spec), dim.clone());
-                    }
-                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
-                }
-
-                // Function pointers decay to pointer
-                if is_func_ptr {
-                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
-                }
-
-                let param_pointer_const = self.attrs.parsing_pointer_const();
-                self.attrs.set_const(saved_const);
-                self.attrs.set_pointer_const(saved_pointer_const);
-                self.attrs.set_restrict(saved_restrict);
-                self.attrs.set_noreturn(saved_noreturn);
-                params.push(ParamDecl {
-                    type_spec,
-                    name,
-                    alignment: param_alignment,
-                    alignas_type: param_alignas_type,
-                    fptr_params: fptr_param_decls,
-                    fptr_variadic,
-                    fptr_has_prototype,
-                    fptr_calling_convention: self
-                        .attrs
-                        .parsing_calling_convention
-                        .take()
-                        .unwrap_or_default(),
-                    is_const: param_is_const,
-                    is_volatile: param_is_volatile,
-                    is_atomic: param_is_atomic,
-                    is_restrict: param_is_restrict,
-                    vla_size_exprs,
-                    decayed_array: !array_dims.is_empty(),
-                    fptr_inner_ptr_depth: inner_ptr_depth,
-                    pointer_depth,
-                    pointer_const: param_pointer_const,
-                    pointer_quals,
-                    base_restrict: param_base_restrict,
-                    paren_star_quals,
-                    adjusted_cvr,
-                });
-            } else {
-                self.attrs.set_const(saved_const);
-                self.attrs.set_pointer_const(saved_pointer_const);
-                self.attrs.set_restrict(saved_restrict);
-                self.attrs.set_noreturn(saved_noreturn);
+            let Some(param) = self.parse_single_param_decl() else {
                 break;
+            };
+            if let Some(pname) = param.name.as_deref() {
+                if self.is_parser_enum_constant(pname) {
+                    self.hide_enum_constant(pname);
+                }
+                if self.typedefs.contains(pname) && !self.shadowed_typedefs.contains(pname) {
+                    self.shadowed_typedefs.insert(pname.to_string());
+                }
             }
+            params.push(param);
 
             if !self.consume_if(&TokenKind::Comma) {
                 break;
             }
         }
 
+        self.param_list_depth -= 1;
+        self.shadowed_typedefs = saved_shadowed;
+        self.restore_enum_scope(enum_mark);
+
         self.expect_closing(&TokenKind::RParen, open);
         (params, variadic, true)
+    }
+
+    /// Parse one typed parameter declaration inside a parameter list.
+    fn parse_single_param_decl(&mut self) -> Option<ParamDecl> {
+        // Save noreturn before skip_gcc_extensions() so that a noreturn attribute
+        // on a function pointer parameter (e.g. `__attribute__((__noreturn__)) fn_ptr_t`)
+        // doesn't leak to the enclosing function declaration.
+        let saved_noreturn = self.attrs.parsing_noreturn();
+        // Parse pre-name GCC attributes (e.g. `__attribute__((aligned(16))) int x`)
+        // instead of skipping them, so a pre-name aligned attribute is
+        // honored exactly like the _Alignas pre-name spelling.
+        let (_, pre_align, _, _, _) = self.parse_gcc_attributes();
+        if let Some(a) = pre_align {
+            self.attrs.parsed_alignas = Some(
+                self.attrs
+                    .parsed_alignas
+                    .map_or(a, |prev: usize| prev.max(a)),
+            );
+        }
+        // Save and reset parsing_const to detect if this parameter's base type is const.
+        let saved_const = self.attrs.parsing_const();
+        self.attrs.set_const(false);
+        // The pointer-star `const` is per parameter too (`f(int a, int
+        // *const p)` must not leak p's star const into `a`'s declarator).
+        let saved_pointer_const = self.attrs.parsing_pointer_const();
+        self.attrs.set_pointer_const(false);
+        // Likewise `restrict`: an earlier parameter's star or specifier
+        // (`int *restrict *a, const char **b`) is not `b`'s.
+        let saved_restrict = self.attrs.parsing_restrict();
+        self.attrs.set_restrict(false);
+        // Each parameter's volatile and typedef qualifiers are its own
+        // (`VI p, int y`: `y` is not volatile), so clear them before its
+        // specifiers are parsed. Likewise `_Atomic`.
+        self.attrs.set_volatile(false);
+        self.attrs.set_atomic(false);
+        self.attrs.set_typedef_use(false);
+        self.attrs.set_typedef_object_volatile(false);
+        self.attrs.set_noreturn(saved_noreturn);
+        // Each parameter's named address space is its own.
+        self.attrs.parsing_address_space = AddressSpace::Default;
+        self.attrs.take_storage_classes();
+        let Some(mut type_spec) = self.parse_type_specifier() else {
+            self.attrs.set_const(saved_const);
+            self.attrs.set_pointer_const(saved_pointer_const);
+            self.attrs.set_restrict(saved_restrict);
+            self.attrs.set_noreturn(saved_noreturn);
+            return None;
+        };
+        // Wrap the parameter's OWN vector attribute into its base
+        // spec, before any pointer/array declarator layers (vector-1.c).
+        type_spec = self.apply_param_vector_attr(type_spec);
+        // Snapshot the declaration-level named address space NOW, before
+        // the declarator parser runs.
+        let param_addr_space = std::mem::take(&mut self.attrs.parsing_address_space);
+        let param_span = self.peek_span();
+        // Capture whether the base type (before pointer declarators) was const.
+        let param_is_const = self.attrs.parsing_const();
+        let param_is_volatile = self.attrs.parsing_volatile();
+        let param_is_atomic = self.attrs.parsing_atomic();
+        let param_base_restrict = self.attrs.parsing_restrict();
+        let (
+            name,
+            pointer_depth,
+            array_dims,
+            is_func_ptr,
+            ptr_to_array_dims,
+            fptr_param_decls,
+            fptr_variadic,
+            fptr_has_prototype,
+            inner_ptr_depth,
+            param_is_restrict,
+            paren_ptr_total,
+            star_quals,
+            paren_star_quals,
+            outer_fn_returns,
+        ) = self.parse_param_declarator_full();
+        let adjusted_cvr = self.attrs.param_adjusted_cvr;
+        self.check_parameter_storage(
+            name.as_deref(),
+            param_span,
+            param_addr_space,
+            pointer_depth == 0
+                && inner_ptr_depth == 0
+                && array_dims.is_empty()
+                && ptr_to_array_dims.is_empty()
+                && !is_func_ptr,
+        );
+        self.merge_param_post_align();
+        let param_alignment = self.attrs.parsed_alignas.take();
+        let param_alignas_type = self.attrs.parsed_alignas_type.take();
+        self.skip_gcc_extensions();
+
+        let leading_depth = if paren_ptr_total > 0 {
+            pointer_depth + 1 - paren_ptr_total
+        } else {
+            pointer_depth
+        };
+        let trailing_depth = if paren_ptr_total > 0 {
+            paren_ptr_total
+        } else {
+            0
+        };
+        for level in 0..leading_depth {
+            let space = if level == 0 {
+                param_addr_space
+            } else {
+                star_quals
+                    .get(level as usize - 1)
+                    .map(|(space, _)| *space)
+                    .unwrap_or(AddressSpace::Default)
+            };
+            type_spec = TypeSpecifier::Pointer(Box::new(type_spec), space);
+        }
+        // Pointer-to-array: int (*p)[N][M], int (**p)[N][M]
+        if !ptr_to_array_dims.is_empty() {
+            for dim in ptr_to_array_dims.iter().rev() {
+                type_spec = TypeSpecifier::Array(Box::new(type_spec), dim.clone());
+            }
+        }
+        let mut pointer_quals = vec![0u8; pointer_depth as usize];
+        for (index, (_, cvr)) in star_quals.iter().enumerate() {
+            if let Some(slot) = pointer_quals.get_mut(index) {
+                *slot = *cvr;
+            }
+        }
+        for _ in 0..trailing_depth {
+            type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
+        }
+
+        // Wrap any outer return-type function-pointer layers (from outermost
+        // to innermost) before decaying the parameter's own function/array core.
+        for (ret_params, ret_variadic, ret_has_prototype, extra_ptrs) in
+            outer_fn_returns.into_iter().rev()
+        {
+            type_spec = TypeSpecifier::FunctionPointer(
+                Box::new(type_spec),
+                ret_params,
+                ret_variadic,
+                ret_has_prototype,
+                crate::common::types::CallingConvention::Default,
+            );
+            for _ in 0..extra_ptrs {
+                type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
+            }
+        }
+
+        // Array params: outermost dimension decays to pointer.
+        let mut vla_size_exprs = Vec::with_capacity(2);
+        if let Some(expr) = self.attrs.param_group_array_dim.take() {
+            vla_size_exprs.push(expr);
+        }
+        if !array_dims.is_empty() {
+            if let Some(Some(expr)) = array_dims.first() {
+                vla_size_exprs.push((**expr).clone());
+            }
+            for dim in array_dims.iter().skip(1).rev() {
+                type_spec = TypeSpecifier::Array(Box::new(type_spec), dim.clone());
+            }
+            type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
+        }
+
+        // Function pointers decay to pointer
+        if is_func_ptr {
+            type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
+        }
+
+        let param_pointer_const = self.attrs.parsing_pointer_const();
+        self.attrs.set_const(saved_const);
+        self.attrs.set_pointer_const(saved_pointer_const);
+        self.attrs.set_restrict(saved_restrict);
+        self.attrs.set_noreturn(saved_noreturn);
+        Some(ParamDecl {
+            type_spec,
+            name,
+            alignment: param_alignment,
+            alignas_type: param_alignas_type,
+            fptr_params: fptr_param_decls,
+            fptr_variadic,
+            fptr_has_prototype,
+            fptr_calling_convention: self
+                .attrs
+                .parsing_calling_convention
+                .take()
+                .unwrap_or_default(),
+            is_const: param_is_const,
+            is_volatile: param_is_volatile,
+            is_atomic: param_is_atomic,
+            is_restrict: param_is_restrict,
+            vla_size_exprs,
+            decayed_array: !array_dims.is_empty(),
+            fptr_inner_ptr_depth: inner_ptr_depth,
+            pointer_depth,
+            pointer_const: param_pointer_const,
+            pointer_quals,
+            base_restrict: param_base_restrict,
+            paren_star_quals,
+            adjusted_cvr,
+        })
     }
 
     /// A direct `__attribute__((vector_size(N)))` in a PARAMETER's declaration
