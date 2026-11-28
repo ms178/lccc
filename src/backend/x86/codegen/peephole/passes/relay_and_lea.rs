@@ -2459,6 +2459,52 @@ const PURE_PRODUCERS_3OP_PFX: &[crate::backend::peephole_common::Pfx] = &[
     crate::backend::peephole_common::Pfx::new("sarxq "),
 ];
 
+/// A producer that moves out of a vector or a mask register into a general
+/// one, as `(mnemonic and its space, sources, destination)`:
+///
+/// ```text
+///     vmovq %xmm0, %rax            vpextrq $1, %xmm0, %rax
+///     pmovmskb %xmm0, %eax         kmovw %k1, %eax
+///     movmskps %xmm0, %eax         cvttsd2si %xmm0, %eax
+/// ```
+///
+/// Each reads its sources, writes the one general register it names in
+/// full (the 32-bit forms zero-extend) and leaves the flags alone, which is
+/// all a pure producer is. The code generator computes every such result
+/// in `%rax` and copies it to the register the value lives in; retargeted,
+/// the copy is gone.
+///
+/// The source must be a vector or mask register. The same mnemonics with a
+/// general source move the other way (`vmovq %rax, %xmm0`, `kmovw %eax,
+/// %k1`) and have no general destination; with a memory source they are
+/// loads, which are not this function's (`movq (%rax), %rcx` is on the
+/// list above, `kmovw (%rax), %k1` writes a mask register). The width of
+/// the destination is the width of the operation (`cvttsd2si` to `%eax`
+/// and to `%rax` are two conversions), and the caller keeps it.
+fn vector_to_gp_producer(line: &str) -> Option<(&str, &str, &str)> {
+    let (mnemonic, rest) = line.split_once(' ')?;
+    let base = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
+    let (sources, destination) = match base {
+        "movd" | "movq" | "pmovmskb" | "movmskps" | "movmskpd" | "cvtss2si" | "cvtsd2si"
+        | "cvttss2si" | "cvttsd2si" | "cvtss2sil" | "cvtsd2sil" | "cvttss2sil" | "cvttsd2sil"
+        | "cvtss2siq" | "cvtsd2siq" | "cvttss2siq" | "cvttsd2siq" => split_two_operands(rest)?,
+        "pextrb" | "pextrw" | "pextrd" | "pextrq" | "extractps" => split_three_operands_last(rest)?,
+        // The mask moves have no VEX-prefixed spelling of their own.
+        "kmovb" | "kmovw" | "kmovd" | "kmovq" if base.len() == mnemonic.len() => {
+            split_two_operands(rest)?
+        }
+        _ => return None,
+    };
+    // The register the value comes out of is the last source: an immediate
+    // precedes it in the three-operand forms.
+    let from = sources.rsplit(',').next()?.trim_ascii();
+    let out_of_a_register = ["%xmm", "%ymm", "%zmm", "%k"].iter().any(|bank| {
+        from.strip_prefix(bank)
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+    });
+    out_of_a_register.then(|| (&line[..=mnemonic.len()], sources, destination))
+}
+
 /// Split `src1, src2, dst` into `("src1, src2", "dst")`, keeping the sources
 /// verbatim so the caller can re-emit them and still test them for register
 /// references as a group.
@@ -2653,6 +2699,7 @@ fn retarget_producer_into_copy_impl(
                             split_three_operands_last(&prod[p.len()..]).map(|(s, d)| (p, s, d))
                         })
                 })
+                .or_else(|| vector_to_gp_producer(prod))
         else {
             i += 1;
             continue;
@@ -9399,6 +9446,151 @@ mod rmw_window_tests {
             .collect::<Vec<_>>();
         let removed = (0..store.len()).filter(|&i| infos[i].is_nop()).count();
         (emitted, removed)
+    }
+
+    /// The body of `f` behind the pass, without the frame of the fixture.
+    fn body(text: &str) -> Vec<String> {
+        let (emitted, _) = run(text);
+        emitted[3..emitted.len() - 1].to_vec()
+    }
+
+    /// A value moved out of a vector or a mask register is computed in
+    /// `%rax` and copied to where it lives: the producer writes that
+    /// register instead. `%rax` is written again behind the copy, as it is
+    /// behind every result but the last, which is what makes it dead.
+    #[test]
+    fn a_value_out_of_a_vector_or_mask_register_lands_where_it_lives() {
+        for (producer, copy, retargeted) in [
+            ("vmovq %xmm0, %rax", "movq %rax, %rdi", "vmovq %xmm0, %rdi"),
+            ("movd %xmm0, %eax", "movq %rax, %r8", "movd %xmm0, %r8d"),
+            ("vmovd %xmm3, %eax", "movl %eax, %esi", "vmovd %xmm3, %esi"),
+            (
+                "pmovmskb %xmm0, %eax",
+                "movq %rax, %rsi",
+                "pmovmskb %xmm0, %esi",
+            ),
+            (
+                "vpmovmskb %ymm0, %eax",
+                "movl %eax, %r9d",
+                "vpmovmskb %ymm0, %r9d",
+            ),
+            (
+                "movmskps %xmm0, %eax",
+                "movq %rax, %rdx",
+                "movmskps %xmm0, %edx",
+            ),
+            (
+                "vmovmskpd %ymm0, %eax",
+                "movq %rax, %r10",
+                "vmovmskpd %ymm0, %r10d",
+            ),
+            ("kmovw %k1, %eax", "movq %rax, %rsi", "kmovw %k1, %esi"),
+            ("kmovd %k1, %eax", "movl %eax, %r11d", "kmovd %k1, %r11d"),
+            ("kmovq %k1, %rax", "movq %rax, %rdi", "kmovq %k1, %rdi"),
+            (
+                "cvttsd2si %xmm0, %eax",
+                "movq %rax, %rsi",
+                "cvttsd2si %xmm0, %esi",
+            ),
+            (
+                "vcvtss2si %xmm0, %rax",
+                "movq %rax, %r9",
+                "vcvtss2si %xmm0, %r9",
+            ),
+            (
+                "vpextrq $1, %xmm0, %rax",
+                "movq %rax, %r8",
+                "vpextrq $1, %xmm0, %r8",
+            ),
+            (
+                "pextrw $3, %xmm0, %eax",
+                "movq %rax, %rdi",
+                "pextrw $3, %xmm0, %edi",
+            ),
+            (
+                "extractps $2, %xmm0, %eax",
+                "movl %eax, %edx",
+                "extractps $2, %xmm0, %edx",
+            ),
+        ] {
+            let text = format!("    {producer}\n    {copy}\n    xorl %eax, %eax\n    ret");
+            assert_eq!(
+                body(&text),
+                vec![
+                    retargeted.to_string(),
+                    "xorl %eax, %eax".into(),
+                    "ret".into()
+                ],
+                "{producer}; {copy}"
+            );
+        }
+    }
+
+    /// What must stay: a 64-bit result under a copy that keeps half of it
+    /// (the 32-bit form of the producer is another operation), the same
+    /// mnemonics moving INTO a vector or mask register, a load, a store,
+    /// and a result `%rax` still carries behind the copy.
+    #[test]
+    fn a_producer_that_is_not_a_register_to_register_move_out_is_left() {
+        for (producer, copy, then) in [
+            ("vmovq %xmm0, %rax", "movl %eax, %edi", "xorl %eax, %eax"),
+            (
+                "cvttsd2si %xmm0, %rax",
+                "movl %eax, %esi",
+                "xorl %eax, %eax",
+            ),
+            ("kmovq %k1, %rax", "movl %eax, %edi", "xorl %eax, %eax"),
+            ("vmovq %rax, %xmm0", "movq %rax, %rdi", "xorl %eax, %eax"),
+            ("kmovw %eax, %k1", "movq %rax, %rsi", "xorl %eax, %eax"),
+            ("kmovw (%rdi), %k1", "movq %rax, %rsi", "xorl %eax, %eax"),
+            ("kmovw %k1, %k2", "movq %rax, %rsi", "xorl %eax, %eax"),
+            (
+                "vpextrq $1, %xmm0, (%rdi)",
+                "movq %rax, %r8",
+                "xorl %eax, %eax",
+            ),
+            ("pmovmskb %xmm0, %eax", "movq %rax, %rsi", "addl %esi, %eax"),
+        ] {
+            let text = format!("    {producer}\n    {copy}\n    {then}\n    ret");
+            assert_eq!(
+                body(&text),
+                vec![producer.to_string(), copy.into(), then.into(), "ret".into()],
+                "{producer}; {copy}; {then}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_move_out_parser_takes_the_register_forms_only() {
+        use super::vector_to_gp_producer as parse;
+        assert_eq!(parse("kmovw %k1, %eax"), Some(("kmovw ", "%k1", "%eax")));
+        assert_eq!(
+            parse("vpextrd $1, %xmm12, %eax"),
+            Some(("vpextrd ", "$1, %xmm12", "%eax"))
+        );
+        assert_eq!(
+            parse("vmovmskps %ymm0, %eax"),
+            Some(("vmovmskps ", "%ymm0", "%eax"))
+        );
+        for line in [
+            "movq (%rax), %rcx",
+            "movd 8(%rsp), %xmm0",
+            "vmovq %rax, %xmm0",
+            "kmovw %eax, %k1",
+            "kmovw (%rax), %k1",
+            "vkmovw %k1, %eax",
+            "pextrd $1, (%rax), %eax",
+            "kmovw %k, %eax",
+            "kmovw %k1x, %eax",
+            "movzbl %al, %eax",
+            "vpaddd %xmm0, %xmm1, %xmm2",
+            "pmovmskb",
+        ] {
+            assert_eq!(parse(line), None, "{line}");
+        }
+        // A move between two mask registers parses; its destination is not a
+        // general register, which is the caller's test.
+        assert_eq!(parse("kmovw %k1, %k2"), Some(("kmovw ", "%k1", "%k2")));
     }
 
     #[test]

@@ -1389,6 +1389,11 @@ gate "x86-asm-register-operands" fast \
 # else names, and generated programs run against GCC's build of them.
 gate "x86-zmm-homes" fast \
     python3 tests/regression/check_x86_zmm_homes.py --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# The integer a SIMD operation returns: in a register, with no stack traffic
+# and no vector copy around it, as long as GCC's function, and equal to it.
+gate "x86-simd-integer-results" fast \
+    python3 tests/regression/check_x86_simd_integer_results.py --lccc "$LCCC" \
+        --gcc "${GCC16:-gcc-16}"
 # `-mprefer-vector-width=` is a cost-model request, so its gate is a codegen
 # gate, not a macro gate: it compares the register class lccc picks against
 # GCC for the same command line, proves the flag moves no predefined macro,

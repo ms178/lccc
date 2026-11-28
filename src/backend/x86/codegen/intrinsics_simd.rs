@@ -394,6 +394,47 @@ impl X86Codegen {
         true
     }
 
+    /// The second source of a 512-bit `vpcmp*` as the operand the
+    /// instruction reads it from: the register it is in, or its 64 bytes.
+    ///
+    /// The second source is the instruction's register-or-memory operand
+    /// and EVEX asks no alignment of it, so a value that is in no register
+    /// is compared where it is: `vpcmpd $1, (%rdx), %zmm0, %k1` is one
+    /// instruction and one fused micro-operation where the load into
+    /// `%zmm1` and the compare were two of each (GCC 16.2 and Clang 23.1.5
+    /// both write the memory form). A value a register already holds is
+    /// read there, without the copy to `%zmm1` the loader made.
+    ///
+    /// The order is the loader's (`evex_load_arg_to`), with the global in
+    /// front of the memory it is a case of: the home, the symbol, a claim
+    /// at this width, the memory the value's address can be named as, the
+    /// address through `%rax`. The same 64 bytes are read at the same
+    /// place in the instruction stream, so nothing faults that did not;
+    /// and no register is written, so no claim is evicted and the upper
+    /// halves of `%ymm0..15` stay as clean as they were.
+    ///
+    /// The 256- and 128-bit forms keep the loader: their operands have
+    /// more representations than a pointer (a deferred load, a value
+    /// assigned to a vector register), and each is the loader's to read.
+    fn mask_cmp_source_512(&mut self, arg: &Operand) -> String {
+        if let Some(home) = self.zmm_home_of(arg) {
+            return format!("%{home}");
+        }
+        if let Some(memory) = self.mask_cmp_global_mem(arg) {
+            return memory;
+        }
+        if let Operand::Value(value) = arg {
+            if let Some(held) = self.state.vec_live_zmm(value.0) {
+                return format!("%{held}");
+            }
+            if let Some(memory) = self.value_ptr_mem_operand(value.0) {
+                return memory;
+            }
+        }
+        self.operand_to_reg(arg, "rax");
+        "(%rax)".to_string()
+    }
+
     /// Narrowest `kmov*` for a `vpcmp*` result, chosen from the LANE COUNT.
     ///
     /// An EVEX mask write leaves the destination k register's bits above KL
@@ -2298,23 +2339,19 @@ impl X86Codegen {
                 } else {
                     0
                 };
-                if let (Some(home), "zmm1") = (self.zmm_home_of(&args[1]), reg_b) {
-                    self.state.emit_fmt(format_args!(
-                        "    {} ${}, %{}, %{}, %k1",
-                        inst, imm, home, reg_a
-                    ));
+                // The second source is the register-or-memory operand.
+                let b = if reg_b == "zmm1" {
+                    self.mask_cmp_source_512(&args[1])
                 } else if let Some(mem) = self.mask_cmp_global_mem(&args[1]) {
-                    self.state.emit_fmt(format_args!(
-                        "    {} ${}, {}, %{}, %k1",
-                        inst, imm, mem, reg_a
-                    ));
+                    mem
                 } else {
                     self.simd_load_arg_to(&args[1], reg_b);
-                    self.state.emit_fmt(format_args!(
-                        "    {} ${}, %{}, %{}, %k1",
-                        inst, imm, reg_b, reg_a
-                    ));
-                }
+                    format!("%{reg_b}")
+                };
+                self.state.emit_fmt(format_args!(
+                    "    {} ${}, {}, %{}, %k1",
+                    inst, imm, b, reg_a
+                ));
                 let (kmov, kmov_dst) =
                     Self::mask_compare_kmov(inst, op.mask_compare_vector_width().unwrap_or(64));
                 self.state
@@ -4994,10 +5031,225 @@ mod zmm_home_tests {
         assert!(cg.state.dirty_upper_ymm);
     }
 
+    /// A 512-bit mask compare reads its second source where it is: the
+    /// register it lives in or its 64 bytes, never a copy in `%zmm1`. With
+    /// the first source in a register above 15 nothing below 16 is
+    /// written, and nothing asks for `vzeroupper`.
+    #[test]
+    fn a_mask_compare_reads_its_second_source_where_it_is() {
+        const RESULT: u32 = 5;
+        let args = [
+            Operand::Value(Value(0)),
+            Operand::Value(Value(1)),
+            Operand::Const(IrConst::I32(1)),
+        ];
+        let compare = |op: IntrinsicOp, places: &[Place]| {
+            let mut cg = codegen(places, None);
+            cg.reg_assignments
+                .insert(RESULT, crate::backend::regalloc::PhysReg(15));
+            assert!(cg.emit_simd_op(&Some(Value(RESULT)), &op, &None, &args));
+            let text = cg.state.out.buf.clone();
+            let line = text
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("vpcmp"))
+                .unwrap_or_else(|| panic!("no compare:\n{text}"))
+                .to_string();
+            (line, text, cg.state.dirty_upper_ymm)
+        };
+        let names = codegen(&[], None);
+        let slot = |value: u32| names.slot_ref(slot_of(value));
+        // A register by its whole name: `%zmm16` names no `%zmm1`.
+        let names_register = |text: &str, register: &str| {
+            text.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|word| word == register)
+        };
+        let op = IntrinsicOp::CmpEpi32Mask512;
+
+        let (line, text, dirty) = compare(op, &[Place::Memory, Place::Memory]);
+        assert_eq!(
+            line,
+            format!("vpcmpd $1, {}, %zmm0, %k1", slot(1)),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("vmovdqu64 {}, %zmm0", slot(0))),
+            "{text}"
+        );
+        assert!(!names_register(&text, "zmm1"), "{text}");
+        assert!(dirty, "%zmm0 was written");
+
+        let (line, text, dirty) = compare(op, &[Place::Home(16), Place::Memory]);
+        assert_eq!(
+            line,
+            format!("vpcmpd $1, {}, %zmm16, %k1", slot(1)),
+            "{text}"
+        );
+        assert!(
+            !names_register(&text, "zmm0") && !names_register(&text, "zmm1"),
+            "{text}"
+        );
+        assert!(!dirty, "no register below 16 was written:\n{text}");
+
+        let (line, text, dirty) = compare(op, &[Place::Memory, Place::Home(17)]);
+        assert_eq!(line, "vpcmpd $1, %zmm17, %zmm0, %k1", "{text}");
+        assert!(!names_register(&text, "zmm1"), "{text}");
+        assert!(dirty);
+
+        let (line, text, dirty) = compare(op, &[Place::Home(16), Place::Home(17)]);
+        assert_eq!(line, "vpcmpd $1, %zmm17, %zmm16, %k1", "{text}");
+        assert!(
+            !text.contains('('),
+            "registers alone name no memory:\n{text}"
+        );
+        assert!(!dirty);
+
+        // One object compared with itself: read twice where it is.
+        let same = [args[0], args[0], args[2]];
+        let mut cg = codegen(&[Place::Memory], None);
+        cg.reg_assignments
+            .insert(RESULT, crate::backend::regalloc::PhysReg(15));
+        assert!(cg.emit_simd_op(&Some(Value(RESULT)), &op, &None, &same));
+        let text = cg.state.out.buf.clone();
+        assert!(
+            text.contains(&format!("vpcmpd $1, {}, %zmm0, %k1", slot(0))),
+            "{text}"
+        );
+
+        // The mask leaves through `%rax` into the register of the result.
+        let tail: Vec<&str> = text.lines().map(str::trim).rev().take(2).collect();
+        assert_eq!(tail, ["movq %rax, %rsi", "kmovw %k1, %eax"], "{text}");
+    }
+
     #[test]
     #[should_panic(expected = "is read ymm")]
     fn reading_a_part_of_a_homed_object_is_refused() {
         let mut cg = codegen(&[Place::Home(16)], None);
         cg.evex_load_arg_to(&Operand::Value(Value(0)), "ymm0");
+    }
+}
+
+/// The contract `regalloc` relies on when it gives the integer result of a
+/// SIMD operation a register (`X86_64_INTEGER_RESULTS`): the emitter takes
+/// the operation, writes no register the allocator gives out on the way,
+/// and ends by moving `%rax` into the result's register.
+#[cfg(test)]
+mod integer_result_contract_tests {
+    use super::*;
+    use crate::backend::regalloc::PhysReg;
+    use crate::backend::state::StackSlot;
+    use crate::backend::x86_common::X86_64_INTEGER_RESULTS;
+
+    const DEST: u32 = 9;
+
+    /// Every spelling of the registers of the allocator's pools: `%rbx`,
+    /// `%r12`..`%r15` and `%rbp`; `%r8`..`%r11`, `%rdi`, `%rsi` and `%rdx`.
+    /// `%rax` and `%rcx` are the emitters' scratch and are in neither.
+    fn is_allocatable(register: &str) -> bool {
+        const LEGACY: &[&str] = &[
+            "rbx", "ebx", "bx", "bl", "bh", "rbp", "ebp", "bp", "bpl", "rdi", "edi", "di", "dil",
+            "rsi", "esi", "si", "sil", "rdx", "edx", "dx", "dl", "dh",
+        ];
+        LEGACY.contains(&register)
+            || register
+                .strip_prefix('r')
+                .map(|rest| rest.trim_end_matches(['d', 'w', 'b']))
+                .and_then(|number| number.parse::<u8>().ok())
+                .is_some_and(|number| (8..=15).contains(&number))
+    }
+
+    fn arguments(op: IntrinsicOp) -> Vec<Operand> {
+        use IntrinsicOp::*;
+        let a = Operand::Value(Value(0));
+        let b = Operand::Value(Value(1));
+        let immediate = Operand::Const(IrConst::I32(1));
+        if op.mask_compare_vector_width().is_some() {
+            vec![a, b, immediate]
+        } else if matches!(op, TestzPs128 | TestzPs256 | Testz128) {
+            vec![a, b]
+        } else if matches!(
+            op,
+            ExtractPs128 | Pextrb128 | Pextrw128 | Pextrd128 | Pextrq128
+        ) {
+            vec![a, immediate]
+        } else {
+            vec![a]
+        }
+    }
+
+    /// The text of `op` with its operands in memory and its result in
+    /// `home`.
+    fn emitted(op: IntrinsicOp, home: PhysReg) -> String {
+        let mut cg = X86Codegen::new();
+        cg.state.value_use_counts = vec![1; 10];
+        for value in [0, 1] {
+            cg.state
+                .value_locations
+                .insert(value, StackSlot(-64 * (i64::from(value) + 1)));
+            cg.state.vector_values.insert(value);
+        }
+        cg.reg_assignments.insert(DEST, home);
+        cg.emit_intrinsic_impl(&Some(Value(DEST)), &op, &None, &arguments(op));
+        cg.state.out.buf.clone()
+    }
+
+    #[test]
+    fn the_names_of_the_pools_are_told_from_the_scratch() {
+        for register in [
+            "rbx", "r12d", "r15", "bpl", "r8b", "r11w", "esi", "dil", "dx",
+        ] {
+            assert!(is_allocatable(register), "{register}");
+        }
+        for register in [
+            "rax", "eax", "al", "rcx", "cl", "rsp", "xmm0", "k1", "r16", "r7",
+        ] {
+            assert!(!is_allocatable(register), "{register}");
+        }
+    }
+
+    #[test]
+    fn every_listed_operation_lands_its_result_in_the_register_it_is_given() {
+        assert_eq!(X86_64_INTEGER_RESULTS.len(), 48);
+        // %rsi and %r12: one of each pool.
+        for (home, name) in [(PhysReg(15), "rsi"), (PhysReg(2), "r12")] {
+            for &op in X86_64_INTEGER_RESULTS {
+                let text = emitted(op, home);
+                let lines: Vec<&str> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .collect();
+                let (landing, body) = lines
+                    .split_last()
+                    .unwrap_or_else(|| panic!("{op:?} emitted nothing"));
+                let forms = [
+                    format!("movq %rax, %{name}"),
+                    format!("movl %eax, %{}", name32(name)),
+                ];
+                assert!(
+                    forms.iter().any(|form| *landing == form.as_str()),
+                    "{op:?} does not end by landing %rax in %{name}:\n{text}"
+                );
+                assert!(!body.is_empty(), "{op:?} computes nothing:\n{text}");
+                for line in body {
+                    let written = line.rsplit(',').next().unwrap_or(line).trim();
+                    if let Some(register) = written.strip_prefix('%') {
+                        assert!(
+                            !is_allocatable(register),
+                            "{op:?} writes %{register} before it lands:\n{text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The 32-bit name of a 64-bit register name.
+    fn name32(name: &str) -> String {
+        match name.strip_prefix('r') {
+            Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => format!("{name}d"),
+            Some(rest) => format!("e{rest}"),
+            None => name.to_string(),
+        }
     }
 }

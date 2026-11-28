@@ -4829,6 +4829,24 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 } if x86_fp_pool && !is_32bit => {
                     eligible.insert(dest.0);
                 }
+                // x86-64 SIMD operations with an integer result: a mask, a
+                // lane, a conversion, a test. Their emitters compute in
+                // %rax with %xmm0/%xmm1/%k1 as scratch, none allocatable,
+                // and land the result with the register-aware
+                // `store_rax_to` (`x86_64_integer_result_in_accumulator` is
+                // the list and says how it is held to the emitters). In a
+                // slot, the compare that nearly always follows read it back
+                // from memory.
+                Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op,
+                    ..
+                } if x86_fp_pool
+                    && !is_32bit
+                    && crate::backend::x86_common::x86_64_integer_result_in_accumulator(*op) =>
+                {
+                    eligible.insert(dest.0);
+                }
                 // The halves of a full adder: created for x86-64 alone
                 // (`passes::carry_chain`), whose emitter computes in
                 // %rax/%rcx and lands both results with `store_rax_to`. In a

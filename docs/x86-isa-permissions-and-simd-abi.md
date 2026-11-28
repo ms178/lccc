@@ -522,6 +522,56 @@ the object a register instead of a stack slot at the end of the pipeline:
 again at code generation, and a function for which it no longer holds is
 compiled without homes; `CCC_VERIFY_IR=1` reports such a function.
 
+### 2.3 Integer results of vector operations
+
+`_mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) == 0xffff` asks whether two
+blocks are equal. It is a vector operation whose result is an integer,
+followed by integer code, and four things stood between the two:
+
+* **The result had no register.** The mask, movemask, extract, conversion
+  and test operations (`x86_common::X86_64_INTEGER_RESULTS`, 48 of them)
+  were not register candidates, so the result went to a stack slot and
+  the compare behind it read the slot. They are candidates now. Their
+  emitters compute in `%xmm0`, `%xmm1`, `%k1` and `%rax`, none of which
+  the allocator gives out, and write the result after the last operand is
+  read; `integer_result_contract_tests` runs each of the 48 with its
+  result in a register and holds it to that.
+* **A result in a register was computed in `%rax` and copied.** The
+  peephole's producer retarget (`retarget_producer_into_copy`) knows the
+  instructions that move a value out of a vector or mask register
+  (`pmovmskb`, `movmskps`, `movd`, `pextrw`, `cvttsd2si`, `kmovw`, ...) and
+  writes the destination directly. A 64-bit result under a 32-bit copy
+  is left alone.
+* **The copies around the operand outlived the passes that remove them.**
+  An operation that takes its operand through a pointer has the operand
+  stored and loaded again; store forwarding turns the pair into a
+  register copy in phase 2, behind the last turn of the vector copy
+  passes. Those four passes run again in phase 3. `pmovmskb`, `movmskps`
+  and `movmskpd` are listed with the one vector register they read;
+  unlisted, they read all of them and kept every copy alive.
+* **A 512-bit mask compare loaded its second source.** `vpcmp*` takes a
+  register or memory there, and EVEX asks no alignment: the operand is
+  compared where it is (`mask_cmp_source_512`), and the `kmov` behind it
+  is a plain write for the peephole, with the zero-extension its width
+  gives.
+
+Instructions, `ret` included, at `-O2`:
+
+| Function | before | now | GCC 16.2 | Clang 23.1.5 |
+|---|---|---|---|---|
+| `_mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) == 0xffff` | 12, with a frame | 6 | 6 | 6 |
+| `_mm_movemask_epi8(_mm_cmpeq_epi8(a, b))` | 6 | 3 | 3 | 3 |
+| `_mm_cvtsi128_si32(_mm_add_epi32(a, b))` | 5 | 3 | 3 | 3 |
+| `_mm_movemask_ps(_mm_cmplt_ps(a, b))` | 5 | 3 | 3 | 3 |
+| `_mm512_cmpge_epu32_mask(a, b) == 0xffff`, two loads | 13, with a frame | 8 | 7 | 7 |
+| `_mm512_mask_cmplt_epi32_mask(k, a, b)`, two loads | 10 | 7 | 6 | 6 |
+
+Open, and recorded in the gate at the length they have: a mask is moved
+to a general register and compared there where GCC tests it in place
+(`kortestw`); a mask operand `k` is combined in a general register where
+GCC compares under it; and three 256-bit shapes (a 32-byte value that goes
+through a slot stays there).
+
 ## 3. Call-frame information
 
 Code generation never writes `.cfi_*` directives. `backend/cfi_synth.rs`
@@ -548,6 +598,8 @@ instructions.
 | `tests/regression/check_x86_mflag_effects.py` | `-mharden-sls=`, `-mcld`, `notrack` on the jump of a `switch` under `-fcf-protection=branch`, the `-pg` names and negatives: shape per function against GCC, and the program run |
 | `tests/regression/check_x86_asm_register_operands.py` | `asm` operands in `ymm`, `zmm`, mask and MMX registers (§2.1): the statement's text line for line, GCC's template and diagnostics, generated statements run against GCC's build |
 | `tests/regression/check_x86_zmm_homes.py` | 512-bit objects in `zmm16`..`zmm31` (§2.2): the instructions of chains, copies and a loop; no register above 15 anywhere with the homes off; no home given up at code generation; generated programs run at every level against GCC's build |
+| `tests/regression/check_x86_simd_integer_results.py` | Integer results of vector operations (§2.3): no stack traffic, no vector copy, no `%zmm1` in a mask compare, length against GCC's function measured in the run, the open shapes at their recorded length; the probe run against GCC's build where the CPU has the extension |
+| `integer_result_contract_tests` (unit) | Each of the 48 operations whose result may live in a register: the emitter takes it, writes no allocatable register on the way, and writes the result last |
 | `every_signature_holds_for_its_emitter` (unit) | Each operation a homed object may be an operand of, with its operands in registers, in memory and shared with the result: the value the destination ends with is the one the all-in-memory path computes |
 | `x86_macro_gate_tests` (unit) | XSAVE precedence, the AES/PCLMUL/GFNI announcement split, the POPCNT unwind matrix, sticky `-mno-mmx`, `-mprefer-vector-width=` parsing |
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |

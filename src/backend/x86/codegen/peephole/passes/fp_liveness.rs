@@ -882,6 +882,13 @@ pub(super) fn known_explicit_vector_inputs(mn: &str, operands: &str) -> bool {
                 | "ptest"
                 | "testpd"
                 | "testps"
+                // A sign mask out of a vector register into a general one:
+                // the source is the only vector input, and no vector
+                // register is written. Unlisted, each read as every vector
+                // register at once, and kept every copy in front of it.
+                | "pmovmskb"
+                | "movmskps"
+                | "movmskpd"
                 | "pcmpistri"
                 | "pcmpistrm"
                 | "pcmpestri"

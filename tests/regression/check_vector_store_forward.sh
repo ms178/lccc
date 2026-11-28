@@ -147,7 +147,7 @@ check_budget() {
         echo "FAIL: $name costs $on instructions (budget $budget)" >&2
         fail=1; return
     fi
-    echo "  ok  $name costs $on instruction(s) (budget $budget; register-homed, pass-off $(body "$WORK/off.s" "$name"))"
+    echo "  ok  $name costs $on instruction(s) (budget $budget; pass-off $(body "$WORK/off.s" "$name"))"
 }
 
 # check <name> <budget>: the forwarded body must fit the budget, the disabled
@@ -177,19 +177,25 @@ check() {
 
 # Measured, -O2 -mavx2, `on / off (GCC 16.2)`:
 #   float_256   loop store of a computed 256-bit value   14 / 18 (13)
-#   int_128     one 128-bit integer store                 3 /  4 (3)
+#   int_128     one 128-bit integer store                 3 /  3 (3)
 #   ps_256      single-shot 256-bit float store           4 /  8 (3, GCC
 #                                                        omits vzeroupper)
 #   chain_256   loop-invariant splats + forwarded store 22 / 24 (17)
-#   two_stores  one value read by two whole-vector stores 4 /  9 (4)
+#   two_stores  one value read by two whole-vector stores 4 /  8 (4)
 check float_256 14
-check int_128 3
+# int_128 is budget-only. Without the pass its temporary is 16 bytes, which
+# store forwarding in the peephole turns into a register copy
+# (`vmovdqu %xmm14, %xmm0; vmovdqu %xmm0, (%rdi)`), and the vector copy
+# passes that run behind store forwarding now remove that copy: 3 with the
+# pass and 3 without, where it was 3 and 4. A wider temporary has no such
+# second way out (ps_256 is still 8 without the pass).
+check_budget int_128 3
 check ps_256 4
 # chain_256 is budget-only. Its 256-bit result now has a YMM register home
 # (the straight-line 256-bit allocator in regalloc.rs), so the frame temporary
 # that the pass forwards no longer exists with or without the pass: the
 # counterfactual is 22 as well, below the 24 the pass used to save. The pass
-# still has a measured cost on float_256, int_128, ps_256 and two_stores above.
+# still has a measured cost on float_256, ps_256 and two_stores.
 # The budget still guards the forwarded body.
 check_budget chain_256 22
 

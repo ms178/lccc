@@ -924,6 +924,18 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
     // destinations; a GPR -> vector or memory destination never reaches it.
     {
         let mnemonic = trimmed.split([' ', '\t']).next().unwrap_or("");
+        // A mask register read into a general register (`kmovw %k1, %eax`,
+        // `kmovq %k1, %rax`) is the same kind of transfer: the 8-, 16- and
+        // 32-bit forms take a 32-bit register and zero-extend into it, the
+        // 64-bit form takes a 64-bit one, and none reads what was there.
+        // The other forms (into a mask register, to and from memory) have no
+        // general-register destination, so no caller asks about them. As a
+        // read of its destination, the `kmov` behind every AVX-512 compare
+        // kept whatever was in the register before it alive: the copy of a
+        // pointer in front of the compare, for one.
+        if matches!(mnemonic, "kmovb" | "kmovw" | "kmovd" | "kmovq") {
+            return false;
+        }
         let m = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
         if matches!(m, "movq" | "movd" | "pmovmskb" | "movmskps" | "movmskpd")
             || m.starts_with("pextr")

@@ -2406,6 +2406,16 @@ jobs:
       run: >-
         python3 tests/regression/check_x86_zmm_homes.py --lccc target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
+    # The integer a SIMD operation returns (a mask, a lane, a conversion):
+    # it lives in a register, nothing around it goes through the stack or
+    # copies a vector register, a 512-bit mask compare reads its second
+    # source where it is, and each function is as long as GCC's, give or
+    # take what the gate's table says and why. The probe is built by both
+    # compilers and run where the runner has the instructions.
+    - name: Verify the integer results of SIMD operations against GCC 16.2
+      run: >-
+        python3 tests/regression/check_x86_simd_integer_results.py --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
     - name: Verify x86 -mprefer-vector-width= against GCC 16.2
       run: >-
         python3 scripts/check_x86_prefer_vector_width.py target/fastbuild/lccc

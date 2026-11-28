@@ -2219,6 +2219,56 @@ fn peephole_optimize_inner(
                     local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos)
                 );
             }
+            // The vector copies store forwarding creates. An operation
+            // that takes its operand through a pointer (`pmovmskb`, `movd`,
+            // `movmskps` behind a register-valued compare or add) has the
+            // operand stored to a slot and loaded again; phase 2 turns
+            // that pair into a register copy, and the vector copy passes
+            // had their last turn in phase 1, before there was one:
+            //
+            //     movaps %xmm0, %xmm15
+            //     pcmpeqb %xmm1, %xmm15        pcmpeqb %xmm1, %xmm0
+            //     movdqu %xmm15, %xmm0    ->   pmovmskb %xmm0, %eax
+            //     pmovmskb %xmm0, %eax
+            //
+            // `_mm_movemask_epi8(_mm_cmpeq_epi8(a, b))` was five
+            // instructions against two from GCC 16.2 and Clang 23.1.5.
+            // The same four passes in phase 1's order, under their own
+            // switches; each is asked again only while something changed.
+            if has_vec {
+                if !sk("vector_copy_retarget") {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "retarget_vex_result",
+                        vector_copy::retarget_vex_result(&mut store, &mut infos)
+                    );
+                }
+                if !sk("vector_copy_bracket") {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "coalesce_vector_brackets",
+                        vector_copy::coalesce_vector_brackets(&mut store, &mut infos)
+                    );
+                }
+                if !sk("vector_copy_prop") {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "propagate_vector_copies",
+                        vector_copy::propagate_vector_copies(&mut store, &mut infos)
+                    );
+                }
+                if !sk("vector_copy_dead") {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "eliminate_dead_vector_copies",
+                        vector_copy::eliminate_dead_vector_copies(&store, &mut infos)
+                    );
+                }
+            }
             // Phase 2's copy propagation creates the LEA→memory shapes
             // phase 1's windowed folder never saw: `leaq K(%rax), %rax;
             // movq %rax, %rsi; movq $0, (%rsi)` loses the relay there
@@ -7155,9 +7205,13 @@ mod regression_tests {
             assert!(!out.contains(gone), "{gone}: {out}");
         }
         // The 16 bytes are still stored through %rsi on the fall-through
-        // path, and the branch keeps both returns distinct.
+        // path, and the branch keeps both returns distinct. The store reads
+        // the register the reload was forwarded from: the vector copy
+        // passes have a turn behind the forwarder now. (The copy itself
+        // stays: this text has no return markers, and without them a `ret`
+        // reads %xmm1.)
         assert!(out.contains("movdqu %xmm0, %xmm1"), "{out}");
-        assert!(out.contains("movdqu %xmm1, (%rsi)"), "{out}");
+        assert!(out.contains("movdqu %xmm0, (%rsi)"), "{out}");
         assert_eq!(
             out.lines().filter(|l| l.trim_ascii() == "ret").count(),
             2,

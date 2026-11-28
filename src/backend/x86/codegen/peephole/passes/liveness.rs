@@ -1041,6 +1041,10 @@ fn mnemonic_is_known(t: &str) -> bool {
         "vzeroupper",
         "vzeroall",
         "xgetbv",
+        // `kmov{b,w,d,q}`: every operand is explicit, and the only general
+        // register a form can write is its last operand (`is_read_modify_write`
+        // says it is written and not read).
+        "kmov",
     ];
     KNOWN.iter().any(|k| t.starts_with(k))
         // The central implicit-operand oracle doubles as a knowledge base:
@@ -3267,6 +3271,11 @@ mod tests {
             "cvttsd2si %xmm0, %rax",
             "vcvttss2si %xmm1, %eax",
             "vcvtsd2si %xmm2, %rcx",
+            // Mask register -> GPR.
+            "kmovb %k1, %eax",
+            "kmovw %k1, %eax",
+            "kmovd %k2, %r8d",
+            "kmovq %k3, %rax",
         ];
         for line in dest_only {
             assert!(
@@ -3348,6 +3357,63 @@ mod tests {
             .find(|&n| store.get(n).trim_ascii() == "movq %rdx, %rax")
             .expect("fixture has the copy");
         assert_eq!(lv.live_after(copy, 0), Some(false));
+    }
+
+    /// The `kmov` behind an AVX-512 compare writes its general register and
+    /// reads none: what the register held in front of the compare (here the
+    /// copy of a pointer the load went through) is dead behind its last
+    /// read. The other direction reads the general register and writes none.
+    #[test]
+    fn a_mask_moved_to_a_gpr_kills_it_and_a_gpr_moved_to_a_mask_reads_it() {
+        let (store, _infos, lv) = build(concat!(
+            ".text\nf:\n.cfi_startproc\n",
+            "    movq %rdx, %rax\n",
+            "    vmovdqu64 (%rax), %zmm1\n",
+            "    vpcmpd $1, %zmm1, %zmm0, %k1\n",
+            "    kmovw %k1, %eax\n",
+            "    andq %rax, %rdi\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        let line = |text: &str| {
+            (0..store.len())
+                .find(|&n| store.get(n).trim_ascii() == text)
+                .expect("the fixture has the line")
+        };
+        // Dead behind the load: the next thing that happens to %rax is a write.
+        assert_eq!(
+            lv.live_after(line("vmovdqu64 (%rax), %zmm1"), 0),
+            Some(false)
+        );
+        // Alive between the copy and the load, and behind the `kmovw`.
+        assert_eq!(lv.live_after(line("movq %rdx, %rax"), 0), Some(true));
+        assert_eq!(lv.live_after(line("kmovw %k1, %eax"), 0), Some(true));
+
+        let (store, _infos, lv) = build(concat!(
+            ".text\ng:\n.cfi_startproc\n",
+            "    movl %edi, %eax\n",
+            "    kmovw %eax, %k1\n",
+            "    kmovw %k1, (%rsi)\n",
+            "    kmovq (%rcx), %k2\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        let line = |text: &str| {
+            (0..store.len())
+                .find(|&n| store.get(n).trim_ascii() == text)
+                .expect("the fixture has the line")
+        };
+        // `kmovw %eax, %k1` reads %rax; the store and the load read their
+        // address registers and write no general register. (The load goes
+        // through %rcx: a `ret` without the return markers reads %rdx.)
+        assert_eq!(lv.live_after(line("movl %edi, %eax"), 0), Some(true));
+        assert_eq!(lv.live_after(line("kmovw %eax, %k1"), 0), Some(false));
+        assert_eq!(lv.live_after(line("kmovw %eax, %k1"), 6), Some(true));
+        assert_eq!(lv.live_after(line("kmovw %k1, (%rsi)"), 6), Some(false));
+        assert_eq!(lv.live_after(line("kmovw %k1, (%rsi)"), 1), Some(true));
+        assert_eq!(lv.live_after(line("kmovq (%rcx), %k2"), 1), Some(false));
     }
 
     fn build(asm: &str) -> (LineStore, Vec<LineInfo>, FileLiveness) {

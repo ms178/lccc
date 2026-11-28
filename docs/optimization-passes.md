@@ -447,7 +447,7 @@ passes; the backend peepholes are documented per backend
   the per-iteration skip count on its `phase1 iteration` lines.
 
   The same step's trigger-presence rule gates the audited FP/vector pass
-  family (28 pass names, 44 call sites across all phases) on one entry
+  family (28 pass names, 48 call sites across all phases) on one entry
   probe: a function whose text never names `%xmm`/`%ymm`/`%zmm` or
   `vzeroupper` cannot be mutated by passes whose rewrites are anchored on a
   parsed vector operand, so they are not invoked at all. The probe is
@@ -456,6 +456,20 @@ passes; the backend peepholes are documented per backend
   spent scanning the all-integer 40-function TU. `CCC_PEEPHOLE_NO_VEC_GATE=1`
   disables the gate for bisection; the equality oracle covers both
   directions in `dirty_ticks_tests.rs`.
+
+- **Vector copies behind store forwarding** (x86-64) — the four vector
+  copy passes (`retarget_vex_result`, `coalesce_vector_brackets`,
+  `propagate_vector_copies`, `eliminate_dead_vector_copies`) run in phase 1
+  and again in phase 3's loop. A vector operation whose operand goes through
+  a pointer (`pmovmskb`, `movd`, `movmskps` behind a compare or an add) has
+  the operand stored and loaded; phase 2 forwards the pair into a register
+  copy, which no phase-1 pass can have seen. The rerun sits under the same
+  vector trigger and the same `CCC_PEEPHOLE_SKIP` names as the first turn.
+  The producer retarget of the same phase (`retarget_producer_into_copy`)
+  also takes a value out of a vector or mask register straight into the
+  register that wants it. Measured and gated in
+  [x86-isa-permissions-and-simd-abi.md](x86-isa-permissions-and-simd-abi.md)
+  §2.3.
 
 - **Identical basic-block merging** (`merge_identical_blocks`) — a block is
   deleted and its predecessors retargeted when its instruction text matches

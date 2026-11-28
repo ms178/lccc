@@ -222,7 +222,12 @@ def main() -> int:
         if asm(gcc, fast_c, "-O3") == asm(gcc, fast_c, "-Ofast"):
             failures.append(
                 "-Ofast: GCC composition check is vacuous (oracle drift)")
-        if asm(lccc, opt, "-Ofast") == asm(lccc, opt):
+        # The option must change something, and the probe for that is the
+        # reduction too. On `opt.c` the difference was an accident of the
+        # code without `-O`: a frame and `cvttsd2sil %xmm2, %edi; movl %edi,
+        # %eax`. The peephole now makes the conversion write `%eax`, the
+        # frame goes with the copy, and the default is `-Ofast`'s four lines.
+        if asm(lccc, fast_c, "-Ofast") == asm(lccc, fast_c):
             failures.append("-Ofast: LCCC artifact unchanged from default")
         if not any(f.startswith("-Ofast") for f in failures):
             print("ledger -Ofast: PASS (== -O3 -ffast-math on scalar and packed "
