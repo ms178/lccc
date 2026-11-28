@@ -120,6 +120,8 @@ pub fn evaluate_condition(expr: &str, macros: &MacroTable) -> (bool, Vec<String>
     // rejecting the stray argument list, and hid other malformed conditions.
     let error = if tokens.is_empty() {
         Some("#if with no expression".to_string())
+    } else if let Some(err) = parser.error {
+        Some(err)
     } else if parser.pos < tokens.len() {
         Some(format!(
             "missing binary operator before token '{}'",
@@ -661,6 +663,7 @@ struct ExprParser<'a> {
     /// Parse inactive operands for grammar, but suppress their diagnostics.
     quiet: bool,
     undefined: Vec<String>,
+    error: Option<String>,
 }
 
 /// Result of a preprocessor expression: (bit_pattern_as_i64, is_unsigned)
@@ -673,6 +676,13 @@ impl<'a> ExprParser<'a> {
             pos: 0,
             quiet: false,
             undefined: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn set_error(&mut self, msg: impl Into<String>) {
+        if self.error.is_none() {
+            self.error = Some(msg.into());
         }
     }
 
@@ -722,6 +732,8 @@ impl<'a> ExprParser<'a> {
             let then_val = self.parse_comma();
             if self.peek_op(":") {
                 self.advance(); // :
+            } else {
+                self.set_error("expected ':' in conditional expression");
             }
             self.quiet = quiet || cond.0 != 0;
             let else_val = self.parse_ternary();
@@ -882,23 +894,33 @@ impl<'a> ExprParser<'a> {
             if self.peek_op("<<") {
                 self.advance();
                 let right = self.parse_additive();
-                // Shift: result has type of the left operand
-                let shift_amt = right.0 as u32;
-                if left.1 {
-                    left = ((left.0 as u64).wrapping_shl(shift_amt) as i64, true);
+                // Shift: result has type of the left operand.
+                // Rust wrapping_shl masks shift counts modulo 64, whereas GCC and
+                // Clang evaluate shift counts >= 64 (or negative) by shifting out.
+                if (!right.1 && right.0 < 0) || (right.0 as u64) >= 64 {
+                    left = (0, left.1);
                 } else {
-                    left = (left.0.wrapping_shl(shift_amt), left.1);
+                    let shift_amt = right.0 as u32;
+                    if left.1 {
+                        left = ((left.0 as u64).wrapping_shl(shift_amt) as i64, true);
+                    } else {
+                        left = (left.0.wrapping_shl(shift_amt), false);
+                    }
                 }
             } else if self.peek_op(">>") {
                 self.advance();
                 let right = self.parse_additive();
-                let shift_amt = right.0 as u32;
-                if left.1 {
-                    // Unsigned: logical shift right
-                    left = ((left.0 as u64).wrapping_shr(shift_amt) as i64, true);
+                if (!right.1 && right.0 < 0) || (right.0 as u64) >= 64 {
+                    left = (if left.1 || left.0 >= 0 { 0 } else { -1 }, left.1);
                 } else {
-                    // Signed: arithmetic shift right
-                    left = (left.0.wrapping_shr(shift_amt), false);
+                    let shift_amt = right.0 as u32;
+                    if left.1 {
+                        // Unsigned: logical shift right
+                        left = ((left.0 as u64).wrapping_shr(shift_amt) as i64, true);
+                    } else {
+                        // Signed: arithmetic shift right
+                        left = (left.0.wrapping_shr(shift_amt), false);
+                    }
                 }
             } else {
                 break;
@@ -1021,6 +1043,8 @@ impl<'a> ExprParser<'a> {
                 let val = self.parse_comma();
                 if self.peek() == Some(&ExprToken::RParen) {
                     self.advance();
+                } else {
+                    self.set_error("missing ')' in expression");
                 }
                 val
             }
@@ -1037,9 +1061,15 @@ impl<'a> ExprParser<'a> {
                 // defined() to 0 or 1, so identifiers here mean "not defined"
                 if let Some(ExprToken::Ident(_)) = self.peek() {
                     self.advance();
+                } else {
+                    self.set_error("operator \"defined\" requires an identifier");
                 }
-                if has_paren && self.peek() == Some(&ExprToken::RParen) {
-                    self.advance();
+                if has_paren {
+                    if self.peek() == Some(&ExprToken::RParen) {
+                        self.advance();
+                    } else {
+                        self.set_error("missing ')' after \"defined\"");
+                    }
                 }
                 // If we reach here during evaluation, the macro was not resolved
                 // at expansion time, so it's not defined
@@ -1061,8 +1091,14 @@ impl<'a> ExprParser<'a> {
                     }
                 }
             }
-            _ => {
-                self.advance(); // skip unknown
+            Some(ref tok) => {
+                let text = expr_token_text(tok);
+                self.set_error(format!("unexpected token '{text}' in expression"));
+                self.advance();
+                (0, false)
+            }
+            None => {
+                self.set_error("unexpected end of #if expression");
                 (0, false)
             }
         }

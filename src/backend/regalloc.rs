@@ -4335,11 +4335,23 @@ fn build_coalesce_groups(
                     .get(&v.0)
                     .copied()
                     .unwrap_or((IrType::I32, 0));
-                let widen_from_load = crate::common::types::target_is_32bit()
-                    && matches!(from_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16)
-                    && matches!(to_ty, IrType::I32 | IrType::U32)
-                    && load_def_types.get(&v.0).map(|&(ty, _)| ty) == Some(*from_ty)
-                    && load_uses >= 2;
+                let is_32bit = crate::common::types::target_is_32bit();
+                let widen_from_load = load_def_types.get(&v.0).map(|&(ty, _)| ty) == Some(*from_ty)
+                    && load_uses >= 2
+                    && if is_32bit {
+                        matches!(from_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16)
+                            && matches!(to_ty, IrType::I32 | IrType::U32)
+                    } else {
+                        // Unsigned sub-word loads (`movzbl`/`movzwl` on x86-64,
+                        // `ldrb`/`ldrh` on AArch64, `lbu`/`lhu` on RISC-V) zero-
+                        // extend the full 64-bit architectural register, so all
+                        // widening integer casts hold identical register bits.
+                        matches!(from_ty, IrType::U8 | IrType::U16)
+                            && matches!(
+                                to_ty,
+                                IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64
+                            )
+                    };
                 let (d, s) = (dest.0, v.0);
                 // ParamRef sources: the loop-carried-Copy rationale (the
                 // param's ABI home dies at a redefining Copy while the loop
@@ -4824,7 +4836,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         IntrinsicOp::VecHorizontalAddI32x4
                         | IntrinsicOp::VecHorizontalAddI32x8
                         | IntrinsicOp::VecHorizontalAddI64x2
-                        | IntrinsicOp::VecHorizontalAddI64x4,
+                        | IntrinsicOp::VecHorizontalAddI64x4
+                        | IntrinsicOp::UsubSat32,
                     ..
                 } if x86_fp_pool && !is_32bit => {
                     eligible.insert(dest.0);
@@ -4944,6 +4957,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 phi_coalesce.push(*cand);
             }
         }
+        prioritize_shared_src_phi_coalesce(
+            &mut phi_coalesce,
+            &liveness.block_loop_depth,
+            &use_count,
+        );
     }
     // A source defined *before* a caller-saved clobber in the same block
     // cannot inherit the phi dest's register unless that register is
@@ -5616,6 +5634,40 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 // sign temp the same %r11). Most-constrained wave first so its
                 // values are not starved by the later, freer waves.
                 let mut seeded: FxHashMap<PhysReg, Vec<(u32, u32)>> = FxHashMap::default();
+                let seed_owned_segs = (!config.ra_config.no_segment_scan)
+                    .then(|| owned_live_segments(&liveness, &coalesce_member_of));
+                let push_owner_seed =
+                    |seeded: &mut FxHashMap<PhysReg, Vec<(u32, u32)>>, vid: u32, reg: PhysReg| {
+                        let Some((start, end)) = allocation_owner_bounds(vid, &merged_of, &iv_map)
+                        else {
+                            return;
+                        };
+                        if end <= start {
+                            return;
+                        }
+                        // Seed spans are HALF-OPEN in the allocator
+                        // (`occupy_register` stores `end + 1`), while `iv_map`
+                        // ends are the last LIVE point. When a multi-segment owner
+                        // has proven liveness holes inside its envelope, seed its
+                        // guarded segments instead of locking the register across
+                        // dead inner loops (e.g. an outer accumulator read by a
+                        // trailing printf).
+                        if let Some(segs) = seed_owned_segs.as_ref().and_then(|m| m.get(&vid))
+                            && segs.len() > 1
+                            && segs.first().is_some_and(|&(s, _)| s >= start)
+                            && segs.last().is_some_and(|&(_, e)| e <= end)
+                        {
+                            let entry = seeded.entry(reg).or_default();
+                            for (s, e) in guard_internal_hole_boundaries(segs) {
+                                entry.push((s, e.saturating_add(1)));
+                            }
+                            return;
+                        }
+                        seeded
+                            .entry(reg)
+                            .or_default()
+                            .push((start, end.saturating_add(1)));
+                    };
 
                 // Wave 1: indirect-call args at index ≥ 1 — avoid the arg
                 // registers AND the indirect-target register (r10).
@@ -5637,24 +5689,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
                         caller_used_regs_set.insert(reg.0);
-                        if let Some((start, end)) =
-                            allocation_owner_bounds(*vid, &merged_of, &iv_map)
-                        {
-                            if end > start {
-                                // Seed spans are HALF-OPEN in the allocator
-                                // (`occupy_register` stores `end + 1`), while
-                                // `iv_map` ends are the last LIVE point: push
-                                // [start, end+1) or the final live point is
-                                // unseeded and a later wave reuses the
-                                // register on exactly that point (time_str:
-                                // arg0 [16,20] collided with arg2 [19,20] on
-                                // %r11 at the call staging point 20).
-                                seeded
-                                    .entry(*reg)
-                                    .or_default()
-                                    .push((start, end.saturating_add(1)));
-                            }
-                        }
+                        push_owner_seed(&mut seeded, *vid, *reg);
                     }
                 }
 
@@ -5689,15 +5724,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
                         caller_used_regs_set.insert(reg.0);
-                        if let Some(&(start, end)) = iv_map.get(vid) {
-                            if end > start {
-                                // Half-open seed span (see the Wave 1 note).
-                                seeded
-                                    .entry(*reg)
-                                    .or_default()
-                                    .push((start, end.saturating_add(1)));
-                            }
-                        }
+                        push_owner_seed(&mut seeded, *vid, *reg);
                     }
                 }
 
@@ -5799,17 +5826,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         for (vid, reg) in &alloc.assignments {
                             assignments.insert(*vid, *reg);
                             caller_used_regs_set.insert(reg.0);
-                            if let Some((start, end)) =
-                                allocation_owner_bounds(*vid, &merged_of, &iv_map)
-                            {
-                                if end > start {
-                                    // Half-open seed span (see the Wave 1 note).
-                                    seeded
-                                        .entry(*reg)
-                                        .or_default()
-                                        .push((start, end.saturating_add(1)));
-                                }
-                            }
+                            push_owner_seed(&mut seeded, *vid, *reg);
                         }
                     }
                 }
@@ -6385,6 +6402,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     free_callee,
                     &config.ra_config,
                 );
+                spill_allocator.phase2c_span_over_local = true;
                 // No `prefer_touched` here (measured, RA-CALLEE-STICKY):
                 // this scan cannot evict, so which overflow interval spills
                 // follows placement order; sticky placement spilled zstd's
@@ -7095,7 +7113,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // could hand the register to a value that fat-overlaps the survivor).
     // i686 validated this fill first (boot C text -1,573 B, stack refs
     // -13.1%); x86-64/AArch64/RISC-V get the same treatment now.
-    if !config.ra_config.no_segment_fill && !used_regs_set.is_empty() {
+    let i686_scratch = i686_scratch_pool(config);
+    if !config.ra_config.no_segment_fill
+        && (!used_regs_set.is_empty()
+            || (!i686_scratch && (!caller_used_regs_set.is_empty() || leaf_prefers_caller_saved)))
+    {
         let owner_of = |v: u32| coalesce_member_of.get(&v).copied().unwrap_or(v);
 
         let mut owned_segments = owned_live_segments(&liveness, &coalesce_member_of);
@@ -7105,6 +7127,37 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 .or_insert_with(|| vec![(iv.start, iv.end)]);
         }
 
+        let caller_pool: Vec<PhysReg> = if i686_scratch {
+            Vec::new()
+        } else {
+            config
+                .caller_saved_regs
+                .iter()
+                .copied()
+                .filter(|r| leaf_prefers_caller_saved || caller_used_regs_set.contains(&r.0))
+                .collect()
+        };
+        let entry_param_guard: FxHashSet<u32> =
+            if !ordered_param_homes && !config.call_arg_regs.is_empty() {
+                let mut guard = FxHashSet::default();
+                if let Some(block0) = func.blocks.first() {
+                    let mut later_params: usize = 0;
+                    for inst in block0.instructions.iter().rev() {
+                        if matches!(inst, Instruction::ParamRef { .. }) {
+                            later_params += 1;
+                        } else if later_params > 0 {
+                            if let Some(d) = inst.dest() {
+                                guard.insert(d.0);
+                            }
+                        }
+                    }
+                }
+                propagate_member_restrictions(&mut guard, &coalesce_member_of);
+                guard
+            } else {
+                FxHashSet::default()
+            };
+
         // Collapse current holders to one sorted occupancy set per register.
         // Testing candidates against owner-by-owner vectors is quadratic on
         // sqlite-sized CFGs; the union makes each query independent of the
@@ -7112,7 +7165,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         let mut occupied_by_reg: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
         let mut seen_holders: FxHashSet<(u8, u32)> = FxHashSet::default();
         for (&value, &reg) in &assignments {
-            if !used_regs_set.contains(&reg.0) {
+            let in_callee = used_regs_set.contains(&reg.0);
+            let in_caller = caller_pool.contains(&reg);
+            if !in_callee && !in_caller {
                 continue;
             }
             let owner = owner_of(value);
@@ -7191,9 +7246,40 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             let Some(candidate_segments) = owned_segments.get(&value) else {
                 continue;
             };
-            let Some(reg) =
+            let picked =
                 try_fill_segment_candidate(candidate_segments, &mut occupied_by_reg, &pool)
-            else {
+                    .or_else(|| {
+                        if caller_pool.is_empty()
+                            || call_spanning.contains(&value)
+                            || (!ordered_param_homes && param_restricted.contains(&value))
+                            || riscv_entry_guard.contains(&value)
+                            || entry_param_guard.contains(&value)
+                            || indirect_arg_values.contains(&value)
+                            || later_arg_values.contains_key(&value)
+                            || scratch_denied.contains(&value)
+                        {
+                            return None;
+                        }
+                        if fold_use_transfer.contains_key(&value) {
+                            let fold_caller: Vec<PhysReg> = caller_pool
+                                .iter()
+                                .copied()
+                                .filter(|r| config.fold_base_regs.contains(r))
+                                .collect();
+                            try_fill_segment_candidate(
+                                candidate_segments,
+                                &mut occupied_by_reg,
+                                &fold_caller,
+                            )
+                        } else {
+                            try_fill_segment_candidate(
+                                candidate_segments,
+                                &mut occupied_by_reg,
+                                &caller_pool,
+                            )
+                        }
+                    });
+            let Some(reg) = picked else {
                 continue;
             };
             if config.ra_config.debug_segment_fill {
@@ -14776,6 +14862,60 @@ struct PhiCallArgHazards<'a> {
     indirect_target_regs: &'a [PhysReg],
 }
 
+/// When multiple phi candidates share the same `backedge_src`, rank the
+/// deeper/hotter copy site first while preserving the relative order of
+/// distinct backedge sources.
+fn prioritize_shared_src_phi_coalesce(
+    phi_coalesce: &mut [PhiCoalesceCandidate],
+    block_loop_depth: &[u32],
+    use_count: &FxHashMap<u32, u64>,
+) {
+    let mut by_src: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+    for (idx, cand) in phi_coalesce.iter().enumerate() {
+        by_src.entry(cand.backedge_src).or_default().push(idx);
+    }
+    for indices in by_src.into_values() {
+        if indices.len() <= 1 {
+            continue;
+        }
+        let mut ranked: Vec<PhiCoalesceCandidate> =
+            indices.iter().map(|&i| phi_coalesce[i]).collect();
+        ranked.sort_by(|a, b| {
+            let da = block_loop_depth.get(a.block_idx).copied().unwrap_or(0);
+            let db = block_loop_depth.get(b.block_idx).copied().unwrap_or(0);
+            let wa = use_count.get(&a.phi_dest).copied().unwrap_or(0);
+            let wb = use_count.get(&b.phi_dest).copied().unwrap_or(0);
+            db.cmp(&da).then_with(|| wb.cmp(&wa))
+        });
+        for (slot, cand) in indices.into_iter().zip(ranked) {
+            phi_coalesce[slot] = cand;
+        }
+    }
+}
+
+/// Once a backedge source is already bound to an earlier applied phi edge,
+/// a second phi with a different register must not overwrite
+/// `assignments[backedge_src]` and break the first pair while leaving both
+/// pairs recorded in `applied`.
+fn phi_src_bound_to_other_reg(
+    applied: &[PhiCoalesceCandidate],
+    assignments: &FxHashMap<u32, PhysReg>,
+    backedge_src: u32,
+    reg: PhysReg,
+    phi_dest: u32,
+    ra_config: &RaConfig,
+) -> bool {
+    let blocked = applied.iter().any(|p| p.backedge_src == backedge_src)
+        && assignments.get(&backedge_src) != Some(&reg);
+    if blocked && ra_config.debug_phi_coalesce {
+        lccc::cli::stderr_line(format_args!(
+            "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: src already bound to another phi",
+            phi_dest, backedge_src, reg.0
+        ));
+    }
+    blocked
+}
+
 fn apply_phi_coalesce_assignments_with_config(
     func: &IrFunction,
     liveness: &LivenessResult,
@@ -14883,6 +15023,16 @@ fn apply_phi_coalesce_assignments_with_config(
         let Some(&reg) = assignments.get(&phi_dest) else {
             continue;
         };
+        if phi_src_bound_to_other_reg(
+            &applied,
+            &assignments,
+            backedge_src,
+            reg,
+            phi_dest,
+            ra_config,
+        ) {
+            continue;
+        }
 
         // Call-argument / indirect-target staging hazard: a secondary backedge
         // source that is also consumed at argument index >= 1 (or as an
@@ -21701,6 +21851,105 @@ mod scalar_lane_class_tests {
                 .any(|c| c.phi_dest == 10 && c.backedge_src == 11),
             "a middle-arm redefinition of the dest must refuse coalescing: {cands:?}"
         );
+    }
+
+    #[test]
+    fn apply_phi_coalesce_does_not_overwrite_already_bound_backedge_src() {
+        let mut f = IrFunction::new("two_phis_one_src".into(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Const(IrConst::I64(0)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Const(IrConst::I64(1)),
+                    },
+                ],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: vec![Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(2)),
+                    ty: IrType::U64,
+                }],
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Value(Value(3)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(2),
+                instructions: vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(3)),
+                }],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(3),
+                instructions: vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(3)),
+                }],
+                terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            },
+        ];
+        let liveness = compute_live_intervals(&f);
+        let cands = vec![
+            PhiCoalesceCandidate {
+                phi_dest: 1,
+                backedge_src: 3,
+                block_idx: 2,
+                copy_idx: 0,
+                source_block_idx: 1,
+                source_def_idx: 0,
+            },
+            PhiCoalesceCandidate {
+                phi_dest: 2,
+                backedge_src: 3,
+                block_idx: 3,
+                copy_idx: 0,
+                source_block_idx: 1,
+                source_def_idx: 0,
+            },
+        ];
+        let iv_map: FxHashMap<u32, (u32, u32)> = liveness
+            .intervals
+            .iter()
+            .map(|iv| (iv.value_id, (iv.start, iv.end)))
+            .collect();
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(10));
+        assignments.insert(2, PhysReg(11));
+        assignments.insert(3, PhysReg(12));
+        let applied = apply_phi_coalesce_assignments(
+            &f,
+            &liveness,
+            &iv_map,
+            &cands,
+            &mut assignments,
+            &[PhysReg(1)],
+        );
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].phi_dest, 1);
+        assert_eq!(assignments.get(&3).copied(), Some(PhysReg(10)));
     }
 }
 

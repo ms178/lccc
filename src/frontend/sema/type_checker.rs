@@ -14,7 +14,7 @@
 //! The `ExprTypeChecker` operates on immutable references and does not modify
 //! any state. It is designed to be called from `SemanticAnalyzer::analyze_expr`.
 
-use super::analysis::FunctionInfo;
+use super::analysis::{FunctionInfo, ParamOverlay};
 use super::type_context::TypeContext;
 use crate::common::fx_hash::FxHashMap;
 use crate::common::qualifiers;
@@ -24,6 +24,7 @@ use crate::frontend::parser::ast::{
     BinOp, BlockItem, CastQualifiers, CompoundStmt, DerivedDeclarator, Expr, ExprId,
     GenericAssociation, Stmt, StructFieldDecl, TypeSpecifier, UnaryOp,
 };
+use std::cell::RefCell;
 
 /// Expression type checker that infers CTypes using only sema-available state.
 ///
@@ -51,6 +52,8 @@ pub struct ExprTypeChecker<'a> {
     /// The TU is C90/C94: an overflowing signed left shift is still an
     /// integer constant expression (see `ice.rs`).
     pub pre_c99: bool,
+    /// Temporary parameter/enumerator scope active while resolving a parameter list.
+    pub(crate) param_overlay: Option<&'a RefCell<Vec<ParamOverlay>>>,
 }
 
 impl qualifiers::ConstLookup for ExprTypeChecker<'_> {
@@ -217,7 +220,8 @@ impl<'a> ExprTypeChecker<'a> {
         // Memoization: if this expression's type was already computed during
         // the bottom-up sema walk, return it in O(1) instead of re-traversing.
         // This prevents O(2^N) blowup on deep expression chains.
-        if let Some(cache) = self.expr_types {
+        let has_param_overlay = self.param_overlay.is_some_and(|o| !o.borrow().is_empty());
+        if !has_param_overlay && let Some(cache) = self.expr_types {
             if let Some(cached) = cache.get(&expr.id()) {
                 return Some(cached.clone());
             }
@@ -318,6 +322,19 @@ impl<'a> ExprTypeChecker<'a> {
                         Box::new(CType::plain_char()),
                         Some(text.len() + 1),
                     ));
+                }
+                if let Some(overlay) = self.param_overlay {
+                    let entries = overlay.borrow();
+                    for entry in entries.iter().rev() {
+                        match entry {
+                            ParamOverlay::Symbol(n, ty) | ParamOverlay::Enum(n, _, ty)
+                                if n == name =>
+                            {
+                                return Some(ty.clone());
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 // Objects/functions and enumerators share C's ordinary-name
                 // namespace (C11 6.2.3): the innermost visible declaration
@@ -1387,6 +1404,7 @@ impl<'a> ExprTypeChecker<'a> {
             folding_initializer: false,
             pre_c99: self.pre_c99,
             named_constants_only: false,
+            param_overlay: self.param_overlay,
         }
     }
 
@@ -2147,6 +2165,7 @@ mod qualifier_composition_tests {
             expr_types: None,
             builtin_policy: Default::default(),
             pre_c99: false,
+            param_overlay: None,
         };
         let span = Span::new(0, 1, 0);
         let array = Expr::Identifier("a".into(), span);

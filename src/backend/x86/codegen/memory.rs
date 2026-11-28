@@ -1158,6 +1158,9 @@ impl X86Codegen {
                             if let Some((fr, fold_dest)) = fold_target {
                                 self.note_inplace_compute(fr, fold_dest);
                             } else {
+                                if use_32bit_dest && matches!(ty, IrType::U8 | IrType::U16) {
+                                    self.zext_loaded_values.insert(dest.0);
+                                }
                                 self.note_inplace_compute(d_reg, dest.0);
                             }
                             return;
@@ -1225,6 +1228,8 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    {} (%rax), %{}", load_instr, d_name));
                     if fold_reg.is_some() {
                         self.fold_skip_cast = fold_target.map(|(_, c)| c);
+                    } else if use_32bit_dest && matches!(ty, IrType::U8 | IrType::U16) {
+                        self.zext_loaded_values.insert(dest.0);
                     }
                     return;
                 }
@@ -1279,6 +1284,10 @@ impl X86Codegen {
                         self.state.reg_cache.invalidate_acc();
                         if fold_reg.is_some() {
                             self.fold_skip_cast = fold_target.map(|(_, c)| c);
+                        } else if matches!(load_instr, "movzbl" | "movzwl")
+                            && matches!(ty, IrType::U8 | IrType::U16)
+                        {
+                            self.zext_loaded_values.insert(dest.0);
                         }
                         return;
                     }

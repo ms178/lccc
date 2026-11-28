@@ -332,22 +332,91 @@ fn fold_zext_copies_into_addresses(
         if j >= len || infos[j].is_nop() || !all_editable(infos, &[i, j]) {
             continue;
         }
-        if !matches!(infos[j].kind, LineKind::Other { .. }) {
+        if matches!(infos[j].kind, LineKind::Other { .. }) {
+            // Filter on borrowed text: the rewriter rejects most candidates,
+            // and the owned `new_text` it returns on acceptance is the only
+            // allocation this loop makes (allocate-before-filter ratchet).
+            let rewritten = rewrite_address_zext_use(infos[j].trimmed(store.get(j)), s_fam, d_fam);
+            let Some((new_text, needs_deadness)) = rewritten else {
+                continue;
+            };
+            if needs_deadness && !dead.dead_after(store, infos, j, d_fam, &[i, j]) {
+                continue;
+            }
+            replace_line(store, &mut infos[j], j, new_text);
+            mark_nop(&mut infos[i]);
+            dead.invalidate(store, infos, j);
+            changed = true;
             continue;
         }
-        // Filter on borrowed text: the rewriter rejects most candidates,
-        // and the owned `new_text` it returns on acceptance is the only
-        // allocation this loop makes (allocate-before-filter ratchet).
-        let rewritten = rewrite_address_zext_use(infos[j].trimmed(store.get(j)), s_fam, d_fam);
-        let Some((new_text, needs_deadness)) = rewritten else {
+        // Switch bounds-check + jump-table dispatch:
+        //   movl %Es, %Ed
+        //   cmpl $range, %Es   (or %Ed)
+        //   jcc  .Ldefault
+        //   jmpq *.Ljt_N(,%Rd,8)
+        // Because `cmpl` and `jcc` intervene, `copy_propagation` and the
+        // adjacent-line fold stop before `jmpq *`. When `FileLiveness` proves
+        // `%Rd` dead across BOTH `.Ldefault` and every `.Ljt_N` target, `%Rs`
+        // (whose upper 32 bits are zero) can index the jump table directly.
+        if s_fam == REG_RSP || infos[j].kind != LineKind::Cmp {
+            continue;
+        }
+        let jt = infos[j].trimmed(store.get(j));
+        let j_mnem = jt.split_whitespace().next().unwrap_or("");
+        if !matches!(j_mnem, "cmpb" | "cmpw" | "cmpl" | "cmpq") {
+            continue;
+        }
+        let b = next_non_debug(store, infos, j + 1, len);
+        let k = if b < len {
+            next_non_debug(store, infos, b + 1, len)
+        } else {
+            len
+        };
+        if b >= len
+            || k >= len
+            || infos[b].kind != LineKind::CondJmp
+            || infos[k].kind != LineKind::JmpIndirect
+            || infos[b].reg_refs != 0
+            || !all_editable(infos, &[i, j, b, k])
+        {
+            continue;
+        }
+        let d_mask = 1u16 << d_fam;
+        let new_cmp = if infos[j].reg_refs & d_mask == 0 {
+            None
+        } else {
+            let d32 = REG_NAMES[1][d_fam as usize];
+            let s32 = REG_NAMES[1][s_fam as usize];
+            let d64 = REG_NAMES[0][d_fam as usize];
+            if j_mnem == "cmpl"
+                && !jt.contains('(')
+                && count_reg_name_exact(jt, d64) == 0
+                && count_reg_name_exact(jt, REG_NAMES[2][d_fam as usize]) == 0
+                && count_reg_name_exact(jt, REG_NAMES[3][d_fam as usize]) == 0
+                && !(d_fam <= 3 && jt.contains(["%ah", "%ch", "%dh", "%bh"][d_fam as usize]))
+                && count_reg_name_exact(jt, d32) == 1
+            {
+                Some(format!("    {}", replace_reg_name_exact(jt, d32, s32)))
+            } else {
+                continue;
+            }
+        };
+        let Some((new_jmp, _)) =
+            rewrite_address_zext_use(infos[k].trimmed(store.get(k)), s_fam, d_fam)
+        else {
             continue;
         };
-        if needs_deadness && !dead.dead_after(store, infos, j, d_fam, &[i, j]) {
+        if !dead.dead_after_dropping_region(store, infos, b, i, k, d_fam)
+            || !dead.dead_after_dropping_region(store, infos, k, i, k, d_fam)
+        {
             continue;
         }
-        replace_line(store, &mut infos[j], j, new_text);
+        if let Some(cmp_text) = new_cmp {
+            replace_line(store, &mut infos[j], j, cmp_text);
+        }
+        replace_line(store, &mut infos[k], k, new_jmp);
         mark_nop(&mut infos[i]);
-        dead.invalidate(store, infos, j);
+        dead.invalidate(store, infos, k);
         changed = true;
     }
     changed
@@ -963,5 +1032,38 @@ mod tests {
     fn unlisted_memory_destination_clears_all() {
         let asm = "    movl %edx, %edx\n    vmovdqu %ymm0, (%rdi)\n    movl %edx, %edx\n";
         assert_eq!(survivors(asm, "movl %edx, %edx"), 2);
+    }
+
+    #[test]
+    fn switch_jump_table_zext_copy_folds_when_dead_everywhere() {
+        let asm = concat!(
+            "f:\n",
+            "    .cfi_startproc\n",
+            "    movzbl (%rdi), %eax\n",
+            "    movl %eax, %r11d\n",
+            "    cmpl $1, %eax\n",
+            "    jae .Ldef\n",
+            "    jmpq *.Ljt_0(,%r11,8)\n",
+            ".section .rodata\n",
+            ".align 8\n",
+            ".Ljt_0:\n",
+            "    .quad .Lc0\n",
+            ".section .text,\"ax\",@progbits\n",
+            ".Lc0:\n",
+            "    movl $10, %eax\n",
+            "    ret\n",
+            ".Ldef:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            "    .cfi_endproc\n",
+        );
+        let out = run_lines(asm).join("\n");
+        assert!(out.contains("jmpq *.Ljt_0(,%rax,8)"), "{out}");
+        assert!(!out.contains("movl %eax, %r11d"), "{out}");
+
+        let live_in_default = asm.replace("xorl %eax, %eax", "movl %r11d, %eax");
+        let kept = run_lines(&live_in_default).join("\n");
+        assert!(kept.contains("movl %eax, %r11d"), "{kept}");
+        assert!(kept.contains("jmpq *.Ljt_0(,%r11,8)"), "{kept}");
     }
 }

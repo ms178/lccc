@@ -64,10 +64,56 @@ static long long __attribute__((noinline)) shape_two(void)
          + tmp.tail[0] * 1000000 + tmp.tail[1] * 1000 + tmp.tail[2] + tmp.tail[3];
 }
 
+/* `shape_three` reads `tmp` first, writes `tmp` after its last read so `D`
+ * has no remaining reads, and reads `a` only after the write (`D_read ->
+ * D_write -> S_use`). Coalescing must still be refused so the write to `tmp`
+ * never clobbers `a`, regardless of whether `D` or `S` is read first. */
+static long long __attribute__((noinline)) shape_three(int flag)
+{
+    Big a;
+    init(&a, 11, 22, 30, 40, 50, 60);
+
+    long long acc = 0;
+    {
+        Big tmp = a;
+        acc += tmp.h.a * 100 + tmp.tail[0];
+        if (flag) {
+            tmp.h.a = 999;
+        }
+        tmp.tail[3] = 777;
+    }
+    return acc * 10000LL + a.h.a * 100 + a.tail[3];
+}
+
+/* `shape_four` runs a copy + write to `D` inside a loop whose header or post-
+ * loop observer reads `S`: a loop backedge from a `D_write` block back to `S`
+ * must likewise block coalescing. */
+static long long __attribute__((noinline)) shape_four(int n)
+{
+    Big a;
+    init(&a, 3, 4, 5, 6, 7, 8);
+    long long sum = 0;
+    for (int i = 0; i < n; i++) {
+        Big tmp = a;
+        sum += tmp.h.a + a.tail[1];
+        tmp.h.a += 100 + i;
+    }
+    return sum * 100 + a.h.a;
+}
+
 int main(void)
 {
     long long r1 = shape_one();
     long long r2 = shape_two();
-    printf("r1=%lld r2=%lld\n", r1, r2);
-    return (r1 == 11022077 && r2 == 505101202707LL) ? 0 : 1;
+    long long r3a = shape_three(0);
+    long long r3b = shape_three(1);
+    long long r4 = shape_four(3);
+    printf("r1=%lld r2=%lld r3a=%lld r3b=%lld r4=%lld\n", r1, r2, r3a, r3b, r4);
+    return (r1 == 11022077
+            && r2 == 505101202707LL
+            && r3a == 11301160LL
+            && r3b == 11301160LL
+            && r4 == 2703)
+        ? 0
+        : 1;
 }

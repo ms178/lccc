@@ -159,18 +159,12 @@ impl SemanticAnalyzer {
     pub(super) fn check_constexpr_initializer(
         &mut self,
         decl: &Declaration,
-        init_decl: &InitDeclarator,
+        _init_decl: &InitDeclarator,
         init: &Initializer,
-    ) {
-        let Some(ty) = self
-            .symbol_table
-            .lookup(&init_decl.name)
-            .map(|s| s.ty.clone())
-        else {
-            return;
-        };
+        ty: &CType,
+    ) -> Option<Vec<(String, crate::common::symbol_table::FoldedValue)>> {
         if matches!(ty, CType::Function(_)) {
-            return;
+            return None;
         }
         // The leaves that are no constant at all, by the static-initializer
         // rules (arithmetic or address constants), whatever the storage
@@ -195,12 +189,12 @@ impl SemanticAnalyzer {
         // A file-scope or `static` object's non-constant leaves were already
         // reported by `check_object_initializer`.
         let reported = decl.is_static() || self.symbol_table.at_file_scope();
-        let leaves = init_leaves(self, &ty, init);
+        let leaves = init_leaves(self, ty, init);
         // Members without an initializer are zero (C11 6.7.9p10); the
         // explicit values, recorded after, replace them.
         let explicit: Vec<&str> = leaves.iter().map(|l| l.path.as_str()).collect();
         let mut members = Vec::new();
-        self.implicit_zero_members(&ty, "", &explicit, &mut members);
+        self.implicit_zero_members(ty, "", &explicit, &mut members);
         let mut errors: Vec<(String, Span)> = Vec::new();
         for leaf in leaves {
             let span = leaf.expr.span();
@@ -232,7 +226,7 @@ impl SemanticAnalyzer {
             }
         }
         self.emit_constexpr_errors(errors);
-        self.symbol_table.mark_constexpr(&init_decl.name, members);
+        Some(members)
     }
 
     /// Validate a C23 `(constexpr T){...}` compound literal and record its

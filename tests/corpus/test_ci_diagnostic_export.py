@@ -7,7 +7,11 @@ import tempfile
 import unittest
 from unittest import mock
 
-import yaml
+try:
+    import yaml  # noqa: F401
+except ModuleNotFoundError as exc:  # pragma: no cover - host dependency
+    raise unittest.SkipTest("PyYAML is required (`pip install pyyaml`)") from exc
+
 from scripts import export_ci_diagnostics as export
 
 ROOT = Path(__file__).resolve().parents[2]

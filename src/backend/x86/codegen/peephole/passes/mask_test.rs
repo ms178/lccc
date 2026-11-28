@@ -130,7 +130,8 @@
 //! against that oracle instead of being re-derived here.
 
 use super::super::types::*;
-use super::flag_peepholes::flags_dead_after;
+use super::flag_peepholes::{flags_dead_after, is_byteless_comment};
+use super::helpers::{extract_jump_target, steps_over_line};
 use super::liveness::FileLiveness;
 
 /// The largest mask the *byte* forms can express: everything above bit 7 is
@@ -212,7 +213,7 @@ fn parse_zext_pair(t: &str) -> Option<(usize, RegId, RegId)> {
         .then_some((row, s_fam, d_fam))
 }
 
-/// A `setcc`/`jcc` whose condition does not consult `%sf`.
+/// A `setcc`/`jcc`/`cmovcc` whose condition does not consult `%sf`.
 ///
 /// `and`/`test` agree on ZF, CF, OF and PF, so only a condition that reads SF
 /// can distinguish them: the `s` pair, and the signed `l`/`g` families, which
@@ -223,10 +224,13 @@ fn condition_ignores_sf(t: &str) -> bool {
     let Some(mnemonic) = t.split_whitespace().next() else {
         return false;
     };
-    let Some(cond) = mnemonic
-        .strip_prefix("set")
-        .or_else(|| mnemonic.strip_prefix('j'))
-    else {
+    let cond = if let Some(c) = mnemonic.strip_prefix("set") {
+        c
+    } else if let Some(rest) = mnemonic.strip_prefix("cmov") {
+        rest.strip_suffix(['w', 'l', 'q']).unwrap_or(rest)
+    } else if let Some(c) = mnemonic.strip_prefix('j') {
+        c
+    } else {
         return false;
     };
     matches!(
@@ -301,11 +305,19 @@ fn find_reader(
     } else {
         (first, None)
     };
-    matches!(
+    let is_cmov = infos[reader]
+        .trimmed(store.get(reader))
+        .split_whitespace()
+        .next()
+        .is_some_and(|m| m.starts_with("cmov"));
+    if is_cmov && (infos[reader].reg_refs & (1u16 << fam) != 0) {
+        return None;
+    }
+    (matches!(
         infos[reader].kind,
         LineKind::CondJmp | LineKind::SetCC { .. }
-    )
-    .then_some((reader, mid))
+    ) || is_cmov)
+        .then_some((reader, mid))
 }
 
 /// Replace the mask at `idx` with the byte test and delete the redundant zero
@@ -387,6 +399,593 @@ fn fold_zext_test(
     true
 }
 
+fn parse_reg_pair_row(t: &str, row: usize) -> Option<(RegId, RegId)> {
+    let (_, rest) = t.split_once(char::is_whitespace)?;
+    let (src, dst) = rest.split_once(',')?;
+    let (src, dst) = (src.trim_ascii(), dst.trim_ascii());
+    let s_fam = register_family_fast(src);
+    let d_fam = register_family_fast(dst);
+    if s_fam > REG_GP_MAX || d_fam > REG_GP_MAX {
+        return None;
+    }
+    (src == REG_NAMES[row][s_fam as usize] && dst == REG_NAMES[row][d_fam as usize])
+        .then_some((s_fam, d_fam))
+}
+
+fn parse_movl_reg_reg(t: &str) -> Option<(RegId, RegId)> {
+    t.starts_with("movl ")
+        .then(|| parse_reg_pair_row(t, 1))
+        .flatten()
+        .filter(|&(s, d)| s != REG_RSP && s != REG_RBP && d != REG_RSP && d != REG_RBP && s != d)
+}
+
+fn parse_movq_reg_reg(t: &str) -> Option<(RegId, RegId)> {
+    t.starts_with("movq ")
+        .then(|| parse_reg_pair_row(t, 0))
+        .flatten()
+        .filter(|&(s, d)| s != REG_RSP && s != REG_RBP && d != REG_RSP && d != REG_RBP && s != d)
+}
+
+fn parse_shrl_one_reg32(t: &str) -> Option<RegId> {
+    let rest = t.strip_prefix("shrl ")?;
+    let (imm, dst) = rest.split_once(',')?;
+    if imm.trim_ascii() != "$1" {
+        return None;
+    }
+    let dst = dst.trim_ascii();
+    let fam = register_family_fast(dst);
+    (fam <= REG_GP_MAX && fam != REG_RSP && fam != REG_RBP && dst == REG_NAMES[1][fam as usize])
+        .then_some(fam)
+}
+
+fn parse_negl_reg32(t: &str) -> Option<RegId> {
+    let dst = t.strip_prefix("negl ")?.trim_ascii();
+    let fam = register_family_fast(dst);
+    (fam <= REG_GP_MAX && fam != REG_RSP && fam != REG_RBP && dst == REG_NAMES[1][fam as usize])
+        .then_some(fam)
+}
+
+fn parse_xorl_imm_reg32(t: &str) -> Option<(&str, RegId)> {
+    let rest = t.strip_prefix("xorl ")?;
+    let (imm, dst) = rest.split_once(',')?;
+    let (imm, dst) = (imm.trim_ascii(), dst.trim_ascii());
+    if !imm.starts_with('$') {
+        return None;
+    }
+    let imm_body = &imm[1..];
+    if imm_body.is_empty()
+        || !imm_body
+            .bytes()
+            .enumerate()
+            .all(|(k, b)| b.is_ascii_digit() || (k == 0 && b == b'-'))
+    {
+        return None;
+    }
+    let fam = register_family_fast(dst);
+    (fam <= REG_GP_MAX && fam != REG_RSP && fam != REG_RBP && dst == REG_NAMES[1][fam as usize])
+        .then_some((imm, fam))
+}
+
+fn parse_cmovne_reg32(t: &str) -> Option<(RegId, RegId)> {
+    let mnem = t.split_whitespace().next()?;
+    if !matches!(mnem, "cmovnel" | "cmovnzl") {
+        return None;
+    }
+    parse_reg_pair_row(t, 1)
+        .filter(|&(s, d)| s != REG_RSP && s != REG_RBP && d != REG_RSP && d != REG_RBP && s != d)
+}
+
+fn parse_mov_reg_reg_allow_rbp(t: &str) -> Option<(RegId, RegId)> {
+    if t.starts_with("movl ") {
+        parse_reg_pair_row(t, 1)
+    } else if t.starts_with("movq ") {
+        parse_reg_pair_row(t, 0)
+    } else {
+        None
+    }
+    .filter(|&(s, d)| s != REG_RSP && d != REG_RSP && s != d)
+}
+
+fn parse_cmovne_reg32_allow_rbp(t: &str) -> Option<(RegId, RegId)> {
+    let mnem = t.split_whitespace().next()?;
+    if !matches!(mnem, "cmovnel" | "cmovnzl") {
+        return None;
+    }
+    parse_reg_pair_row(t, 1).filter(|&(s, d)| s != REG_RSP && d != REG_RSP && s != d)
+}
+
+fn is_neutral_non_flag_op(t: &str, info: &LineInfo, s_fam: RegId, t_fam: RegId) -> bool {
+    let LineKind::Other { dest_reg: d } = info.kind else {
+        return false;
+    };
+    if d > REG_GP_MAX || d == s_fam || d == t_fam || d == REG_RSP || d == REG_RBP {
+        return false;
+    }
+    if info.reg_refs & (1u16 << t_fam) != 0 {
+        return false;
+    }
+    if t.split(',')
+        .next_back()
+        .is_some_and(|dst| dst.contains('('))
+    {
+        return false;
+    }
+    let Some(mnem) = t.split_whitespace().next() else {
+        return false;
+    };
+    matches!(
+        mnem,
+        "movb"
+            | "movw"
+            | "movl"
+            | "movq"
+            | "movzbl"
+            | "movzwl"
+            | "movsbl"
+            | "movswl"
+            | "movslq"
+            | "lea"
+            | "leal"
+            | "leaq"
+            | "addb"
+            | "addw"
+            | "addl"
+            | "addq"
+            | "subb"
+            | "subw"
+            | "subl"
+            | "subq"
+            | "xorl"
+            | "xorq"
+            | "orl"
+            | "orq"
+            | "andl"
+            | "andq"
+            | "shll"
+            | "shlq"
+            | "shrl"
+            | "shrq"
+            | "sarl"
+            | "sarq"
+            | "negl"
+            | "negq"
+            | "notl"
+            | "notq"
+    ) || (matches!(mnem, "imul" | "imull" | "imulq") && t.contains(','))
+}
+
+fn ensure_liveness<'a>(
+    liveness: &'a mut Option<FileLiveness>,
+    dirty: &mut u16,
+    store: &LineStore,
+    infos: &[LineInfo],
+    mask: u16,
+) -> &'a FileLiveness {
+    if *dirty & mask != 0 {
+        *dirty &= !mask;
+        *liveness = None;
+    }
+    liveness.get_or_insert_with(|| FileLiveness::new(store, infos))
+}
+
+/// True when flags after `from - 1` are provably dead either directly via
+/// `flags_dead_after` or across an immediate unconditional backward `jmp .Lhead`
+/// (e.g. a loop latch) whose loop header redefines all flags before any reader.
+fn crc_flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usize) -> bool {
+    if flags_dead_after(store, infos, from) {
+        return true;
+    }
+    let len = store.len();
+    let mut n = from;
+    while n < len {
+        let info = &infos[n];
+        if info.is_nop() {
+            n += 1;
+            continue;
+        }
+        let t = info.trimmed(store.get(n));
+        if steps_over_line(info, t) || is_byteless_comment(t) {
+            n += 1;
+            continue;
+        }
+        if info.kind == LineKind::Jmp
+            && let Some(target) = extract_jump_target(t)
+        {
+            let lo = n.saturating_sub(256);
+            for k in (lo..n).rev() {
+                if infos[k].is_nop() {
+                    continue;
+                }
+                let kt = infos[k].trimmed(store.get(k));
+                if infos[k].is_cfi_start() || infos[k].is_cfi_end() {
+                    break;
+                }
+                if infos[k].kind == LineKind::Label {
+                    let lbl = kt.strip_suffix(':').map(str::trim_ascii);
+                    if lbl == Some(target) {
+                        return flags_dead_after(store, infos, k + 1);
+                    }
+                    if lbl.is_some_and(|l| !l.starts_with(".L")) {
+                        break;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    false
+}
+
+/// Fold `movl %S, %D; shrl $1, %D; andl $1, %S; [movq %S, %T;] negl %T` into
+/// `movl %S, %D; shrl $1, %D; sbbl %T, %T` when flags after `negl` are dead
+/// (and when `movq` is present, `%S` is dead after `movq`).
+fn fold_crc_shift_and_neg(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    i0: usize,
+    liveness: &mut Option<FileLiveness>,
+    dirty: &mut u16,
+) -> bool {
+    let len = store.len();
+    let Some((s_fam, d_fam)) = parse_movl_reg_reg(infos[i0].trimmed(store.get(i0))) else {
+        return false;
+    };
+    let i1 = next_non_debug(store, infos, i0 + 1, len);
+    let i2 = next_non_debug(store, infos, i1 + 1, len);
+    let i3 = next_non_debug(store, infos, i2 + 1, len);
+    if i3 >= len || !all_editable(infos, &[i0, i1, i2, i3]) {
+        return false;
+    }
+    if parse_shrl_one_reg32(infos[i1].trimmed(store.get(i1))) != Some(d_fam) {
+        return false;
+    }
+    if parse_inplace_mask(infos[i2].trimmed(store.get(i2))) != Some((1, s_fam)) {
+        return false;
+    }
+    let (opt_mov, neg_idx, t_fam) =
+        if let Some((ms, md)) = parse_movq_reg_reg(infos[i3].trimmed(store.get(i3))) {
+            if ms != s_fam || md == d_fam {
+                return false;
+            }
+            let i4 = next_non_debug(store, infos, i3 + 1, len);
+            if i4 >= len || infos[i4].pinned || infos[i4].is_nop() {
+                return false;
+            }
+            (Some(i3), i4, md)
+        } else {
+            (None, i3, s_fam)
+        };
+    if parse_negl_reg32(infos[neg_idx].trimmed(store.get(neg_idx))) != Some(t_fam) {
+        return false;
+    }
+    if !crc_flags_dead_after(store, infos, neg_idx + 1) {
+        return false;
+    }
+    let query_mask = (1u16 << s_fam) | (1u16 << t_fam);
+    let lv = ensure_liveness(liveness, dirty, store, infos, query_mask);
+    if !lv.same_function(i0, neg_idx) {
+        return false;
+    }
+    if let Some(mov_idx) = opt_mov
+        && lv.live_after(mov_idx, s_fam) != Some(false)
+    {
+        return false;
+    }
+    let t32 = REG_NAMES[1][t_fam as usize];
+    replace_line(
+        store,
+        &mut infos[neg_idx],
+        neg_idx,
+        format!("    sbbl {t32}, {t32}"),
+    );
+    mark_nop(&mut infos[i2]);
+    if let Some(mov_idx) = opt_mov {
+        mark_nop(&mut infos[mov_idx]);
+    }
+    *dirty |= query_mask | (1u16 << d_fam);
+    true
+}
+
+/// Fold the 7-instruction CRC branchless poly step:
+/// ```text
+///   movl %S, %T; andl $1, %T; shrl $1, %S; movl %S, %U; xorl $K, %U;
+///   testl %T, %T; cmovnel %U, %S
+/// ```
+/// into:
+/// ```text
+///   shrl $1, %S; sbbl %T, %T; andl $K, %T; xorl %T, %S
+/// ```
+/// when `%T`, `%U`, and flags are dead after `cmovnel`.
+fn fold_crc_shift_xor_cmov(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    i0: usize,
+    liveness: &mut Option<FileLiveness>,
+    dirty: &mut u16,
+) -> bool {
+    let len = store.len();
+    let Some((s_fam, t_fam)) = parse_movl_reg_reg(infos[i0].trimmed(store.get(i0))) else {
+        return false;
+    };
+    let i1 = next_non_debug(store, infos, i0 + 1, len);
+    let i2 = next_non_debug(store, infos, i1 + 1, len);
+    let i3 = next_non_debug(store, infos, i2 + 1, len);
+    let i4 = next_non_debug(store, infos, i3 + 1, len);
+    let i5 = next_non_debug(store, infos, i4 + 1, len);
+    let i6 = next_non_debug(store, infos, i5 + 1, len);
+    if i6 >= len || !all_editable(infos, &[i0, i1, i2, i3, i4, i5, i6]) {
+        return false;
+    }
+    if parse_inplace_mask(infos[i1].trimmed(store.get(i1))) != Some((1, t_fam))
+        || parse_shrl_one_reg32(infos[i2].trimmed(store.get(i2))) != Some(s_fam)
+    {
+        return false;
+    }
+    let Some((s3, u_fam)) = parse_movl_reg_reg(infos[i3].trimmed(store.get(i3))) else {
+        return false;
+    };
+    if s3 != s_fam || u_fam == t_fam {
+        return false;
+    }
+    let Some((imm_slice, x_fam)) = parse_xorl_imm_reg32(infos[i4].trimmed(store.get(i4))) else {
+        return false;
+    };
+    if x_fam != u_fam
+        || !is_zero_test_of(infos[i5].trimmed(store.get(i5)), t_fam)
+        || parse_cmovne_reg32(infos[i6].trimmed(store.get(i6))) != Some((u_fam, s_fam))
+    {
+        return false;
+    }
+    if !crc_flags_dead_after(store, infos, i6 + 1) {
+        return false;
+    }
+    let imm_owned = imm_slice.to_string();
+    let mask = (1u16 << s_fam) | (1u16 << t_fam) | (1u16 << u_fam);
+    let lv = ensure_liveness(liveness, dirty, store, infos, mask);
+    if !lv.same_function(i0, i6)
+        || lv.live_after(i6, t_fam) != Some(false)
+        || lv.live_after(i6, u_fam) != Some(false)
+    {
+        return false;
+    }
+    let t32 = REG_NAMES[1][t_fam as usize];
+    let s32 = REG_NAMES[1][s_fam as usize];
+    replace_line(store, &mut infos[i3], i3, format!("    sbbl {t32}, {t32}"));
+    replace_line(
+        store,
+        &mut infos[i4],
+        i4,
+        format!("    andl {imm_owned}, {t32}"),
+    );
+    replace_line(store, &mut infos[i5], i5, format!("    xorl {t32}, {s32}"));
+    mark_nop(&mut infos[i0]);
+    mark_nop(&mut infos[i1]);
+    mark_nop(&mut infos[i6]);
+    *dirty |= mask;
+    true
+}
+
+/// Fold the 9-instruction split-register CRC branchless poly step (e.g.
+/// `multmodp` / `zng_crc32_combine`):
+/// ```text
+///   mov %S, %T; andl $1, %T;
+///   mov %S, %W; shrl $1, %W;
+///   mov %W, %U; xorl $K, %U;
+///   testl %T, %T; mov %W, %D; cmovnel %U, %D
+/// ```
+/// (including swapped `(T, W)` pairs, and `%D == %S`, e.g. `%ebp`) into:
+/// ```text
+///   [movl %S, %D;] shrl $1, %D; sbbl %T, %T; andl $K, %T; xorl %T, %D
+/// ```
+/// when `%T`, `%W`, `%U`, and flags are dead after `cmovnel`.
+fn fold_crc_split_shift_xor_cmov(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    i0: usize,
+    liveness: &mut Option<FileLiveness>,
+    dirty: &mut u16,
+) -> bool {
+    let len = store.len();
+    let Some((s0, d0)) = parse_mov_reg_reg_allow_rbp(infos[i0].trimmed(store.get(i0))) else {
+        return false;
+    };
+    let i1 = next_non_debug(store, infos, i0 + 1, len);
+    let i2 = next_non_debug(store, infos, i1 + 1, len);
+    let i3 = next_non_debug(store, infos, i2 + 1, len);
+    let i4 = next_non_debug(store, infos, i3 + 1, len);
+    let i5 = next_non_debug(store, infos, i4 + 1, len);
+    let i6 = next_non_debug(store, infos, i5 + 1, len);
+    let i7 = next_non_debug(store, infos, i6 + 1, len);
+    let i8 = next_non_debug(store, infos, i7 + 1, len);
+    if i8 >= len || !all_editable(infos, &[i0, i1, i2, i3, i4, i5, i6, i7, i8]) {
+        return false;
+    }
+    let Some((s2, d2)) = parse_mov_reg_reg_allow_rbp(infos[i2].trimmed(store.get(i2))) else {
+        return false;
+    };
+    if s0 != s2 {
+        return false;
+    }
+    let (t_fam, w_fam) = if parse_inplace_mask(infos[i1].trimmed(store.get(i1))) == Some((1, d0))
+        && parse_shrl_one_reg32(infos[i3].trimmed(store.get(i3))) == Some(d2)
+    {
+        (d0, d2)
+    } else if parse_shrl_one_reg32(infos[i1].trimmed(store.get(i1))) == Some(d0)
+        && parse_inplace_mask(infos[i3].trimmed(store.get(i3))) == Some((1, d2))
+    {
+        (d2, d0)
+    } else {
+        return false;
+    };
+    let s_fam = s0;
+    if t_fam == REG_RBP || w_fam == REG_RBP || t_fam == w_fam || t_fam == s_fam || w_fam == s_fam {
+        return false;
+    }
+    let Some((s4, u_fam)) = parse_movl_reg_reg(infos[i4].trimmed(store.get(i4))) else {
+        return false;
+    };
+    if s4 != w_fam || u_fam == t_fam || u_fam == s_fam {
+        return false;
+    }
+    let Some((imm_slice, x_fam)) = parse_xorl_imm_reg32(infos[i5].trimmed(store.get(i5))) else {
+        return false;
+    };
+    if x_fam != u_fam || !is_zero_test_of(infos[i6].trimmed(store.get(i6)), t_fam) {
+        return false;
+    }
+    let Some((s7, dst_fam)) = parse_mov_reg_reg_allow_rbp(infos[i7].trimmed(store.get(i7))) else {
+        return false;
+    };
+    if s7 != w_fam || dst_fam == t_fam || dst_fam == u_fam {
+        return false;
+    }
+    if parse_cmovne_reg32_allow_rbp(infos[i8].trimmed(store.get(i8))) != Some((u_fam, dst_fam)) {
+        return false;
+    }
+    if !crc_flags_dead_after(store, infos, i8 + 1) {
+        return false;
+    }
+    let imm_owned = imm_slice.to_string();
+    let mask =
+        (1u16 << s_fam) | (1u16 << t_fam) | (1u16 << w_fam) | (1u16 << u_fam) | (1u16 << dst_fam);
+    let lv = ensure_liveness(liveness, dirty, store, infos, mask);
+    if !lv.same_function(i0, i8)
+        || lv.live_after(i8, t_fam) != Some(false)
+        || lv.live_after(i8, w_fam) != Some(false)
+        || lv.live_after(i8, u_fam) != Some(false)
+    {
+        return false;
+    }
+    let s32 = REG_NAMES[1][s_fam as usize];
+    let t32 = REG_NAMES[1][t_fam as usize];
+    let dst32 = REG_NAMES[1][dst_fam as usize];
+    if dst_fam == s_fam {
+        mark_nop(&mut infos[i0]);
+        mark_nop(&mut infos[i1]);
+        replace_line(store, &mut infos[i2], i2, format!("    shrl $1, {dst32}"));
+        replace_line(store, &mut infos[i3], i3, format!("    sbbl {t32}, {t32}"));
+        replace_line(
+            store,
+            &mut infos[i4],
+            i4,
+            format!("    andl {imm_owned}, {t32}"),
+        );
+        replace_line(
+            store,
+            &mut infos[i5],
+            i5,
+            format!("    xorl {t32}, {dst32}"),
+        );
+        mark_nop(&mut infos[i6]);
+        mark_nop(&mut infos[i7]);
+        mark_nop(&mut infos[i8]);
+    } else {
+        replace_line(
+            store,
+            &mut infos[i0],
+            i0,
+            format!("    movl {s32}, {dst32}"),
+        );
+        replace_line(store, &mut infos[i1], i1, format!("    shrl $1, {dst32}"));
+        replace_line(store, &mut infos[i2], i2, format!("    sbbl {t32}, {t32}"));
+        replace_line(
+            store,
+            &mut infos[i3],
+            i3,
+            format!("    andl {imm_owned}, {t32}"),
+        );
+        replace_line(
+            store,
+            &mut infos[i4],
+            i4,
+            format!("    xorl {t32}, {dst32}"),
+        );
+        mark_nop(&mut infos[i5]);
+        mark_nop(&mut infos[i6]);
+        mark_nop(&mut infos[i7]);
+        mark_nop(&mut infos[i8]);
+    }
+    *dirty |= mask;
+    true
+}
+
+/// Fold `movl %S, %T; andl $imm, %T; <1..=4 neutral ALU/mov ops>; test %T, %T; reader`
+/// into `<neutral ops>; testb $imm, %Sb; reader` when `%T` and flags die at `reader`.
+fn fold_copy_and_mask_across_neutral(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    i0: usize,
+    liveness: &mut Option<FileLiveness>,
+    dirty: &mut u16,
+) -> bool {
+    let len = store.len();
+    let Some((s_fam, t_fam)) = parse_movl_reg_reg(infos[i0].trimmed(store.get(i0))) else {
+        return false;
+    };
+    let i1 = next_non_debug(store, infos, i0 + 1, len);
+    if i1 >= len || !all_editable(infos, &[i0, i1]) {
+        return false;
+    }
+    let Some((imm, m_fam)) = parse_inplace_mask(infos[i1].trimmed(store.get(i1))) else {
+        return false;
+    };
+    if m_fam != t_fam || imm > MAX_BYTE_MASK {
+        return false;
+    }
+    let mut cur = next_non_debug(store, infos, i1 + 1, len);
+    let mut neutral_count = 0usize;
+    while cur < len && !infos[cur].pinned && neutral_count < 4 {
+        let trimmed = infos[cur].trimmed(store.get(cur));
+        if is_zero_test_of(trimmed, t_fam) {
+            break;
+        }
+        if !is_neutral_non_flag_op(trimmed, &infos[cur], s_fam, t_fam) {
+            return false;
+        }
+        neutral_count += 1;
+        cur = next_non_debug(store, infos, cur + 1, len);
+    }
+    if neutral_count == 0 || cur >= len || infos[cur].pinned {
+        return false;
+    }
+    let test_idx = cur;
+    if !is_zero_test_of(infos[test_idx].trimmed(store.get(test_idx)), t_fam) {
+        return false;
+    }
+    let reader = next_non_debug(store, infos, test_idx + 1, len);
+    if reader >= len || infos[reader].pinned {
+        return false;
+    }
+    let reader_trimmed = infos[reader].trimmed(store.get(reader));
+    if !condition_ignores_sf(reader_trimmed) {
+        return false;
+    }
+    let is_cmov = reader_trimmed
+        .split_whitespace()
+        .next()
+        .is_some_and(|m| m.starts_with("cmov"));
+    let reader_ok = matches!(
+        infos[reader].kind,
+        LineKind::CondJmp | LineKind::SetCC { .. }
+    ) || is_cmov;
+    if !reader_ok || (is_cmov && (infos[reader].reg_refs & (1u16 << t_fam) != 0)) {
+        return false;
+    }
+    if !flags_dead_after(store, infos, reader + 1) {
+        return false;
+    }
+    let mask = (1u16 << s_fam) | (1u16 << t_fam);
+    let lv = ensure_liveness(liveness, dirty, store, infos, mask);
+    if !lv.same_function(i0, reader) || lv.live_after(reader, t_fam) != Some(false) {
+        return false;
+    }
+    emit_byte_test(store, infos, test_idx, imm, s_fam, None);
+    mark_nop(&mut infos[i0]);
+    mark_nop(&mut infos[i1]);
+    *dirty |= mask;
+    true
+}
+
 /// Fold in-place byte masks (see the module documentation).
 pub(super) fn fold_inplace_mask_test(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
@@ -410,7 +1009,12 @@ pub(super) fn fold_inplace_mask_test(store: &mut LineStore, infos: &mut [LineInf
         let Some((imm, fam)) = parse_inplace_mask(t) else {
             // Rule 3: the mask spelled as a register-to-register `movzx`
             // whose destination exists only to be zero-tested.
-            if fold_zext_test(store, infos, i, &mut liveness, &mut dirty) {
+            if fold_zext_test(store, infos, i, &mut liveness, &mut dirty)
+                || fold_crc_shift_xor_cmov(store, infos, i, &mut liveness, &mut dirty)
+                || fold_crc_split_shift_xor_cmov(store, infos, i, &mut liveness, &mut dirty)
+                || fold_crc_shift_and_neg(store, infos, i, &mut liveness, &mut dirty)
+                || fold_copy_and_mask_across_neutral(store, infos, i, &mut liveness, &mut dirty)
+            {
                 changed = true;
             }
             i += 1;
@@ -789,5 +1393,112 @@ mod mask_test_tests {
                 "{q} -> {out}"
             );
         }
+    }
+
+    #[test]
+    fn cmov_ignores_sf_and_cross_neutral_copy_mask_folds() {
+        let out = run(
+            "    movl %edi, %r9d\n    andl $1, %r9d\n    movl %edx, %r10d\n    xorl %esi, %r10d\n    testl %r9d, %r9d\n    cmovnel %r10d, %edx\n    movl %edx, %eax\n    ret\n",
+        );
+        assert!(out.contains("testb $1, %dil"), "{out}");
+        assert!(!out.contains("movl %edi, %r9d"), "{out}");
+        assert!(!out.contains("andl $1, %r9d"), "{out}");
+        assert!(!out.contains("testl %r9d, %r9d"), "{out}");
+
+        // Live %r9 after cmovnel must NOT fold.
+        let kept = run(
+            "    movl %edi, %r9d\n    andl $1, %r9d\n    movl %edx, %r10d\n    xorl %esi, %r10d\n    testl %r9d, %r9d\n    cmovnel %r10d, %edx\n    movl %r9d, %eax\n    ret\n",
+        );
+        assert!(kept.contains("andl $1, %r9d"), "{kept}");
+    }
+
+    #[test]
+    fn crc_shift_xor_cmov_and_shift_neg_fold_to_sbbl() {
+        let poly = run(
+            "    movl %esi, %r9d\n    andl $1, %r9d\n    shrl $1, %esi\n    movl %esi, %r10d\n    xorl $-306674912, %r10d\n    testl %r9d, %r9d\n    cmovnel %r10d, %esi\n    movl %esi, %eax\n    ret\n",
+        );
+        assert!(poly.contains("shrl $1, %esi"), "{poly}");
+        assert!(poly.contains("sbbl %r9d, %r9d"), "{poly}");
+        assert!(poly.contains("andl $-306674912, %r9d"), "{poly}");
+        assert!(poly.contains("xorl %r9d, %esi"), "{poly}");
+        assert!(!poly.contains("cmovnel"), "{poly}");
+
+        let byte = run(
+            "    movl %r10d, %r11d\n    shrl $1, %r11d\n    andl $1, %r10d\n    negl %r10d\n    andl $-306674912, %r10d\n    xorl %r10d, %r11d\n    movl %r11d, %eax\n    ret\n",
+        );
+        assert!(byte.contains("shrl $1, %r11d"), "{byte}");
+        assert!(byte.contains("sbbl %r10d, %r10d"), "{byte}");
+        assert!(!byte.contains("negl"), "{byte}");
+        assert!(!byte.contains("andl $1"), "{byte}");
+
+        let byte_movq = run(
+            "    movl %r8d, %r10d\n    shrl $1, %r10d\n    andl $1, %r8d\n    movq %r8, %rsi\n    negl %esi\n    andl $-306674912, %esi\n    xorl %esi, %r10d\n    movl %r10d, %eax\n    ret\n",
+        );
+        assert!(byte_movq.contains("sbbl %esi, %esi"), "{byte_movq}");
+        assert!(!byte_movq.contains("movq %r8, %rsi"), "{byte_movq}");
+
+        // Exact 9-instruction shape emitted inside zng_crc32_combine / multmodp
+        // (including %ebp as loop-carried b and movq %rdx, %rbp).
+        let split_crc = run(concat!(
+            "    # LCCC_RET_RDX 0\n",
+            "    movl %ebp, %r9d\n",
+            "    andl $1, %r9d\n",
+            "    movl %ebp, %edx\n",
+            "    shrl $1, %edx\n",
+            "    movl %edx, %r11d\n",
+            "    xorl $-306674912, %r11d\n",
+            "    testl %r9d, %r9d\n",
+            "    movq %rdx, %rbp\n",
+            "    cmovnel %r11d, %ebp\n",
+            "    movl %ebp, %eax\n",
+            "    ret\n",
+        ));
+        assert!(split_crc.contains("shrl $1, %ebp"), "{split_crc}");
+        assert!(split_crc.contains("sbbl %r9d, %r9d"), "{split_crc}");
+        assert!(split_crc.contains("andl $-306674912, %r9d"), "{split_crc}");
+        assert!(split_crc.contains("xorl %r9d, %ebp"), "{split_crc}");
+        assert!(!split_crc.contains("cmovnel"), "{split_crc}");
+
+        // Loop-latch backward-jmp shape: flags are killed at .Lhead (testl)
+        // across `jmp .Lhead`.
+        let split_loop = run(concat!(
+            "    # LCCC_RET_RDX 0\n",
+            ".Lhead:\n",
+            "    testl %edi, %esi\n",
+            "    je .Lexit\n",
+            "    movl %ebp, %r9d\n",
+            "    andl $1, %r9d\n",
+            "    movl %ebp, %edx\n",
+            "    shrl $1, %edx\n",
+            "    movl %edx, %r11d\n",
+            "    xorl $-306674912, %r11d\n",
+            "    testl %r9d, %r9d\n",
+            "    movq %rdx, %rbp\n",
+            "    cmovnel %r11d, %ebp\n",
+            "    jmp .Lhead\n",
+            ".Lexit:\n",
+            "    movl %ebp, %eax\n",
+            "    ret\n",
+        ));
+        assert!(split_loop.contains("shrl $1, %ebp"), "{split_loop}");
+        assert!(split_loop.contains("sbbl %r9d, %r9d"), "{split_loop}");
+        assert!(!split_loop.contains("cmovnel"), "{split_loop}");
+
+        // If %edx is live after cmovnel, keep intact (fail closed).
+        let split_live = run(concat!(
+            "    # LCCC_RET_RDX 0\n",
+            "    movl %ebp, %r9d\n",
+            "    andl $1, %r9d\n",
+            "    movl %ebp, %edx\n",
+            "    shrl $1, %edx\n",
+            "    movl %edx, %r11d\n",
+            "    xorl $-306674912, %r11d\n",
+            "    testl %r9d, %r9d\n",
+            "    movq %rdx, %rbp\n",
+            "    cmovnel %r11d, %ebp\n",
+            "    movl %edx, %eax\n",
+            "    ret\n",
+        ));
+        assert!(split_live.contains("cmovnel %r11d, %ebp"), "{split_live}");
     }
 }

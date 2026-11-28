@@ -557,19 +557,13 @@ impl Lowerer {
             Some((bit_offset, bit_width)),
         );
 
-        let rhs_val = self.lower_expr(rhs);
-        let rhs_ty = self.value_ir_type(rhs);
-
-        // A floating right operand (binary, _Float128 or decimal) makes the
-        // floating type the common type (C11 6.5.16.2p3, 6.3.1.8): the field
-        // value converts to it, the operation runs there, and only the
-        // result converts back to the field. Converting the operand to the
-        // field's integer type first truncated it (`bf *= 0.5` gave 0, not
-        // bf / 2).
+        let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
         let rhs_ct = self.expr_ctype(rhs);
         if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
             && (rhs_ct.is_floating() || rhs_ct.is_soft_float())
         {
+            let rhs_val = self.lower_expr(rhs);
+            let rhs_ty = self.value_ir_type(rhs);
             let field_ct = Self::promoted_int_ctype(current_ty);
             let common_ct = CType::usual_arithmetic_conversion(&field_ct, &rhs_ct);
             let l = self.convert_scalar_ctype(current_val, current_ty, &field_ct, &common_ct);
@@ -604,20 +598,40 @@ impl Lowerer {
             ));
         }
 
-        let is_unsigned = storage_ty.is_unsigned();
+        // Usual arithmetic conversions between the promoted bitfield type
+        // (`current_ty` per C11 6.5.2.1 / 6.3.1.1, where e.g. `ull : 31`
+        // promotes to `int`) and the RHS type.
+        let rhs_ty = self.get_expr_type(rhs);
+        let rhs_ir_ty = self.infer_expr_type(rhs);
+        let (common_ty, op_ty) = if is_shift {
+            (current_ty, widened_op_type(current_ty))
+        } else {
+            Self::usual_arithmetic_conversions(current_ty, rhs_ty, current_ty, rhs_ir_ty)
+        };
+        let is_unsigned = if is_shift {
+            current_ty.is_unsigned()
+        } else {
+            common_ty.is_unsigned()
+        };
         let ir_op = Self::binop_to_ir(*op, is_unsigned);
-        let wt = widened_op_type(Self::bitfield_arithmetic_type(storage_ty, bit_width));
-        let current_casted = self.emit_implicit_cast(current_val, current_ty, wt);
-        let rhs_casted = self.emit_implicit_cast(rhs_val, rhs_ty, wt);
-        let result = self.emit_binop_val(ir_op, current_casted, rhs_casted, wt);
+        let current_casted = self.promote_for_op(
+            current_val,
+            current_ty,
+            current_ty,
+            op_ty,
+            common_ty,
+            is_shift,
+        );
+        let rhs_casted = self.lower_expr_with_type(rhs, op_ty);
+        let result = self.emit_binop_val(ir_op, current_casted, rhs_casted, op_ty);
 
         // C standard 6.3.1.2: when the target is _Bool, normalize the result
         // to 0 or 1 before storing into the bitfield.
         let store_val = if is_bool {
-            let normalized = self.emit_bool_normalize_typed(Operand::Value(result), wt);
+            let normalized = self.emit_bool_normalize_typed(Operand::Value(result), op_ty);
             self.emit_implicit_cast(normalized, IrType::I32, storage_ty)
         } else {
-            self.emit_implicit_cast(Operand::Value(result), wt, storage_ty)
+            self.narrow_from_op(Operand::Value(result), storage_ty, storage_ty, op_ty)
         };
 
         self.store_bitfield(
@@ -1249,7 +1263,33 @@ impl Lowerer {
         Operand::Value(lhs_ptr)
     }
 
-    /// Scalar compound assignment with complex RHS: extract real part from RHS.
+    fn eval_scalar_complex_compound_op(
+        &mut self,
+        op: &BinOp,
+        lhs_val: Operand,
+        lhs_val_ty: IrType,
+        lhs_val_ct: &CType,
+        rhs_ptr: Value,
+        result_ct: &CType,
+        comp_ct: &CType,
+        comp_ir_ty: IrType,
+    ) -> Value {
+        let lhs_in_comp = self.convert_scalar_ctype(lhs_val, lhs_val_ty, lhs_val_ct, comp_ct);
+        let lhs_complex = self.scalar_to_complex(lhs_in_comp, comp_ir_ty, result_ct);
+        let lhs_ptr = self.operand_to_value(lhs_complex);
+        let result = match op {
+            BinOp::Add => self.lower_complex_add(lhs_ptr, rhs_ptr, result_ct),
+            BinOp::Sub => self.lower_complex_sub(lhs_ptr, rhs_ptr, result_ct),
+            BinOp::Mul => self.lower_complex_mul(lhs_ptr, rhs_ptr, result_ct),
+            BinOp::Div => self.lower_complex_div(lhs_ptr, rhs_ptr, result_ct),
+            _ => lhs_complex,
+        };
+        self.operand_to_value(result)
+    }
+
+    /// Scalar compound assignment with complex RHS (C11 6.5.16.2p3): compute
+    /// `lhs op rhs` in the common complex type, then convert back to `lhs`'s
+    /// real or `_Bool` type (including division by complex and `_Bool` `!= 0`).
     fn lower_scalar_compound_assign_complex_rhs(
         &mut self,
         op: &BinOp,
@@ -1257,40 +1297,76 @@ impl Lowerer {
         rhs: &Expr,
         rhs_ct: &crate::common::types::CType,
     ) -> Operand {
+        let is_bool = self.is_bool_lvalue(lhs);
+        let lhs_ct = self.expr_ctype(lhs);
+        let result_ct = self.common_complex_type(&lhs_ct, rhs_ct);
+        let comp_ct = Self::complex_component_ctype(&result_ct);
+        let comp_ir_ty = Self::complex_component_ir_type(&result_ct);
+
         let rhs_val = self.lower_expr(rhs);
-        let rhs_ptr = self.operand_to_value(rhs_val);
-        let real_part = self.load_complex_real(rhs_ptr, rhs_ct);
-        let real_ty = Self::complex_component_ir_type(rhs_ct);
+        let rhs_complex = self.convert_to_complex(rhs_val, rhs_ct, &result_ct);
+        let rhs_ptr = self.operand_to_value(rhs_complex);
 
-        let ty = self.get_expr_type(lhs);
-        let common_ty = if ty.is_float() || real_ty.is_float() {
-            if ty == IrType::F128 || real_ty == IrType::F128 {
-                IrType::F128
-            } else if ty == IrType::F64 || real_ty == IrType::F64 {
-                IrType::F64
+        if let Some((field_addr, storage_ty, bit_offset, bit_width, sso, seg)) =
+            self.resolve_bitfield_lvalue(lhs)
+        {
+            let is_vol = self.expr_access_is_volatile(lhs);
+            let current_val = self.extract_bitfield_from_addr(
+                field_addr, storage_ty, bit_offset, bit_width, sso, is_vol, seg,
+            );
+            let current_ty = crate::ir::lowering::expr_types::bitfield_promoted_type(
+                storage_ty,
+                Some((bit_offset, bit_width)),
+            );
+            let bf_ct = if is_bool {
+                CType::Bool
             } else {
-                IrType::F32
-            }
-        } else {
-            widened_op_type(IrType::I32)
-        };
-        let op_ty = if common_ty.is_float() {
-            common_ty
-        } else {
-            widened_op_type(IrType::I32)
-        };
-
-        let rhs_promoted = self.emit_implicit_cast(real_part, real_ty, op_ty);
+                Self::promoted_int_ctype(current_ty)
+            };
+            let res_ptr = self.eval_scalar_complex_compound_op(
+                op,
+                current_val,
+                current_ty,
+                &bf_ct,
+                rhs_ptr,
+                &result_ct,
+                &comp_ct,
+                comp_ir_ty,
+            );
+            let store_val = if is_bool {
+                let truth = self.lower_complex_to_bool(res_ptr, &result_ct);
+                self.emit_implicit_cast(truth, IrType::I32, storage_ty)
+            } else {
+                let real_part = self.load_complex_real(res_ptr, &result_ct);
+                let back = self.convert_scalar_ctype(real_part, comp_ir_ty, &comp_ct, &bf_ct);
+                self.emit_implicit_cast(back, IrType::from_ctype(&bf_ct), storage_ty)
+            };
+            self.store_bitfield(
+                field_addr, storage_ty, bit_offset, bit_width, store_val, is_vol, sso, seg,
+            );
+            return self.truncate_to_bitfield_value(
+                store_val,
+                storage_ty,
+                bit_width,
+                storage_ty.is_signed(),
+            );
+        }
 
         if let Some(lv) = self.lower_lvalue_for_mutation(lhs) {
+            let ty = self.get_expr_type(lhs);
             let loaded = self.load_lvalue_typed(&lv, ty);
-            let loaded_promoted = self.emit_implicit_cast(loaded, ty, op_ty);
-            let is_unsigned = self.infer_expr_type(lhs).is_unsigned();
-            let ir_op = Self::binop_to_ir(*op, is_unsigned);
-            let result = self.emit_binop_val(ir_op, loaded_promoted, rhs_promoted, op_ty);
-            let result_cast = self.emit_implicit_cast(Operand::Value(result), op_ty, ty);
-            self.store_lvalue_typed(&lv, result_cast, ty);
-            return result_cast;
+            let res_ptr = self.eval_scalar_complex_compound_op(
+                op, loaded, ty, &lhs_ct, rhs_ptr, &result_ct, &comp_ct, comp_ir_ty,
+            );
+            let store_val = if is_bool {
+                let truth = self.lower_complex_to_bool(res_ptr, &result_ct);
+                self.emit_implicit_cast(truth, IrType::I32, ty)
+            } else {
+                let real_part = self.load_complex_real(res_ptr, &result_ct);
+                self.convert_scalar_ctype(real_part, comp_ir_ty, &comp_ct, &lhs_ct)
+            };
+            self.store_lvalue_typed(&lv, store_val, ty);
+            return store_val;
         }
         Operand::Const(IrConst::I64(0))
     }

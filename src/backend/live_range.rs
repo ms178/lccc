@@ -1411,6 +1411,10 @@ pub struct LinearScanAllocator {
     /// free bypassed those gates and cascaded (rot(): 51 -> 55 insns,
     /// 2 -> 5 stack refs; zstd_count +3 stack refs; expat +6 moves).
     pub free_slot_victims: bool,
+    /// Phase-2c leftover scan: allow hot in-loop spans to evict
+    /// non-loop-spanning temporaries whose spill cost is at least 4x lower
+    /// (keeping the span-pressure valve intact).
+    pub phase2c_span_over_local: bool,
 }
 
 impl LinearScanAllocator {
@@ -1451,6 +1455,7 @@ impl LinearScanAllocator {
             demoted_spans: Vec::new(),
             total_spans,
             free_slot_victims: false,
+            phase2c_span_over_local: false,
         }
     }
 
@@ -2589,7 +2594,9 @@ impl LinearScanAllocator {
         // behavior whenever every active is itself a recurrence, hinted,
         // or steal-unsafe.
         let floor_victim = if victim.is_none() {
-            let idx = self.find_recurrence_floor_victim(&range);
+            let idx = self
+                .find_recurrence_floor_victim(&range)
+                .or_else(|| self.find_phase2c_non_span_victim(&range));
             if idx.is_some() && self.ra_config.trace_alloc {
                 lccc::cli::stderr_line(format_args!(
                     "[SPILL-TRACE] recurrence-floor steal for v{} @{} remcost={} site=6",
@@ -2772,6 +2779,50 @@ impl LinearScanAllocator {
                 continue;
             }
             if cost >= incoming_cost {
+                continue;
+            }
+            let nxt = next_use_after(&interval.range, pos);
+            if cost < best_cost || (cost == best_cost && nxt > best_next_use) {
+                best_idx = Some(idx);
+                best_cost = cost;
+                best_next_use = nxt;
+            }
+        }
+        best_idx
+    }
+
+    /// Phase-2c fallback victim: when ordinary eviction and the recurrence
+    /// floor refuse to evict a short non-loop-spanning active for a hot
+    /// in-loop-used span (e.g. a 2-instruction depth-2 cast holding `%rbp`
+    /// across the entry of a depth-3 loop invariant), allow eviction when the
+    /// incoming span's remaining spill cost dominates the non-span victim by
+    /// at least 4x.
+    fn find_phase2c_non_span_victim(&self, incoming: &LiveRange) -> Option<usize> {
+        if !self.phase2c_span_over_local
+            || self.active.is_empty()
+            || !(incoming.spans_loop && incoming.span_marked && incoming.span_has_in_loop_use)
+        {
+            return None;
+        }
+        let pos = incoming.start;
+        let incoming_cost = incoming.spill_cost_at(pos);
+        if incoming_cost == 0 {
+            return None;
+        }
+        let mut best_idx: Option<usize> = None;
+        let mut best_cost = u64::MAX;
+        let mut best_next_use = 0u32;
+        for (idx, interval) in self.active.iter().enumerate() {
+            if interval.range.spans_loop || interval.range.reg_hint.is_some() {
+                continue;
+            }
+            if !self.register_steal_is_safe(interval.range.value_id, incoming)
+                || interval.range.cascade > incoming.cascade
+            {
+                continue;
+            }
+            let cost = interval.range.spill_cost_at(pos);
+            if cost == 0 || incoming_cost < cost.saturating_mul(4) {
                 continue;
             }
             let nxt = next_use_after(&interval.range, pos);
@@ -3040,6 +3091,12 @@ impl LinearScanAllocator {
         self.next_reg_idx = 0;
         self.init_registers();
         self.reg_occupancy.clear();
+        if !self.ra_config.no_segment_scan
+            && !self.segment_mode
+            && seed.values().any(|spans| spans.len() > 1)
+        {
+            self.segment_mode = true;
+        }
         for (reg, spans) in seed {
             // Fat-mode invariant: reg_free_until is the latest occupied point
             // (max end across spans). Fat mode cannot represent holes, so a
@@ -6028,5 +6085,22 @@ mod tests {
     fn rotation_is_kept_without_the_flag_or_under_the_knob() {
         assert_eq!(sticky_run(false, false)[&3], PhysReg(3));
         assert_eq!(sticky_run(true, true)[&3], PhysReg(3));
+    }
+
+    #[test]
+    fn phase2c_hot_loop_span_evicts_cheap_non_span_victim() {
+        let mut short = lr_weighted(1, 5, 12, vec![(12, 100)]);
+        short.spans_loop = false;
+
+        let mut hot_span = lr_weighted(2, 8, 50, vec![(20, 600), (40, 500)]);
+        hot_span.spans_loop = true;
+        hot_span.span_marked = true;
+        hot_span.span_has_in_loop_use = true;
+
+        let mut alloc = LinearScanAllocator::new(vec![short, hot_span], vec![PhysReg(6)]);
+        alloc.phase2c_span_over_local = true;
+        alloc.run();
+        assert_eq!(alloc.assignments.get(&2), Some(&PhysReg(6)));
+        assert!(!alloc.assignments.contains_key(&1));
     }
 }

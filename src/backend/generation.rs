@@ -6938,7 +6938,7 @@ fn generate_function_body(
         FxHashMap::default()
     };
 
-    let remat_global_addrs = if cg.supports_global_addr_remat() {
+    let mut remat_global_addrs = if cg.supports_global_addr_remat() {
         build_rematerializable_global_addr_set_for(func, &global_addr_map)
     } else {
         FxHashSet::default()
@@ -6955,10 +6955,13 @@ fn generate_function_body(
     // PF-07: the prologue promoted PIC indexed-symbol bases (defined at a
     // shallower loop depth than their consumers) out of the
     // never-materialized set so RA homes them. Honour that here: skipping
-    // emission would leave the SIB base register unwritten.
+    // emission would leave the SIB base register unwritten, and keeping them
+    // in `remat_global_addrs` would re-materialize `leaq sym(%rip)` at every
+    // Add/Sub/GEP consumer instead of reusing the hoisted register home.
     // (PF-07 promotes non-TLS bases only, so the omitted TLS roots stand.)
     for v in &cg.state_ref().promoted_global_addr_homes {
         dead_global_addrs.remove(v);
+        remat_global_addrs.remove(v);
     }
 
     // Indexed-fold guaranteed-offset-producer skipping (session 27): when an
@@ -8727,12 +8730,14 @@ fn generate_instruction_body(
                 if *op == IrBinOp::Add && !ty.is_float() && ty.size() == 8 {
                     for (base, index) in [(lhs, rhs), (rhs, lhs)] {
                         if let (Operand::Value(b), Operand::Value(idx)) = (base, index) {
-                            if let Some(sym) = global_addr_map.get(&b.0) {
-                                if !rip_rel_blocked(cg, sym)
-                                    && cg.emit_leaq_sym_index(dest, sym, idx, 0, 0)
-                                {
-                                    folded = true;
-                                    break;
+                            if cg.get_phys_reg_for_value(b.0).is_none() {
+                                if let Some(sym) = global_addr_map.get(&b.0) {
+                                    if !rip_rel_blocked(cg, sym)
+                                        && cg.emit_leaq_sym_index(dest, sym, idx, 0, 0)
+                                    {
+                                        folded = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -8803,11 +8808,13 @@ fn generate_instruction_body(
                 // compute) instead of `movq` (load).
                 let mut folded = false;
                 if let Operand::Value(off_val) = offset {
-                    if let Some(sym) = global_addr_map.get(&base.0) {
-                        if !rip_rel_blocked(cg, sym)
-                            && cg.emit_leaq_sym_index(dest, sym, off_val, 0, 0)
-                        {
-                            folded = true;
+                    if cg.get_phys_reg_for_value(base.0).is_none() {
+                        if let Some(sym) = global_addr_map.get(&base.0) {
+                            if !rip_rel_blocked(cg, sym)
+                                && cg.emit_leaq_sym_index(dest, sym, off_val, 0, 0)
+                            {
+                                folded = true;
+                            }
                         }
                     }
                 }

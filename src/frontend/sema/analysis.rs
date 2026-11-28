@@ -260,6 +260,23 @@ impl Default for SemaResult {
     }
 }
 
+#[derive(Clone)]
+pub(crate) enum ParamOverlay {
+    Symbol(String, CType),
+    Enum(String, i64, CType),
+}
+
+struct ParamOverlayGuard<'a> {
+    overlay: &'a RefCell<Vec<ParamOverlay>>,
+    mark: usize,
+}
+
+impl Drop for ParamOverlayGuard<'_> {
+    fn drop(&mut self) {
+        self.overlay.borrow_mut().truncate(self.mark);
+    }
+}
+
 /// Semantic analyzer that builds a scoped symbol table and collects type info.
 pub struct SemanticAnalyzer {
     /// The scoped symbol table for name resolution.
@@ -385,6 +402,9 @@ pub struct SemanticAnalyzer {
     record_resolve_depth: Cell<u32>,
     /// One-shot marker so the depth diagnostic is emitted exactly once.
     record_depth_diagnosed: Cell<bool>,
+    /// Temporary parameter/enumerator overlay active while converting a
+    /// parameter list so earlier parameters shadow outer names in later ones.
+    param_overlay: RefCell<Vec<ParamOverlay>>,
 }
 
 /// Maximum nested record-definition resolution depth; see
@@ -490,6 +510,7 @@ impl SemanticAnalyzer {
             weak_symbols: FxHashSet::default(),
             record_resolve_depth: Cell::new(0),
             record_depth_diagnosed: Cell::new(false),
+            param_overlay: RefCell::new(Vec::new()),
         };
         analyzer
     }
@@ -698,13 +719,14 @@ impl SemanticAnalyzer {
         let mangled = format!("{}.{}", parent, func.name);
 
         let return_type = self.function_def_return_ctype(func);
+        self.check_no_nested_auto_type(&func.return_type, func.span);
+        for p in &func.params {
+            self.check_no_nested_auto_type(&p.type_spec, func.span);
+        }
         self.collect_enum_constants_from_type_spec(&func.return_type, func.span);
 
-        let params: Vec<(CType, Option<String>)> = func
-            .params
-            .iter()
-            .map(|p| (self.param_decl_ctype(p), p.name.clone()))
-            .collect();
+        let params: Vec<(CType, Option<String>)> =
+            <Self as type_builder::TypeConvertContext>::convert_param_decls(self, &func.params);
 
         let prototype = if func.has_prototype {
             Some(FunctionType {
@@ -777,9 +799,10 @@ impl SemanticAnalyzer {
         // Analyze the body in its own scope, with its own return type.
         self.symbol_table.push_scope();
         self.result.type_context.push_scope();
-        for param in &func.params {
+        for (param, (ty, _)) in func.params.iter().zip(params.iter()) {
+            self.collect_enum_constants_from_type_spec(&param.type_spec, func.span);
             if let Some(name) = &param.name {
-                let ty = self.param_decl_ctype(param);
+                let ty = ty.clone();
                 let own_cvr = self.param_object_cvr(param, &ty);
                 let const_base = self.decl_const_base(&param.type_spec, param.is_const);
                 let base_volatile =
@@ -958,6 +981,7 @@ impl SemanticAnalyzer {
             self.inline_husk_definitions.insert(func.name.clone());
         }
         let return_type = self.function_def_return_ctype(func);
+        self.check_no_nested_auto_type(&func.return_type, func.span);
         if func.is_kr {
             for p in &func.params {
                 self.check_void_param(p, VoidRole::KrParameter, func.span);
@@ -971,11 +995,8 @@ impl SemanticAnalyzer {
         // Must happen at file scope before pushing the function body scope.
         self.collect_enum_constants_from_type_spec(&func.return_type, func.span);
 
-        let params: Vec<(CType, Option<String>)> = func
-            .params
-            .iter()
-            .map(|p| (self.param_decl_ctype(p), p.name.clone()))
-            .collect();
+        let params: Vec<(CType, Option<String>)> =
+            <Self as type_builder::TypeConvertContext>::convert_param_decls(self, &func.params);
 
         self.check_ms_scalar_signature(
             calling_convention,
@@ -1066,9 +1087,10 @@ impl SemanticAnalyzer {
         // (`int (*cb)(void*)`) store the function type in `fptr_params`, not
         // in `type_spec`; using only type_spec typed them as `int *` and
         // rejected assigning them to matching fields (sqlite3 amalgamation).
-        for param in &func.params {
+        for (param, (ty, _)) in func.params.iter().zip(params.iter()) {
+            self.collect_enum_constants_from_type_spec(&param.type_spec, func.span);
             if let Some(name) = &param.name {
-                let ty = self.param_decl_ctype(param);
+                let ty = ty.clone();
                 let own_cvr = self.param_object_cvr(param, &ty);
                 let const_base = self.decl_const_base(&param.type_spec, param.is_const);
                 let base_volatile =
@@ -1271,6 +1293,298 @@ impl SemanticAnalyzer {
         }
     }
 
+    /// Reject `__auto_type` / C23 `auto` in type contexts where type inference
+    /// is invalid (function returns, parameters, struct/union fields,
+    /// type names, typedefs, or nested inside pointer/array/vector/typeof types).
+    fn check_no_nested_auto_type(&self, ts: &TypeSpecifier, span: Span) {
+        match ts {
+            TypeSpecifier::AutoType => {
+                self.diagnostics
+                    .borrow_mut()
+                    .error("invalid use of 'auto'".to_string(), span);
+            }
+            TypeSpecifier::Pointer(inner, _)
+            | TypeSpecifier::Array(inner, _)
+            | TypeSpecifier::Vector(inner, _)
+            | TypeSpecifier::TypeofType(inner, _) => {
+                self.check_no_nested_auto_type(inner, span);
+            }
+            TypeSpecifier::FunctionPointer(ret, params, ..)
+            | TypeSpecifier::BareFunction(ret, params, ..) => {
+                self.check_no_nested_auto_type(ret, span);
+                for p in params {
+                    self.check_no_nested_auto_type(&p.type_spec, span);
+                }
+            }
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), ..) => {
+                for f in fields {
+                    self.check_no_nested_auto_type(&f.type_spec, span);
+                    for d in &f.derived {
+                        if let DerivedDeclarator::Function(params, ..)
+                        | DerivedDeclarator::FunctionPointer(params, ..) = d
+                        {
+                            for p in params {
+                                self.check_no_nested_auto_type(&p.type_spec, span);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_auto_decl_base_type(&mut self, decl: &Declaration) -> (CType, bool, bool, Vec<u8>) {
+        let mut auto_analyzed_first = false;
+        let mut auto_const_base = decl.is_const();
+        let mut auto_pointer_quals = Vec::new();
+        if decl.declarators.len() > 1 {
+            self.diagnostics.borrow_mut().error(
+                "'auto' can only be specified for single declarations".to_string(),
+                decl.span,
+            );
+        }
+        let base_type = if let Some(first) = decl.declarators.first() {
+            if !first.derived.is_empty() {
+                self.diagnostics.borrow_mut().error(
+                    "'auto' requires a plain identifier, possibly with attributes, as declarator"
+                        .to_string(),
+                    first.span,
+                );
+            }
+            match first.init {
+                Some(Initializer::Expr(ref init_expr)) => {
+                    self.analyze_expr(init_expr);
+                    auto_analyzed_first = true;
+                    if decl.is_c23_auto()
+                        && !first.name.is_empty()
+                        && Self::expr_references_ident(init_expr, &first.name)
+                    {
+                        self.diagnostics.borrow_mut().error(
+                            format!(
+                                "underspecified '{}' referenced in its initializer",
+                                first.name
+                            ),
+                            init_expr.span(),
+                        );
+                    }
+                    let inferred = {
+                        let checker = self.expr_type_checker();
+                        checker
+                            .infer_expr_ctype(init_expr)
+                            .map_or(CType::Int, |ct| ct.decayed_value_ctype())
+                    };
+                    if matches!(inferred, CType::Pointer(..)) {
+                        auto_const_base = crate::common::qualifiers::expr_const_base(
+                            init_expr,
+                            &self.expr_type_checker(),
+                        );
+                        if let Some(level) =
+                            crate::common::qualifiers::typedef_const_pointer_level(&inferred)
+                        {
+                            auto_pointer_quals = self.typeof_expr_pointer_quals(init_expr);
+                            auto_pointer_quals.resize(auto_pointer_quals.len().max(level + 1), 0);
+                            if decl.is_const() {
+                                auto_pointer_quals[level] |=
+                                    crate::frontend::parser::ast::CVR_CONST;
+                            }
+                        }
+                    }
+                    inferred
+                }
+                Some(Initializer::List(_)) => {
+                    self.diagnostics.borrow_mut().error(
+                        "expected expression before '{' token".to_string(),
+                        first.span,
+                    );
+                    CType::Int
+                }
+                None => {
+                    self.diagnostics.borrow_mut().error(
+                        "'auto' requires an initialized data declaration".to_string(),
+                        first.span,
+                    );
+                    CType::Int
+                }
+            }
+        } else {
+            self.diagnostics.borrow_mut().error(
+                "'auto' requires an initialized data declaration".to_string(),
+                decl.span,
+            );
+            CType::Int
+        };
+        (
+            base_type,
+            auto_analyzed_first,
+            auto_const_base,
+            auto_pointer_quals,
+        )
+    }
+
+    fn analyze_typedef_declaration(
+        &mut self,
+        decl: &Declaration,
+        base_type: &CType,
+        base_const: bool,
+        base_pointer_quals: &[u8],
+        base_top_const: bool,
+    ) {
+        for declarator in &decl.declarators {
+            if declarator.name.is_empty() {
+                continue;
+            }
+            let has_func_derived = DerivedDeclarator::declares_function(&declarator.derived);
+            if has_func_derived {
+                if let Some(DerivedDeclarator::Function(params, variadic, has_prototype, abi)) =
+                    declarator.derived.last()
+                {
+                    let return_type = super::type_context::build_prefix_return_type_spec(
+                        &decl.type_spec,
+                        &declarator.derived,
+                        declarator.derived.len() - 1,
+                    );
+                    self.result.type_context.function_typedefs.insert(
+                        declarator.name.clone(),
+                        FunctionTypedefInfo {
+                            calling_convention: abi.unwrap_or_default(),
+                            return_type,
+                            params: params.clone(),
+                            variadic: *variadic,
+                            has_prototype: *has_prototype,
+                        },
+                    );
+                }
+            } else if let Some(fti) =
+                super::type_context::extract_fptr_typedef_info(&decl.type_spec, &declarator.derived)
+            {
+                self.result
+                    .type_context
+                    .func_ptr_typedefs
+                    .insert(declarator.name.clone());
+                self.result
+                    .type_context
+                    .func_ptr_typedef_info
+                    .insert(declarator.name.clone(), fti);
+            }
+
+            let base_cvr = self.specifier_cvr(
+                &decl.type_spec,
+                written_cvr(
+                    decl.is_const(),
+                    declarator.attrs.base_volatile_written(),
+                    declarator.attrs.base_restrict,
+                ),
+            );
+            let mut resolved_ctype = if declarator.derived.is_empty() {
+                base_type.clone()
+            } else {
+                type_builder::build_qualified_ctype_with_base(
+                    self,
+                    base_type.clone(),
+                    base_cvr,
+                    &declarator.derived,
+                )
+            };
+            let top_cvr = match declarator.derived.last() {
+                None => base_cvr,
+                Some(DerivedDeclarator::Array(_))
+                    if declarator
+                        .derived
+                        .iter()
+                        .all(|d| matches!(d, DerivedDeclarator::Array(_))) =>
+                {
+                    base_cvr
+                }
+                Some(DerivedDeclarator::Pointer(_, cvr))
+                    if !declarator.derived.iter().any(|d| {
+                        matches!(
+                            d,
+                            DerivedDeclarator::Function(..)
+                                | DerivedDeclarator::FunctionPointer(..)
+                        )
+                    }) =>
+                {
+                    Some(*cvr)
+                }
+                Some(_) => None,
+            };
+            self.result
+                .type_context
+                .set_typedef_top_cvr(&declarator.name, top_cvr);
+            type_builder::apply_declaration_address_space_for_object(
+                &mut resolved_ctype,
+                decl.address_space,
+                &declarator.derived,
+            );
+            let resolved_ctype = if resolved_ctype.is_vector() {
+                resolved_ctype
+            } else {
+                self.resolve_decl_vector_ctype(decl, resolved_ctype.clone())
+                    .unwrap_or(resolved_ctype)
+            };
+            let pointee_qualified = (decl.is_const()
+                || (decl.is_volatile() && !declarator.attrs.base_atomic))
+                && matches!(resolved_ctype, CType::Pointer(..))
+                || (declarator.derived.is_empty()
+                    && matches!(&decl.type_spec, TypeSpecifier::TypedefName(base)
+                        if self.result.type_context.qualified_pointee_typedefs.contains(base)));
+            self.result
+                .type_context
+                .set_typedef_pointee_qualified(&declarator.name, pointee_qualified);
+            self.result
+                .type_context
+                .set_typedef_const_base(&declarator.name, base_const);
+            let typedef_quals = {
+                let mut quals = base_pointer_quals.to_vec();
+                quals.extend(type_builder::declarator_pointer_quals(&declarator.derived));
+                quals
+            };
+            self.result
+                .type_context
+                .set_typedef_pointer_quals(&declarator.name, typedef_quals);
+            let has_star = declarator
+                .derived
+                .iter()
+                .any(|d| matches!(d, DerivedDeclarator::Pointer(..)));
+            let typedef_top_const = if has_star {
+                matches!(resolved_ctype, CType::Pointer(..)) && declarator.attrs.pointer_const
+            } else {
+                decl.is_const() || base_top_const
+            };
+            self.result
+                .type_context
+                .set_typedef_top_const(&declarator.name, typedef_top_const);
+            self.result
+                .type_context
+                .typedefs
+                .insert(declarator.name.clone(), resolved_ctype);
+
+            let effective_alignment = {
+                let mut align = decl.alignment;
+                if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
+                    let ctype = self.type_spec_to_ctype(sizeof_ts);
+                    let real_sizeof =
+                        ctype.size_ctx(&*self.result.type_context.borrow_struct_layouts());
+                    align = Some(align.map_or(real_sizeof, |a| a.max(real_sizeof)));
+                }
+                align.or_else(|| {
+                    decl.alignas_type.as_ref().map(|ts| {
+                        let ctype = self.type_spec_to_ctype(ts);
+                        ctype.align_ctx(&*self.result.type_context.borrow_struct_layouts())
+                    })
+                })
+            };
+            if let Some(align) = effective_alignment {
+                self.result
+                    .type_context
+                    .typedef_alignments
+                    .insert(declarator.name.clone(), align);
+            }
+        }
+    }
+
     /// The parameter lists inside a declarator's function derivations.
     fn check_void_derived_params(&self, derived: &[DerivedDeclarator], span: Span) {
         for d in derived {
@@ -1296,6 +1610,7 @@ impl SemanticAnalyzer {
     }
 
     fn check_void_param(&self, p: &ParamDecl, role: VoidRole, span: Span) {
+        self.check_no_nested_auto_type(&p.type_spec, span);
         // The constraints apply to the type as declared, before `T a[2]` was
         // adjusted to `T *a` (which is all `type_spec` still says).
         let unadjusted;
@@ -1332,6 +1647,7 @@ impl SemanticAnalyzer {
                     }
                     self.check_void_derived_params(&f.derived, span);
                     self.check_void_members(&f.type_spec, span);
+                    self.check_no_nested_auto_type(&f.type_spec, span);
                 }
             }
             TypeSpecifier::Pointer(inner, _)
@@ -1344,6 +1660,7 @@ impl SemanticAnalyzer {
     /// A type name (cast, `sizeof`, `_Alignof`, `va_arg`; compound literals
     /// use `VoidRole::CompoundLiteral`).
     fn check_void_type_name(&self, ts: &TypeSpecifier, span: Span) {
+        self.check_no_nested_auto_type(ts, span);
         self.check_void_members(ts, span);
         self.report_void_declarator(ts, &[], None, VoidRole::Other, span);
     }
@@ -1405,63 +1722,49 @@ impl SemanticAnalyzer {
             }
         }
         self.check_void_declaration(decl, is_global);
+        if decl.is_typedef() && matches!(&decl.type_spec, TypeSpecifier::AutoType) {
+            self.diagnostics
+                .borrow_mut()
+                .error("invalid use of 'auto' in typedef".to_string(), decl.span);
+        } else if !matches!(&decl.type_spec, TypeSpecifier::AutoType) {
+            self.check_no_nested_auto_type(&decl.type_spec, decl.span);
+        }
 
         // Handle __auto_type / C23 `auto` (6.7.10): requires a single plain-identifier
         // declarator with an expression initializer.
-        let base_type = if matches!(&decl.type_spec, TypeSpecifier::AutoType) {
-            if decl.declarators.len() > 1 {
-                self.diagnostics.borrow_mut().error(
-                    "'auto' can only be specified for single declarations".to_string(),
-                    decl.span,
-                );
-            }
-            if let Some(first) = decl.declarators.first() {
-                if !first.derived.is_empty() {
-                    self.diagnostics.borrow_mut().error(
-                        "'auto' requires a plain identifier, possibly with attributes, as declarator"
-                            .to_string(),
-                        first.span,
-                    );
-                }
-                match first.init {
-                    Some(Initializer::Expr(ref init_expr)) => {
-                        let checker = self.expr_type_checker();
-                        checker
-                            .infer_expr_ctype(init_expr)
-                            .map_or(CType::Int, |ct| ct.decayed_value_ctype())
-                    }
-                    Some(Initializer::List(_)) => {
-                        self.diagnostics.borrow_mut().error(
-                            "expected expression before '{' token".to_string(),
-                            first.span,
-                        );
-                        CType::Int
-                    }
-                    None => {
-                        self.diagnostics.borrow_mut().error(
-                            "'auto' requires an initialized data declaration".to_string(),
-                            first.span,
-                        );
-                        CType::Int
-                    }
-                }
-            } else {
-                self.diagnostics.borrow_mut().error(
-                    "'auto' requires an initialized data declaration".to_string(),
-                    decl.span,
-                );
-                CType::Int
-            }
+        let is_inferred_decl =
+            !decl.is_typedef() && matches!(&decl.type_spec, TypeSpecifier::AutoType);
+        let (
+            base_type,
+            auto_analyzed_first,
+            base_const,
+            base_pointer_quals,
+            base_top_const,
+            base_volatile,
+        ) = if is_inferred_decl {
+            let (ty, analyzed, inferred_const_base, inferred_ptr_quals) =
+                self.resolve_auto_decl_base_type(decl);
+            (
+                ty,
+                analyzed,
+                inferred_const_base,
+                inferred_ptr_quals,
+                false,
+                decl.is_volatile(),
+            )
         } else {
-            self.type_spec_to_ctype(&decl.type_spec)
+            // The declaration specifier is resolved once, before any of its
+            // declarators enters scope. In `typeof(p) *p, q`, the new `p` must not
+            // change the type (or qualifiers) subsequently used for `q`.
+            (
+                self.type_spec_to_ctype(&decl.type_spec),
+                false,
+                self.decl_const_base(&decl.type_spec, decl.is_const()),
+                self.base_typedef_pointer_quals(&decl.type_spec, decl.is_const()),
+                self.base_typedef_is_top_const(&decl.type_spec),
+                decl.is_volatile() || self.scalar_typeof_is_volatile(&decl.type_spec),
+            )
         };
-        // The declaration specifier is resolved once, before any of its
-        // declarators enters scope. In `typeof(p) *p, q`, the new `p` must not
-        // change the type (or qualifiers) subsequently used for `q`.
-        let base_const = self.decl_const_base(&decl.type_spec, decl.is_const());
-        let base_volatile = decl.is_volatile() || self.scalar_typeof_is_volatile(&decl.type_spec);
-        let base_pointer_quals = self.base_typedef_pointer_quals(&decl.type_spec, decl.is_const());
-        let base_top_const = self.base_typedef_is_top_const(&decl.type_spec);
         if decl.is_designated_init() {
             if matches!(base_type, CType::Struct(_)) {
                 self.diagnostics.borrow_mut().warning_with_kind(
@@ -1479,212 +1782,13 @@ impl SemanticAnalyzer {
 
         // Handle typedef declarations: populate TypeContext with typedef info
         if decl.is_typedef() {
-            for declarator in &decl.declarators {
-                if declarator.name.is_empty() {
-                    continue;
-                }
-                // Check for function typedef (e.g., typedef int func_t(int, int);),
-                // including function types RETURNING function pointers
-                // (`typedef void (*fn_t(int))(void);`), which must not be
-                // mistaken for function-pointer typedefs merely because the
-                // return type contains a FunctionPointer declarator.
-                let has_func_derived = DerivedDeclarator::declares_function(&declarator.derived);
-                if has_func_derived {
-                    // Function typedef like `typedef int func_t(int x);` or
-                    // `typedef int (*fn_t(int))(char);`. The typedef's own
-                    // parameter list is the LAST derived.
-                    if let Some(DerivedDeclarator::Function(params, variadic, has_prototype, abi)) =
-                        declarator.derived.last()
-                    {
-                        let return_type = super::type_context::build_prefix_return_type_spec(
-                            &decl.type_spec,
-                            &declarator.derived,
-                            declarator.derived.len() - 1,
-                        );
-                        self.result.type_context.function_typedefs.insert(
-                            declarator.name.clone(),
-                            FunctionTypedefInfo {
-                                calling_convention: abi.unwrap_or_default(),
-                                return_type,
-                                params: params.clone(),
-                                variadic: *variadic,
-                                has_prototype: *has_prototype,
-                            },
-                        );
-                    }
-                } else if let Some(fti) = super::type_context::extract_fptr_typedef_info(
-                    &decl.type_spec,
-                    &declarator.derived,
-                ) {
-                    // Function pointer typedef (e.g., `typedef void *(*lua_Alloc)(void *, ...)`)
-                    self.result
-                        .type_context
-                        .func_ptr_typedefs
-                        .insert(declarator.name.clone());
-                    self.result
-                        .type_context
-                        .func_ptr_typedef_info
-                        .insert(declarator.name.clone(), fti);
-                }
-
-                // Store resolved CType for the typedef.
-                // Use build_full_ctype_with_base to reuse the already-resolved base
-                // type, avoiding re-resolution of anonymous struct type specs.
-                let base_cvr = self.specifier_cvr(
-                    &decl.type_spec,
-                    written_cvr(
-                        decl.is_const(),
-                        declarator.attrs.base_volatile_written(),
-                        declarator.attrs.base_restrict,
-                    ),
-                );
-                let mut resolved_ctype = if declarator.derived.is_empty() {
-                    base_type.clone()
-                } else {
-                    type_builder::build_qualified_ctype_with_base(
-                        self,
-                        base_type.clone(),
-                        base_cvr,
-                        &declarator.derived,
-                    )
-                };
-                // The alias's own top-level qualifiers, when completely known:
-                // the specifiers' for a plain or array alias, the outermost
-                // star's for a pointer (the parser drops the stars' around a
-                // function core).
-                let top_cvr = match declarator.derived.last() {
-                    None => base_cvr,
-                    // An array type is qualified exactly like its elements
-                    // (`typedef const int A[3]` is a const-qualified type).
-                    Some(DerivedDeclarator::Array(_))
-                        if declarator
-                            .derived
-                            .iter()
-                            .all(|d| matches!(d, DerivedDeclarator::Array(_))) =>
-                    {
-                        base_cvr
-                    }
-                    Some(DerivedDeclarator::Pointer(_, cvr))
-                        if !declarator.derived.iter().any(|d| {
-                            matches!(
-                                d,
-                                DerivedDeclarator::Function(..)
-                                    | DerivedDeclarator::FunctionPointer(..)
-                            )
-                        }) =>
-                    {
-                        Some(*cvr)
-                    }
-                    Some(_) => None,
-                };
-                self.result
-                    .type_context
-                    .set_typedef_top_cvr(&declarator.name, top_cvr);
-                // Same declaration-level address space rule as variables
-                // (see analyze_declaration); lowering applies it to typedefs
-                // too (stmt.rs lower_local_typedef).
-                type_builder::apply_declaration_address_space_for_object(
-                    &mut resolved_ctype,
-                    decl.address_space,
-                    &declarator.derived,
-                );
-                // Mirror lowering's vector-attribute handling: without the
-                // vector wrap, sema records `typedef float xmm_t
-                // __attribute__((vector_size(16)))` as a plain 4-byte float,
-                // and every struct layout computed through sema's
-                // TypeConvertContext (cached in the SHARED type_context
-                // layout table) is wrong. glibc's La_x86_64_regs then put
-                // lr_vector at offset 96 instead of 192 in the gen-as-const
-                // pipeline, and elf/dl-trampoline.S failed its
-                // "LR_VECTOR_OFFSET must be multiple of VEC_SIZE" #error.
-                let resolved_ctype = if resolved_ctype.is_vector() {
-                    resolved_ctype
-                } else {
-                    self.resolve_decl_vector_ctype(decl, resolved_ctype.clone())
-                        .unwrap_or(resolved_ctype)
-                };
-                // Pointee qualifier of a pointer typedef, from the declaration's
-                // base-type `const`/`volatile`, or inherited from a typedef
-                // name it is built on (`typedef CNPT CNPT2;`).
-                let pointee_qualified = (decl.is_const()
-                    || (decl.is_volatile() && !declarator.attrs.base_atomic))
-                    && matches!(resolved_ctype, CType::Pointer(..))
-                    || (declarator.derived.is_empty()
-                        && matches!(&decl.type_spec, TypeSpecifier::TypedefName(base)
-                            if self.result.type_context.qualified_pointee_typedefs.contains(base)));
-                self.result
-                    .type_context
-                    .set_typedef_pointee_qualified(&declarator.name, pointee_qualified);
-                self.result
-                    .type_context
-                    .set_typedef_const_base(&declarator.name, base_const);
-                // An alias must keep the per-level qualifiers of the type it
-                // names: `typedef int *const cp;` used as `cp *p` declares a
-                // pointer to a const pointer, and `*p = 0` is a constraint
-                // violation (C11 6.5.16p1). Levels inherited from a typedef the
-                // alias is built on come first (they are closer to the base).
-                let typedef_quals = {
-                    let mut quals = base_pointer_quals.clone();
-                    quals.extend(type_builder::declarator_pointer_quals(&declarator.derived));
-                    quals
-                };
-                self.result
-                    .type_context
-                    .set_typedef_pointer_quals(&declarator.name, typedef_quals);
-                // `typedef int *const cp;` declares a read-only pointer
-                // object; every `cp x` is read-only like a written-out
-                // `int *const x`, and `x = 0` is a constraint violation.
-                // A star keeps the old rule (the star closest to the name);
-                // without one the alias's own base decides (`typedef const
-                // int CI;` makes every `CI x` a read-only object, `CI a[1]`
-                // read-only elements), inherited through alias chains.
-                let has_star = declarator
-                    .derived
-                    .iter()
-                    .any(|d| matches!(d, DerivedDeclarator::Pointer(..)));
-                let typedef_top_const = if has_star {
-                    matches!(resolved_ctype, CType::Pointer(..)) && declarator.attrs.pointer_const
-                } else {
-                    decl.is_const() || base_top_const
-                };
-                self.result
-                    .type_context
-                    .set_typedef_top_const(&declarator.name, typedef_top_const);
-                self.result
-                    .type_context
-                    .typedefs
-                    .insert(declarator.name.clone(), resolved_ctype);
-
-                // Preserve alignment override from __attribute__((aligned(N))) on the typedef.
-                // E.g. typedef struct S aligned_S __attribute__((aligned(32)));
-                // Also handle _Alignas(type) on typedefs by computing alignment from the type.
-                //
-                // When alignment_sizeof_type is set, the parser saw aligned(sizeof(type))
-                // but may have computed sizeof incorrectly for struct/union types.  Recompute
-                // sizeof here with full struct layout information and use that as alignment.
-                let effective_alignment = {
-                    let mut align = decl.alignment;
-                    if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
-                        let ctype = self.type_spec_to_ctype(sizeof_ts);
-                        let real_sizeof =
-                            ctype.size_ctx(&*self.result.type_context.borrow_struct_layouts());
-                        align = Some(align.map_or(real_sizeof, |a| a.max(real_sizeof)));
-                    }
-                    align.or_else(|| {
-                        decl.alignas_type.as_ref().map(|ts| {
-                            // _Alignas(type) means align to alignof(type)
-                            let ctype = self.type_spec_to_ctype(ts);
-                            ctype.align_ctx(&*self.result.type_context.borrow_struct_layouts())
-                        })
-                    })
-                };
-                if let Some(align) = effective_alignment {
-                    self.result
-                        .type_context
-                        .typedef_alignments
-                        .insert(declarator.name.clone(), align);
-                }
-            }
+            self.analyze_typedef_declaration(
+                decl,
+                &base_type,
+                base_const,
+                &base_pointer_quals,
+                base_top_const,
+            );
             return; // typedefs don't declare variables
         }
 
@@ -1708,7 +1812,7 @@ impl SemanticAnalyzer {
                 .unwrap_or(base_type)
         };
 
-        for init_decl in &decl.declarators {
+        for (decl_idx, init_decl) in decl.declarators.iter().enumerate() {
             let mut full_type = if init_decl.derived.is_empty() {
                 base_type.clone()
             } else {
@@ -2109,6 +2213,22 @@ impl SemanticAnalyzer {
                     ),
                 )
             });
+            let mut pre_init_marks = None;
+            if is_inferred_decl {
+                // `__auto_type` binds the new identifier AFTER analyzing and
+                // validating its initializer so `__auto_type outer = &outer;`
+                // resolves `outer` inside `&outer` to the enclosing declaration.
+                let static_duration = decl.is_static() || links;
+                pre_init_marks = Some(self.analyze_declarator_initializer(
+                    decl,
+                    init_decl,
+                    decl_idx,
+                    auto_analyzed_first,
+                    static_duration,
+                    base_volatile || init_decl.attrs.object_volatile,
+                    &full_type,
+                ));
+            }
             if is_global && is_object {
                 // The debug information names this object.  A `typedef`-declared
                 // one keeps the alias, and a header's `extern` declaration is
@@ -2128,6 +2248,7 @@ impl SemanticAnalyzer {
                     span: init_decl.span,
                 });
             }
+            let declared_ty = full_type.clone();
             self.symbol_table.declare(Symbol {
                 name: init_decl.name.clone(),
                 ty: full_type,
@@ -2247,120 +2368,130 @@ impl SemanticAnalyzer {
             // leave the array uninitialised, so `nm_t l[2] = (nm_t[2]){ ... }`
             // in a function silently read garbage.
             let static_duration = decl.is_static() || links;
-            if let (Some(Initializer::Expr(expr)), false) = (&init_decl.init, static_duration) {
-                let array_target = self
-                    .symbol_table
-                    .lookup(&init_decl.name)
-                    .is_some_and(|s| matches!(s.ty, CType::Array(..)));
-                // Conjunction order is the cost model: `array_target` is a hash
-                // lookup on a name we just inserted, while `infer_expr_ctype`
-                // walks the initializer (its memo is cold here — the sema walk
-                // runs later in this same function). Short-circuit on the
-                // structural test so the walk happens only for array targets.
-                let array_source = array_target && self.initializer_is_array_valued(expr);
-                if array_source {
-                    // GCC's wording depends on the expression: a compound
-                    // literal is the array-expression case it names; any other
-                    // array-typed expression (`int b[3] = a;`) is a plain
-                    // invalid initializer.
-                    let message = if matches!(expr, Expr::CompoundLiteral(..)) {
-                        "array initialized from non-constant array expression"
-                    } else {
-                        "invalid initializer"
-                    };
-                    self.diagnostics
-                        .borrow_mut()
-                        .error(message.to_string(), expr.span());
+            let (folded_mark, constexpr_mark) = if let Some(marks) = pre_init_marks {
+                marks
+            } else {
+                if let (Some(Initializer::Expr(expr)), false) = (&init_decl.init, static_duration) {
+                    let array_target = matches!(declared_ty, CType::Array(..));
+                    let array_source = array_target && self.initializer_is_array_valued(expr);
+                    if array_source {
+                        let message = if matches!(expr, Expr::CompoundLiteral(..)) {
+                            "array initialized from non-constant array expression"
+                        } else {
+                            "invalid initializer"
+                        };
+                        self.diagnostics
+                            .borrow_mut()
+                            .error(message.to_string(), expr.span());
+                    }
                 }
+                self.analyze_declarator_initializer(
+                    decl,
+                    init_decl,
+                    decl_idx,
+                    auto_analyzed_first,
+                    static_duration,
+                    base_volatile || init_decl.attrs.object_volatile,
+                    &declared_ty,
+                )
+            };
+            if let Some(folded_val) = folded_mark {
+                self.symbol_table.mark_folded(&init_decl.name, folded_val);
             }
+            if let Some(members) = constexpr_mark {
+                self.symbol_table.mark_constexpr(&init_decl.name, members);
+            }
+        }
+    }
 
-            // Analyze initializer expressions
-            if let Some(init) = &init_decl.init {
-                self.analyze_initializer(init);
-                self.check_object_initializer(decl, init_decl, init);
-                if !static_duration && Self::has_direct_compound_initializer(init) {
-                    if let Some(ty) = self
-                        .symbol_table
-                        .lookup(&init_decl.name)
-                        .map(|s| s.ty.clone())
-                    {
-                        self.check_automatic_array_members(&ty, init);
-                    }
-                }
-                if decl.is_constexpr() {
-                    self.check_constexpr_initializer(decl, init_decl, init);
-                }
-                if let Initializer::List(_) = init {
-                    let var_ty = self
-                        .symbol_table
-                        .lookup(&init_decl.name)
-                        .map(|s| s.ty.clone());
-                    if let Some(var_ty) = var_ty {
-                        self.check_initializer_element_spaces(&var_ty, init);
-                    }
-                }
-                // Check for invalid pointer <-> float conversions in scalar initializers
-                if let Initializer::Expr(init_expr) = init {
-                    let var_ty = self
-                        .symbol_table
-                        .lookup(&init_decl.name)
-                        .map(|s| s.ty.clone());
-                    if let Some(var_ty) = var_ty {
-                        let checker = self.expr_type_checker();
-                        if self.check_assignment_operand(
-                            init_expr,
-                            &var_ty,
-                            init_expr.span(),
-                            IConvContext::Initialization,
-                        ) {
-                            // Diagnosed; the checks below would only repeat it.
-                        } else if let Some(init_ty) = checker.infer_expr_ctype(init_expr) {
-                            self.check_pointer_float_conversion(
-                                &init_ty,
-                                &var_ty,
-                                init_expr.span(),
-                            );
-                            let init_ty = self.conversion_source_ctype(init_expr, init_ty);
-                            let null_constant = self.is_void_null_pointer_constant(init_expr);
-                            self.check_address_space_conversion(
-                                &init_ty,
-                                &var_ty,
-                                init_expr.span(),
-                                null_constant,
-                            );
-                            // Scalar <-> GNU vector in scalar initializers
-                            // follows exactly the implicit-assignment rule:
-                            // oracles reject it at any size ("initializing
-                            // 'd1' with an expression of incompatible
-                            // type"), with the sole documented exception of
-                            // the ext-vector splat. Accepting it also
-                            // silently miscompiled: the scalar rvalue's
-                            // VALUE was used as the SOURCE ADDRESS of the
-                            // whole-vector copy, faulting at runtime.
-                            let scalar_side = init_ty.is_integer()
-                                || init_ty.is_floating()
-                                || init_ty.is_soft_float()
-                                || init_ty.is_complex();
-                            let mismatched = (matches!(var_ty, CType::Vector(..)) && scalar_side)
-                                || (matches!(init_ty, CType::Vector(..) | CType::ExtVector(..))
-                                    && (var_ty.is_integer()
-                                        || var_ty.is_floating()
-                                        || var_ty.is_soft_float()
-                                        || var_ty.is_complex()));
-                            if mismatched {
-                                self.diagnostics.borrow_mut().error(
-                                    format!(
-                                        "incompatible types (have '{}' but expected '{}')",
-                                        init_ty, var_ty
-                                    ),
-                                    init_expr.span(),
-                                );
-                            }
-                        }
-                    }
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_declarator_initializer(
+        &mut self,
+        decl: &Declaration,
+        init_decl: &InitDeclarator,
+        decl_idx: usize,
+        auto_analyzed_first: bool,
+        static_duration: bool,
+        object_volatile: bool,
+        var_ty: &CType,
+    ) -> (
+        Option<Option<crate::common::symbol_table::FoldedValue>>,
+        Option<Vec<(String, crate::common::symbol_table::FoldedValue)>>,
+    ) {
+        let Some(init) = &init_decl.init else {
+            return (None, None);
+        };
+        if !(auto_analyzed_first && decl_idx == 0) {
+            self.analyze_initializer(init);
+        }
+        let folded_mark =
+            self.check_object_initializer(decl, init_decl, init, object_volatile, var_ty);
+        if !static_duration && Self::has_direct_compound_initializer(init) {
+            self.check_automatic_array_members(var_ty, init);
+        }
+        let constexpr_mark = if decl.is_constexpr() {
+            self.check_constexpr_initializer(decl, init_decl, init, var_ty)
+        } else {
+            None
+        };
+        if let Initializer::List(_) = init {
+            self.check_initializer_element_spaces(var_ty, init);
+        }
+        if let Initializer::Expr(init_expr) = init {
+            let checker = self.expr_type_checker();
+            if self.check_assignment_operand(
+                init_expr,
+                var_ty,
+                init_expr.span(),
+                IConvContext::Initialization,
+            ) {
+                // Diagnosed; the checks below would only repeat it.
+            } else if let Some(init_ty) = checker.infer_expr_ctype(init_expr) {
+                self.check_pointer_float_conversion(&init_ty, var_ty, init_expr.span());
+                let init_ty = self.conversion_source_ctype(init_expr, init_ty);
+                let null_constant = self.is_void_null_pointer_constant(init_expr);
+                self.check_address_space_conversion(
+                    &init_ty,
+                    var_ty,
+                    init_expr.span(),
+                    null_constant,
+                );
+                let scalar_side = init_ty.is_integer()
+                    || init_ty.is_floating()
+                    || init_ty.is_soft_float()
+                    || init_ty.is_complex();
+                let mismatched = (matches!(var_ty, CType::Vector(..)) && scalar_side)
+                    || (matches!(init_ty, CType::Vector(..) | CType::ExtVector(..))
+                        && (var_ty.is_integer()
+                            || var_ty.is_floating()
+                            || var_ty.is_soft_float()
+                            || var_ty.is_complex()));
+                if mismatched {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "incompatible types (have '{}' but expected '{}')",
+                            init_ty, var_ty
+                        ),
+                        init_expr.span(),
+                    );
                 }
             }
         }
+        (folded_mark, constexpr_mark)
+    }
+
+    /// Whether `expr` contains a reference to identifier `name`.
+    fn expr_references_ident(expr: &Expr, name: &str) -> bool {
+        let mut stack: Vec<&Expr> = vec![expr];
+        while let Some(e) = stack.pop() {
+            if let Expr::Identifier(n, _) = e
+                && n == name
+            {
+                return true;
+            }
+            e.for_each_child(&mut |child| stack.push(child));
+        }
+        false
     }
 
     /// Designator validity for one braced initializer (C11 6.7.9p2-p6).
@@ -2503,13 +2634,11 @@ impl SemanticAnalyzer {
         decl: &Declaration,
         init_decl: &InitDeclarator,
         init: &Initializer,
-    ) {
+        object_volatile: bool,
+        var_ty: &CType,
+    ) -> Option<Option<crate::common::symbol_table::FoldedValue>> {
         let (non_constant, folds) = {
             let type_checker = self.expr_type_checker();
-            // An object with static storage (file scope, or a block-scope
-            // `static`) needs a constant initializer (C11 6.7.9p4), and its
-            // initializer is folded the way GCC folds one; an automatic
-            // object's is not.
             let static_storage = decl.is_static() || self.symbol_table.at_file_scope();
             let eval = |e: &Expr| {
                 if static_storage {
@@ -2529,23 +2658,11 @@ impl SemanticAnalyzer {
                 &select,
             );
             let non_constant = if static_storage {
-                // The object's own type decides what an array-typed compound
-                // literal means here: its braced list, or a decayed address.
-                let object_ty =
-                    type_builder::build_full_ctype(self, &decl.type_spec, &init_decl.derived);
-                checker.non_constant_leaves_for(init, &object_ty)
+                checker.non_constant_leaves_for(init, var_ty)
             } else {
                 Vec::new()
             };
-            // Do not substitute a constant for an observable volatile read,
-            // including when volatility came from a scalar typeof operand.
-            // The existing symbol flag also represents volatile pointees, so
-            // do not treat a pointer object itself as volatile on that basis.
-            let volatile_non_pointer = self.symbol_table.is_volatile_base(&init_decl.name)
-                && self
-                    .symbol_table
-                    .lookup(&init_decl.name)
-                    .is_some_and(|s| !matches!(s.ty, CType::Pointer(..)));
+            let volatile_non_pointer = object_volatile && !matches!(var_ty, CType::Pointer(..));
             let folds = declares_const_object(decl, init_decl)
                 && !volatile_non_pointer
                 && checker.is_constant_initializer(init);
@@ -2556,26 +2673,18 @@ impl SemanticAnalyzer {
                 .borrow_mut()
                 .error("initializer element is not constant".to_string(), span);
         }
-        if folds {
-            let value = self.folded_value(decl, init_decl, init);
-            self.symbol_table.mark_folded(&init_decl.name, value);
-        }
+        let folded = folds.then(|| self.folded_value(init, var_ty));
         if matches!(init, Initializer::List(_)) {
-            let ct = type_builder::build_full_ctype(self, &decl.type_spec, &init_decl.derived);
-            self.check_designators(&ct, init, init_decl.span);
+            self.check_designators(var_ty, init, init_decl.span);
         }
+        folded
     }
 
     /// The value of a const object with a constant scalar initializer, after
     /// conversion to the object's type (`const unsigned char c = 300;` is 44,
     /// `const float f = 0.1;` is the nearest float; see [`fold_to_type`]).
     /// `None` for initializers that are not a single constant scalar.
-    fn folded_value(
-        &self,
-        decl: &Declaration,
-        init_decl: &InitDeclarator,
-        init: &Initializer,
-    ) -> Option<FoldedValue> {
+    fn folded_value(&self, init: &Initializer, ct: &CType) -> Option<FoldedValue> {
         let expr = match init {
             Initializer::Expr(e) => e,
             // `const int c = {5};` is the same scalar initializer.
@@ -2587,7 +2696,6 @@ impl SemanticAnalyzer {
                 _ => return None,
             },
         };
-        let ct = type_builder::build_full_ctype(self, &decl.type_spec, &init_decl.derived);
         let evaluator = SemaConstEval {
             types: &self.result.type_context,
             symbols: &self.symbol_table,
@@ -2598,10 +2706,11 @@ impl SemanticAnalyzer {
             folding_initializer: false,
             pre_c99: self.pre_c99,
             named_constants_only: false,
+            param_overlay: Some(&self.param_overlay),
         };
         let value = evaluator.eval_const_expr(expr)?;
         let source = self.expr_type_checker().infer_expr_ctype(expr);
-        fold_to_type(value, source.as_ref(), &ct)
+        fold_to_type(value, source.as_ref(), ct)
     }
 
     /// Count the number of array elements from an initializer.
@@ -4158,6 +4267,9 @@ impl SemanticAnalyzer {
         // int: 1)` on a `void *` is the selector error alone).
         self.analyze_unevaluated(controlling);
         for assoc in associations {
+            if let Some(ref ts) = assoc.type_spec {
+                self.check_no_nested_auto_type(ts, controlling.span());
+            }
             self.analyze_expr(&assoc.expr);
         }
         self.check_generic_selection(controlling, associations);
@@ -4852,6 +4964,7 @@ impl SemanticAnalyzer {
             folding_initializer: false,
             pre_c99: self.pre_c99,
             named_constants_only: false,
+            param_overlay: Some(&self.param_overlay),
         };
         if let Some(val) = evaluator.eval_const_expr(expr) {
             self.result.const_values.insert(expr.id(), val);
@@ -8771,6 +8884,7 @@ dereference it before applying '->' to it?"
         span: Span,
         storage: &crate::frontend::parser::ast::CompoundLiteralStorage,
     ) {
+        self.check_no_nested_auto_type(ts, span);
         self.check_void_members(ts, span);
         let empty = matches!(init, Initializer::List(items) if items.is_empty());
         let role = VoidRole::CompoundLiteral { empty };
@@ -10972,6 +11086,7 @@ dereference it before applying '->' to it?"
             expr_types: Some(&self.result.expr_types),
             builtin_policy: self.builtin_policy.clone(),
             pre_c99: self.pre_c99,
+            param_overlay: Some(&self.param_overlay),
         }
     }
 
@@ -10994,6 +11109,7 @@ dereference it before applying '->' to it?"
             folding_initializer: false,
             pre_c99: self.pre_c99,
             named_constants_only: false,
+            param_overlay: Some(&self.param_overlay),
         }
     }
 
@@ -11245,7 +11361,70 @@ fn written_cvr(is_const: bool, is_volatile: bool, is_restrict: bool) -> u8 {
         | u8::from(is_restrict) * PtrQuals::RESTRICT
 }
 
+impl SemanticAnalyzer {
+    fn push_param_overlay_enums(&self, ts: &TypeSpecifier) {
+        match ts {
+            TypeSpecifier::Enum(name, Some(variants), is_packed, underlying, _) => {
+                let fixed = underlying.as_deref().and_then(|u| {
+                    crate::common::types::EnumType::fixed_underlying(self.type_spec_to_ctype(u))
+                });
+                let enum_ty = fixed.clone().unwrap_or(CType::Int);
+                let _ = (name, is_packed);
+                let mut next: i128 = 0;
+                for variant in variants {
+                    if let Some(val_expr) = &variant.value
+                        && let Some(val) = self.eval_const_expr(val_expr)
+                    {
+                        next = i128::from(val);
+                    }
+                    let val = next as i64;
+                    self.param_overlay.borrow_mut().push(ParamOverlay::Enum(
+                        variant.name.clone(),
+                        val,
+                        enum_ty.clone(),
+                    ));
+                    next = next.saturating_add(1);
+                }
+            }
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), .., _) => {
+                for field in fields {
+                    self.push_param_overlay_enums(&field.type_spec);
+                }
+            }
+            TypeSpecifier::Array(inner, _)
+            | TypeSpecifier::Pointer(inner, _)
+            | TypeSpecifier::TypeofType(inner, _)
+            | TypeSpecifier::Vector(inner, _)
+            | TypeSpecifier::ExtVector(inner, _) => {
+                self.push_param_overlay_enums(inner);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl type_builder::TypeConvertContext for SemanticAnalyzer {
+    fn convert_param_decls(&self, params: &[ParamDecl]) -> Vec<(CType, Option<String>)> {
+        let mark = self.param_overlay.borrow().len();
+        let _guard = ParamOverlayGuard {
+            overlay: &self.param_overlay,
+            mark,
+        };
+        let mut resolved = Vec::with_capacity(params.len());
+        for p in params {
+            self.push_param_overlay_enums(&p.type_spec);
+            let ty = type_builder::param_decl_to_ctype(self, p);
+            if let Some(name) = &p.name {
+                self.param_overlay
+                    .borrow_mut()
+                    .push(ParamOverlay::Symbol(name.clone(), ty.clone()));
+            }
+            resolved.push((ty, p.name.clone()));
+        }
+        resolved
+    }
+
     fn typedef_cvr(&self, name: &str) -> Option<u8> {
         self.result.type_context.typedef_top_cvr(name)
     }

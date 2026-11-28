@@ -556,6 +556,8 @@ pub mod decl_flag {
     /// `constexpr` came after `_Thread_local` or `auto` (diagnostic order).
     pub const CONSTEXPR_LAST: u16 = 1 << 11;
     pub const DESIGNATED_INIT: u16 = 1 << 12;
+    /// C23 `auto` inferred declaration (6.7.10), as distinct from GNU `__auto_type`.
+    pub const C23_AUTO: u16 = 1 << 13;
 }
 
 /// A variable/type declaration.
@@ -733,6 +735,15 @@ impl Declaration {
     #[inline]
     pub fn set_inline(&mut self, v: bool) {
         self.set_flag(decl_flag::INLINE, v)
+    }
+    /// C23 `auto` inferred declaration (6.7.10), as distinct from GNU `__auto_type`.
+    #[inline]
+    pub fn is_c23_auto(&self) -> bool {
+        self.flags & decl_flag::C23_AUTO != 0
+    }
+    #[inline]
+    pub fn set_c23_auto(&mut self, v: bool) {
+        self.set_flag(decl_flag::C23_AUTO, v)
     }
 
     #[inline]

@@ -69,12 +69,11 @@ impl Lowerer {
         let declares_function = DerivedDeclarator::declares_function(&declarator.derived)
             || self.block_function_typedef(decl, declarator).is_some()
             || self.block_typeof_redeclares_function(decl, declarator);
-        // Remove from locals, but track in scope frame so pop_scope()
-        // restores the local when this block exits.
+        // Remove from locals, static_local_names, and const_local_values,
+        // tracking in scope frame so pop_scope() restores on block exit.
         self.shadow_local_for_scope(&declarator.name);
-        // Also remove from static_local_names so that the extern name
-        // resolves to the true global, not a same-named static local
         self.shadow_static_for_scope(&declarator.name);
+        self.shadow_const_for_scope(&declarator.name);
 
         // Propagate __attribute__((weak)) / visibility from ANY block-scope
         // extern declaration — including `extern typeof(f) f
@@ -100,7 +99,7 @@ impl Lowerer {
         if !self.globals.contains_key(&declarator.name) {
             let mut ext_da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
             self.apply_declaration_qualifiers(&mut ext_da, decl, declarator, inherited_volatile);
-            ext_da.apply_decl_vector_type(decl);
+            self.apply_decl_vector_type(&mut ext_da, decl);
             // A block-scope `extern` names an object with linkage, so it is
             // placed exactly like its file-scope declaration (global_decl.rs).
             // Skipping this left `extern long __seg_gs x;` in generic memory.
@@ -171,6 +170,8 @@ impl Lowerer {
                 variadic,
             );
             self.shadow_local_for_scope(&declarator.name);
+            self.shadow_static_for_scope(&declarator.name);
+            self.shadow_const_for_scope(&declarator.name);
             self.register_block_func_attrs(declarator, entity.as_deref());
             return true;
         }
@@ -189,6 +190,8 @@ impl Lowerer {
                 fti.variadic,
             );
             self.shadow_local_for_scope(&declarator.name);
+            self.shadow_static_for_scope(&declarator.name);
+            self.shadow_const_for_scope(&declarator.name);
             self.register_block_func_attrs(declarator, entity.as_deref());
             return true;
         }
@@ -199,6 +202,8 @@ impl Lowerer {
             let entity =
                 self.block_scope_entity_key(&declarator.name, declarator.attrs.is_nested_fn());
             self.shadow_local_for_scope(&declarator.name);
+            self.shadow_static_for_scope(&declarator.name);
+            self.shadow_const_for_scope(&declarator.name);
             self.register_block_func_attrs(declarator, entity.as_deref());
             return true;
         }
@@ -319,6 +324,7 @@ impl Lowerer {
         da: &DeclAnalysis,
         is_complex: bool,
         decl: &Declaration,
+        type_spec: &TypeSpecifier,
     ) {
         if da.is_array && (da.base_ty == IrType::I8 || da.base_ty == IrType::U8) {
             self.lower_char_array_init_expr(expr, alloca, da);
@@ -329,7 +335,7 @@ impl Lowerer {
         } else if da.is_struct {
             self.lower_struct_copy_init(expr, alloca, da);
         } else if is_complex {
-            self.lower_complex_var_init(expr, alloca, da, decl);
+            self.lower_complex_var_init(expr, alloca, da, type_spec);
         } else if let Some(ref ct) = da.c_type {
             if ct.is_vector() {
                 self.copy_vector_expr_to_alloca(expr, alloca, ct);
@@ -518,9 +524,9 @@ impl Lowerer {
         expr: &Expr,
         alloca: Value,
         da: &DeclAnalysis,
-        decl: &Declaration,
+        type_spec: &TypeSpecifier,
     ) {
-        let complex_ctype = self.type_spec_to_ctype(&decl.type_spec);
+        let complex_ctype = self.type_spec_to_ctype(type_spec);
         let src = self.lower_expr_to_complex(expr, &complex_ctype);
         self.emit(Instruction::Memcpy {
             dest: alloca,

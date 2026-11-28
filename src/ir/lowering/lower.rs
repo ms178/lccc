@@ -797,6 +797,11 @@ impl Lowerer {
         self.func_mut().shadow_static_for_scope(name);
     }
 
+    /// Remove a cached const local value, tracking the removal in the current scope frame.
+    pub(super) fn shadow_const_for_scope(&mut self, name: &str) {
+        self.func_mut().shadow_const_for_scope(name);
+    }
+
     /// Insert a local variable, tracking the change in the current scope frame.
     pub(super) fn insert_local_scoped(&mut self, name: String, info: LocalInfo) {
         self.func_mut().insert_local_scoped(name, info);
@@ -955,7 +960,7 @@ impl Lowerer {
                                 self.build_full_ctype(&decl.type_spec, &declarator.derived);
                             if !base_ctype.is_vector() {
                                 if let Some(vec_ctype) =
-                                    decl.resolve_vector_ctype(base_ctype.clone())
+                                    self.resolve_decl_vector_ctype(decl, base_ctype.clone())
                                 {
                                     has_vector_typedefs = true;
                                     self.types

@@ -46,6 +46,8 @@ struct DeclContext {
     /// `Parser::spec_names_unused_type`): each declarator of exactly that
     /// type is exempt from the unused warnings.
     spec_type_unused: bool,
+    /// C23 `auto` inferred declaration (6.7.10), as distinct from GNU `__auto_type`.
+    is_c23_auto: bool,
 }
 
 /// Parser-side mirror of `common::type_builder::apply_declaration_address_space`
@@ -195,6 +197,8 @@ impl Parser {
         let type_spec = self
             .parse_type_specifier()
             .or_else(|| self.implicit_int_type_specifier(start))?;
+        let is_c23_auto = self.attrs.parsing_c23_auto();
+        self.attrs.set_c23_auto(false);
         // Read before a declarator's parameter list parses its own specifiers.
         let spec_type_unused = self.spec_names_unused_type(&type_spec);
         // Capture the declaration's named address space before any declarator
@@ -230,7 +234,7 @@ impl Parser {
         // Specifier-position applicability records are settled here, before
         // the declarator (parameters, post-declarator attributes) can add
         // unrelated entries to the pool.
-        let mut spec_attr_targets = std::mem::take(&mut self.attrs.parsing_attr_targets);
+        let spec_attr_targets = std::mem::take(&mut self.attrs.parsing_attr_targets);
 
         let (name, derived, decl_mode, decl_common, decl_aligned, _) =
             self.parse_declarator_with_attrs();
@@ -244,149 +248,33 @@ impl Parser {
         let declarator_base_volatile = self.attrs.declarator_base_volatile;
         let declarator_base_atomic = self.attrs.declarator_base_atomic;
         let declarator_base_restrict = self.attrs.declarator_base_restrict;
-        let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
-            self.parse_asm_and_attributes();
-        // Applicability is a property of the declaration, not of where the
-        // attribute was written: `int x __attribute__((noreturn));` is the
-        // same mistake as `__attribute__((noreturn)) int x;`, and GCC
-        // diagnoses both. Every position feeds one pool, and the verdict is
-        // taken once the declarator kind is known.
-        spec_attr_targets.extend(std::mem::take(&mut self.attrs.parsing_attr_targets));
-        self.check_attribute_targets(&type_spec, &derived, &spec_attr_targets, start);
-        // `cleanup` names a function to run when a *block* scope ends. A
-        // file-scope object never ends one, so GCC ignores the attribute
-        // there (measured: `'cleanup' attribute ignored`); the generic
-        // object/function rule cannot see the difference.
-        // Same location rule as the kind check above: GCC reports at the
-        // declaration, a leading attribute list included.
-        let decl_loc = match self.attrs.first_attr_span {
-            Some(attr) if attr.start < start.start => attr,
-            _ => start,
-        };
-        // A `cleanup` list with the wrong number of arguments is an error and
-        // gcc reports only that error, so the applicability warning is
-        // suppressed for it (measured).
-        let cleanup_arity_error = self.cleanup_diagnoses.iter().any(|(d, _)| {
-            matches!(
-                d,
-                crate::frontend::parser::parse::CleanupDiagnosis::WrongArgumentCount(_)
-            )
-        });
-        for (attr_name, attr_span, _) in &spec_attr_targets {
-            if attr_name == "cleanup" && !cleanup_arity_error {
-                // One verdict per written attribute: gcc reports
-                // `int x __attribute__((noreturn)) __attribute__((noreturn));`
-                // twice, and `cleanup` behaves the same way (measured).
-                self.diagnostics.warning_with_kind_salted(
-                    "'cleanup' attribute ignored",
-                    decl_loc,
-                    crate::common::error::WarningKind::Attributes,
-                    Self::attribute_dedup_salt(*attr_span),
-                );
-            }
-        }
-        let mode_kind = decl_mode.or(post_mode);
-        let is_common = decl_common || post_common;
-        // Merge alignment from _Alignas (type specifier), declarator attrs, and post-declarator attrs.
-        // Per C11, alignment can only increase (6.7.5), so take the maximum.
-        let mut merged_alignment = self.attrs.parsed_alignas.take();
-        let alignas_type = self.attrs.parsed_alignas_type.take();
-        let alignment_sizeof_type = self.attrs.parsed_alignment_sizeof_type.take();
-        for a in [decl_aligned, post_aligned].iter().copied().flatten() {
-            merged_alignment = Some(merged_alignment.map_or(a, |prev| prev.max(a)));
-        }
-        // Merge all sources of constructor/destructor: type-level attrs, declarator-level attrs, post-declarator attrs
-        let is_constructor = type_level_ctor || self.attrs.parsing_constructor() || post_ctor;
-        let is_destructor = type_level_dtor || self.attrs.parsing_destructor() || post_dtor;
-        // Capture alias/ifunc/weak/visibility/section/error attributes
-        let is_weak = self.attrs.parsing_weak();
-        let alias_target = self.attrs.parsing_alias_target.take();
-        let ifunc_target = self.attrs.parsing_ifunc_target.take();
-        // Use explicit __attribute__((visibility(...))) if present, otherwise fall back
-        // to the current #pragma GCC visibility default (if any).
-        let visibility = self
-            .attrs
-            .parsing_visibility
-            .take()
-            .or_else(|| self.pragma_default_visibility.clone());
-        let section = self.attrs.parsing_section.take();
-        let tls_model = self.attrs.parsing_tls_model.take();
-        let is_error_attr = self.attrs.parsing_error_attr();
-        let is_noreturn = self.attrs.parsing_noreturn();
-        let cleanup_fn = self.attrs.parsing_cleanup_fn.take();
-        let symver = self.attrs.parsing_symver.take();
-        let target = self.attrs.parsing_target.take();
-        let target_clones = self.attrs.parsing_target_clones.take();
-        let is_uninitialized = self.attrs.parsing_uninitialized();
-        self.attrs.set_uninitialized(false);
-        let diagnose_as = self.attrs.parsing_diagnose_as.take();
-        let is_used = self.attrs.parsing_used();
-        let is_maybe_unused = self.attrs.parsing_maybe_unused();
-        let is_fastcall = self.attrs.parsing_fastcall();
-        let regparm = self.attrs.parsing_regparm;
-        let is_naked = self.attrs.parsing_naked();
-        let no_instrument = self.attrs.parsing_no_instrument();
-        let is_noinline = self.attrs.parsing_noinline();
-        let is_pure = self.attrs.parsing_pure();
-        let is_const_attr = self.attrs.parsing_const_attr();
-        let is_cold = self.attrs.parsing_cold();
-        let is_stack_protect = self.attrs.parsing_stack_protect;
-        self.attrs.parsing_stack_protect = false;
-        let is_no_stack_protector = self.attrs.parsing_no_stack_protector;
-        self.attrs.parsing_no_stack_protector = false;
-        let externally_visible = self.attrs.parsing_externally_visible;
-        self.attrs.parsing_externally_visible = false;
-        let zero_call_used_regs = self.attrs.parsing_zero_call_used_regs.take();
-        let no_sanitize = self.attrs.parsing_no_sanitize.take();
-
-        // Build per-declarator attributes struct from the collected flags
-        let mut decl_attrs = DeclAttributes::default();
-        decl_attrs.parsing_attr_targets = spec_attr_targets;
-        decl_attrs.object_space = declarator_object_space;
-        decl_attrs.object_volatile = declarator_object_volatile;
-        decl_attrs.pointer_const = declarator_pointer_const;
-        (decl_attrs.object_restrict, decl_attrs.object_atomic) = declarator_object_quals;
-        decl_attrs.base_volatile = declarator_base_volatile;
-        decl_attrs.base_atomic = declarator_base_atomic;
-        decl_attrs.base_restrict = declarator_base_restrict;
-        decl_attrs.set_constructor(is_constructor);
-        decl_attrs.set_destructor(is_destructor);
-        decl_attrs.set_weak(is_weak);
-        decl_attrs.set_error_attr(is_error_attr);
-        decl_attrs.set_noreturn(is_noreturn);
-        decl_attrs.set_used(is_used);
-        decl_attrs.set_maybe_unused(is_maybe_unused);
-        decl_attrs.set_fastcall(is_fastcall);
-        decl_attrs.regparm = regparm;
-        decl_attrs.set_naked(is_naked);
-        decl_attrs.set_no_instrument(no_instrument);
-        decl_attrs.set_pure(is_pure);
-        decl_attrs.set_const_attr(is_const_attr);
-        decl_attrs.set_cold(is_cold);
-        decl_attrs.set_uninitialized(is_uninitialized);
-        decl_attrs.set_stack_protect(is_stack_protect);
-        decl_attrs.set_no_stack_protector(is_no_stack_protector);
-        decl_attrs.set_retain(self.attrs.parsing_retain());
-        decl_attrs.set_noplt(self.attrs.parsing_noplt());
-        decl_attrs.set_noinit(self.attrs.parsing_noinit());
-        decl_attrs.set_persistent(self.attrs.parsing_persistent());
-        decl_attrs.set_nocommon(self.attrs.parsing_nocommon());
-        decl_attrs.set_nested_fn(self.attrs.parsing_nested_fn());
-        decl_attrs.alias_target = alias_target;
-        decl_attrs.ifunc_target = ifunc_target;
-        decl_attrs.visibility = visibility;
-        decl_attrs.tls_model = tls_model;
-        decl_attrs.section = section;
-        decl_attrs.tls_model = tls_model;
-        decl_attrs.asm_register = first_asm_reg;
-        decl_attrs.cleanup_fn = cleanup_fn;
-        decl_attrs.symver = symver;
-        decl_attrs.target = target;
-        decl_attrs.target_clones = target_clones;
-        decl_attrs.diagnose_as = diagnose_as;
-        decl_attrs.externally_visible = externally_visible;
-        decl_attrs.zero_call_used_regs = zero_call_used_regs;
-        decl_attrs.no_sanitize = no_sanitize;
+        let (
+            decl_attrs,
+            is_noinline,
+            mode_kind,
+            is_common,
+            merged_alignment,
+            alignas_type,
+            alignment_sizeof_type,
+        ) = self.collect_external_decl_attrs(
+            &type_spec,
+            &derived,
+            spec_attr_targets,
+            type_level_ctor,
+            type_level_dtor,
+            decl_mode,
+            decl_common,
+            decl_aligned,
+            declarator_object_space,
+            declarator_object_volatile,
+            declarator_pointer_const,
+            declarator_object_quals,
+            declarator_base_volatile,
+            declarator_base_atomic,
+            declarator_base_restrict,
+            start,
+        );
+        let is_noinline = is_noinline || spec_noinline;
 
         // Apply __attribute__((mode(...))): transform type to specified
         // bit-width.  A POINTER declarator is different (measured gcc 16.2):
@@ -448,6 +336,7 @@ impl Parser {
                 spec_persistent,
                 spec_nocommon,
                 spec_type_unused,
+                is_c23_auto,
             };
             self.parse_declaration_rest(type_spec, name, derived, start, ctx)
         }
@@ -569,6 +458,164 @@ impl Parser {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn collect_external_decl_attrs(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+        mut spec_attr_targets: Vec<(String, Span, super::attribute_registry::AttributeTarget)>,
+        type_level_ctor: bool,
+        type_level_dtor: bool,
+        decl_mode: Option<crate::frontend::parser::parse::ModeKind>,
+        decl_common: bool,
+        decl_aligned: Option<usize>,
+        declarator_object_space: AddressSpace,
+        declarator_object_volatile: bool,
+        declarator_pointer_const: bool,
+        declarator_object_quals: (bool, bool),
+        declarator_base_volatile: bool,
+        declarator_base_atomic: bool,
+        declarator_base_restrict: bool,
+        start: Span,
+    ) -> (
+        DeclAttributes,
+        bool,
+        Option<crate::frontend::parser::parse::ModeKind>,
+        bool,
+        Option<usize>,
+        Option<TypeSpecifier>,
+        Option<TypeSpecifier>,
+    ) {
+        let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
+            self.parse_asm_and_attributes();
+        spec_attr_targets.extend(std::mem::take(&mut self.attrs.parsing_attr_targets));
+        self.check_attribute_targets(type_spec, derived, &spec_attr_targets, start);
+        let decl_loc = match self.attrs.first_attr_span {
+            Some(attr) if attr.start < start.start => attr,
+            _ => start,
+        };
+        let cleanup_arity_error = self.cleanup_diagnoses.iter().any(|(d, _)| {
+            matches!(
+                d,
+                crate::frontend::parser::parse::CleanupDiagnosis::WrongArgumentCount(_)
+            )
+        });
+        for (attr_name, attr_span, _) in &spec_attr_targets {
+            if attr_name == "cleanup" && !cleanup_arity_error {
+                self.diagnostics.warning_with_kind_salted(
+                    "'cleanup' attribute ignored",
+                    decl_loc,
+                    crate::common::error::WarningKind::Attributes,
+                    Self::attribute_dedup_salt(*attr_span),
+                );
+            }
+        }
+        let mode_kind = decl_mode.or(post_mode);
+        let is_common = decl_common || post_common;
+        let mut merged_alignment = self.attrs.parsed_alignas.take();
+        let alignas_type = self.attrs.parsed_alignas_type.take();
+        let alignment_sizeof_type = self.attrs.parsed_alignment_sizeof_type.take();
+        for a in [decl_aligned, post_aligned].iter().copied().flatten() {
+            merged_alignment = Some(merged_alignment.map_or(a, |prev| prev.max(a)));
+        }
+        let is_constructor = type_level_ctor || self.attrs.parsing_constructor() || post_ctor;
+        let is_destructor = type_level_dtor || self.attrs.parsing_destructor() || post_dtor;
+        let is_weak = self.attrs.parsing_weak();
+        let alias_target = self.attrs.parsing_alias_target.take();
+        let ifunc_target = self.attrs.parsing_ifunc_target.take();
+        let visibility = self
+            .attrs
+            .parsing_visibility
+            .take()
+            .or_else(|| self.pragma_default_visibility.clone());
+        let section = self.attrs.parsing_section.take();
+        let tls_model = self.attrs.parsing_tls_model.take();
+        let is_error_attr = self.attrs.parsing_error_attr();
+        let is_noreturn = self.attrs.parsing_noreturn();
+        let cleanup_fn = self.attrs.parsing_cleanup_fn.take();
+        let symver = self.attrs.parsing_symver.take();
+        let target = self.attrs.parsing_target.take();
+        let target_clones = self.attrs.parsing_target_clones.take();
+        let is_uninitialized = self.attrs.parsing_uninitialized();
+        self.attrs.set_uninitialized(false);
+        let diagnose_as = self.attrs.parsing_diagnose_as.take();
+        let is_used = self.attrs.parsing_used();
+        let is_maybe_unused = self.attrs.parsing_maybe_unused();
+        let is_fastcall = self.attrs.parsing_fastcall();
+        let regparm = self.attrs.parsing_regparm;
+        let is_naked = self.attrs.parsing_naked();
+        let no_instrument = self.attrs.parsing_no_instrument();
+        let is_noinline = self.attrs.parsing_noinline();
+        let is_pure = self.attrs.parsing_pure();
+        let is_const_attr = self.attrs.parsing_const_attr();
+        let is_cold = self.attrs.parsing_cold();
+        let is_stack_protect = self.attrs.parsing_stack_protect;
+        self.attrs.parsing_stack_protect = false;
+        let is_no_stack_protector = self.attrs.parsing_no_stack_protector;
+        self.attrs.parsing_no_stack_protector = false;
+        let externally_visible = self.attrs.parsing_externally_visible;
+        self.attrs.parsing_externally_visible = false;
+        let zero_call_used_regs = self.attrs.parsing_zero_call_used_regs.take();
+        let no_sanitize = self.attrs.parsing_no_sanitize.take();
+
+        let mut decl_attrs = DeclAttributes::default();
+        decl_attrs.parsing_attr_targets = spec_attr_targets;
+        decl_attrs.object_space = declarator_object_space;
+        decl_attrs.object_volatile = declarator_object_volatile;
+        decl_attrs.pointer_const = declarator_pointer_const;
+        (decl_attrs.object_restrict, decl_attrs.object_atomic) = declarator_object_quals;
+        decl_attrs.base_volatile = declarator_base_volatile;
+        decl_attrs.base_atomic = declarator_base_atomic;
+        decl_attrs.base_restrict = declarator_base_restrict;
+        decl_attrs.set_constructor(is_constructor);
+        decl_attrs.set_destructor(is_destructor);
+        decl_attrs.set_weak(is_weak);
+        decl_attrs.set_error_attr(is_error_attr);
+        decl_attrs.set_noreturn(is_noreturn);
+        decl_attrs.set_used(is_used);
+        decl_attrs.set_maybe_unused(is_maybe_unused);
+        decl_attrs.set_fastcall(is_fastcall);
+        decl_attrs.regparm = regparm;
+        decl_attrs.set_naked(is_naked);
+        decl_attrs.set_no_instrument(no_instrument);
+        decl_attrs.set_pure(is_pure);
+        decl_attrs.set_const_attr(is_const_attr);
+        decl_attrs.set_cold(is_cold);
+        decl_attrs.set_uninitialized(is_uninitialized);
+        decl_attrs.set_stack_protect(is_stack_protect);
+        decl_attrs.set_no_stack_protector(is_no_stack_protector);
+        decl_attrs.set_retain(self.attrs.parsing_retain());
+        decl_attrs.set_noplt(self.attrs.parsing_noplt());
+        decl_attrs.set_noinit(self.attrs.parsing_noinit());
+        decl_attrs.set_persistent(self.attrs.parsing_persistent());
+        decl_attrs.set_nocommon(self.attrs.parsing_nocommon());
+        decl_attrs.set_nested_fn(self.attrs.parsing_nested_fn());
+        decl_attrs.alias_target = alias_target;
+        decl_attrs.ifunc_target = ifunc_target;
+        decl_attrs.visibility = visibility;
+        decl_attrs.tls_model = tls_model;
+        decl_attrs.section = section;
+        decl_attrs.asm_register = first_asm_reg;
+        decl_attrs.cleanup_fn = cleanup_fn;
+        decl_attrs.symver = symver;
+        decl_attrs.target = target;
+        decl_attrs.target_clones = target_clones;
+        decl_attrs.diagnose_as = diagnose_as;
+        decl_attrs.externally_visible = externally_visible;
+        decl_attrs.zero_call_used_regs = zero_call_used_regs;
+        decl_attrs.no_sanitize = no_sanitize;
+
+        (
+            decl_attrs,
+            is_noinline,
+            mode_kind,
+            is_common,
+            merged_alignment,
+            alignas_type,
+            alignment_sizeof_type,
+        )
+    }
+
     /// Parse the rest of a function definition after the declarator.
     fn parse_function_def(
         &mut self,
@@ -638,21 +685,9 @@ impl Parser {
             );
         }
 
-        // Shadow typedef names used as parameter names, and hide enumerators
-        // of the same name until the body ends.
-        let enum_mark = self.enum_scope_log.len();
-        let mut shadowed_added: Vec<String> = Vec::new();
-        for param in &final_params {
-            if let Some(ref pname) = param.name {
-                if self.is_parser_enum_constant(pname) {
-                    self.hide_enum_constant(pname);
-                }
-                if self.typedefs.contains(pname) && !self.shadowed_typedefs.contains(pname) {
-                    self.shadowed_typedefs.insert(pname.clone());
-                    shadowed_added.push(pname.clone());
-                }
-            }
-        }
+        // Shadow typedef names used as parameter names (and expose inline enums
+        // defined in parameter types) until the body ends.
+        let (enum_mark, shadowed_added) = self.enter_function_param_scope(&final_params);
         // Clear noreturn so that _Noreturn/noreturn from the function definition
         // does not leak into local declarations inside the body.
         // parse_compound_stmt saves/restores attr flags, so this is safe.
@@ -698,10 +733,7 @@ impl Parser {
         self.asm_deferred_instantiation = saved_asm_deferral;
         self.asm_immediate_validation_deferred = prior_asm_immediate_defer;
         let body_span = self.through_previous_token(open);
-        for n in shadowed_added {
-            self.shadowed_typedefs.remove(&n);
-        }
-        self.restore_enum_scope(enum_mark);
+        self.leave_function_param_scope(enum_mark, shadowed_added);
 
         self.flush_declarator_verdicts(
             start,
@@ -1485,6 +1517,7 @@ impl Parser {
         d.set_const(self.attrs.parsing_const());
         d.set_constexpr(self.attrs.parsing_constexpr());
         d.set_constexpr_last(self.attrs.parsing_constexpr_last());
+        d.set_c23_auto(ctx.is_c23_auto);
         d.set_volatile(self.attrs.parsing_volatile());
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_common(ctx.is_common);
@@ -1706,6 +1739,7 @@ impl Parser {
         self.attrs.set_inline(false);
         self.attrs.set_const(false);
         self.attrs.set_constexpr(false);
+        self.attrs.set_c23_auto(false);
         self.attrs.set_atomic(false);
         self.attrs.set_restrict(false);
         self.attrs.set_volatile(false);
@@ -1720,6 +1754,8 @@ impl Parser {
         self.attrs.set_nocommon(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let type_spec = self.parse_type_specifier()?;
+        let is_c23_auto = self.attrs.parsing_c23_auto();
+        self.attrs.set_c23_auto(false);
         let spec_type_unused = self.spec_names_unused_type(&type_spec);
         let spec_maybe_unused = self.attrs.parsing_maybe_unused();
         self.attrs.set_maybe_unused(false);
@@ -2012,6 +2048,7 @@ impl Parser {
         d.set_const(self.attrs.parsing_const());
         d.set_constexpr(self.attrs.parsing_constexpr());
         d.set_constexpr_last(self.attrs.parsing_constexpr_last());
+        d.set_c23_auto(is_c23_auto);
         d.set_volatile(self.attrs.parsing_volatile());
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_thread_local(self.attrs.parsing_thread_local());

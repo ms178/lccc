@@ -253,6 +253,7 @@ impl DeclAnalysis {
 
     /// Apply a declaration's vector attribute when the base type has not
     /// already been wrapped by the type-specifier/typedef path.
+    #[allow(dead_code)]
     pub fn apply_decl_vector_type(&mut self, decl: &Declaration) {
         let Some(element) = self.c_type.clone() else {
             return;
@@ -262,6 +263,39 @@ impl DeclAnalysis {
         }
         if let Some(vector_ctype) = decl.resolve_vector_ctype(element) {
             self.apply_vector_ctype(vector_ctype);
+        }
+    }
+}
+
+impl super::lower::Lowerer {
+    /// Resolve declaration-level `vector_size` (constant or deferred `vector_size_expr`)
+    /// or `ext_vector_type` in lowering context so typedef/variable vector attributes
+    /// whose size depends on shadowed local typedefs or structs match sema.
+    pub(super) fn resolve_decl_vector_ctype(
+        &self,
+        decl: &Declaration,
+        element: CType,
+    ) -> Option<CType> {
+        if let Some(ctype) = decl.resolve_vector_ctype(element.clone()) {
+            return Some(ctype);
+        }
+        decl.vector_size_expr
+            .as_deref()
+            .and_then(|e| self.eval_const_expr(e))
+            .and_then(|c| self.const_to_i64(&c))
+            .and_then(|v| usize::try_from(v).ok())
+            .map(|bytes| CType::Vector(Box::new(element), bytes))
+    }
+
+    pub(super) fn apply_decl_vector_type(&self, da: &mut DeclAnalysis, decl: &Declaration) {
+        let Some(element) = da.c_type.clone() else {
+            return;
+        };
+        if element.is_vector() {
+            return;
+        }
+        if let Some(vector_ctype) = self.resolve_decl_vector_ctype(decl, element) {
+            da.apply_vector_ctype(vector_ctype);
         }
     }
 }

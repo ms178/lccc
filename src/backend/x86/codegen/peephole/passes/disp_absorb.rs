@@ -54,7 +54,7 @@ use super::flag_peepholes::flags_dead_after;
 use super::helpers::implicit_read_reg_family;
 use super::relay_and_lea::{
     dead_in_block_after, is_relayable_family, line_refs_family, plain_gp_operand,
-    split_two_operands,
+    segment_prefix_len, split_two_operands,
 };
 
 /// Fold every eligible `add/sub $imm, %rX` + memory consumer pair.
@@ -203,15 +203,33 @@ fn split_base_mem_operand<'a>(
     if base != reg {
         return None; // the register is the index, not the base
     }
-    // Displacement: the numeric run directly before '('.
+    // Displacement: runs from the end of the preceding delimiter (mnemonic
+    // whitespace, operand separator `,`, or validated `%seg:` prefix) up to
+    // `(`.  Scanning only the trailing digit/`-` run would mistake a symbolic
+    // or hex prefix (`sym(%r)`, `sym2(%r)`, `sym-8(%r)`, `0x10(%r)`) for a
+    // numeric displacement and glue the folded constant onto the prefix.
     let head = &line[..open];
     let disp_start = head
-        .rfind(|c: char| !c.is_ascii_digit() && c != '-')
+        .rfind(|c: char| c.is_ascii_whitespace() || matches!(c, ',' | ':'))
         .map_or(0, |p| p + 1);
+    if disp_start > 0 && head.as_bytes()[disp_start - 1] == b':' {
+        let before_colon = &head[..disp_start];
+        let seg_start = before_colon
+            .rfind(|c: char| c.is_ascii_whitespace() || c == ',')
+            .map_or(0, |p| p + 1);
+        if segment_prefix_len(&head[seg_start..]) != Some(disp_start - seg_start) {
+            return None;
+        }
+    } else if disp_start == 0 {
+        return None;
+    }
     let disp_txt = &head[disp_start..];
     let disp: i64 = if disp_txt.is_empty() {
         0
     } else {
+        if disp_txt.starts_with('+') {
+            return None;
+        }
         disp_txt.parse().ok()?
     };
     Some((&line[..disp_start], disp, &line[open..], &line[close + 1..]))
@@ -456,5 +474,35 @@ mod tests {
             "    ret\n",
         )));
         assert!(out.contains("addq $8, %rdi"), "{out}");
+    }
+
+    #[test]
+    fn symbolic_and_hex_displacements_decline_without_gluing() {
+        // Non-PIC `leaq sym(%rsi)` / `sym2(%rsi)` / `sym-8(%rsi)` / `sym+8(%rsi)`
+        // / `0x10(%rsi)` must not glue the constant onto the symbol/prefix.
+        for mem in [
+            "dist_code(%rsi)",
+            "foo2(%rsi)",
+            "foo-8(%rsi)",
+            "sym+8(%rsi)",
+            "0x10(%rsi)",
+        ] {
+            let out = run_pass(&frame(&format!(
+                "    addq $256, %rsi\n    leaq {mem}, %r10\n    ret\n"
+            )));
+            assert!(out.contains("addq $256, %rsi"), "{mem}: {out}");
+            assert!(out.contains(&format!("leaq {mem}, %r10")), "{mem}: {out}");
+        }
+    }
+
+    #[test]
+    fn segment_prefix_preserves_prefix() {
+        let out = run_pass(&frame(concat!(
+            "    addq $16, %rdi\n",
+            "    movq %gs:(%rdi), %rax\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("movq %gs:16(%rdi), %rax"), "{out}");
+        assert!(!out.contains("addq"), "{out}");
     }
 }

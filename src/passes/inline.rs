@@ -1365,6 +1365,7 @@ fn select_inline_site(
                 size_optimized,
             )
             || (!const_trip_admitted
+                && !small_loop_helper_exempt(callee_data, callee_inst_count)
                 && nested_loop_multisite_static_should_stay_outlined(
                     callee_data,
                     callee_inst_count,
@@ -1373,13 +1374,14 @@ fn select_inline_site(
                     site.pgo_force,
                     size_optimized,
                 ))
-            || repeated_small_loop_clone_should_stay_outlined(
-                callee_data,
-                callee_inst_count,
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
-            )
+            || (!small_loop_helper_exempt(callee_data, callee_inst_count)
+                && repeated_small_loop_clone_should_stay_outlined(
+                    callee_data,
+                    callee_inst_count,
+                    caller_has_section,
+                    site.pgo_force,
+                    size_optimized,
+                ))
         {
             continue;
         }
@@ -1504,6 +1506,7 @@ fn select_inline_site(
                 size_optimized,
             )
             || (!const_trip_admitted
+                && !small_loop_helper_exempt(callee_data, callee_inst_count)
                 && nested_loop_multisite_static_should_stay_outlined(
                     callee_data,
                     callee_inst_count,
@@ -1512,13 +1515,14 @@ fn select_inline_site(
                     site.pgo_force,
                     size_optimized,
                 ))
-            || repeated_small_loop_clone_should_stay_outlined(
-                callee_data,
-                callee_inst_count,
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
-            )
+            || (!small_loop_helper_exempt(callee_data, callee_inst_count)
+                && repeated_small_loop_clone_should_stay_outlined(
+                    callee_data,
+                    callee_inst_count,
+                    caller_has_section,
+                    site.pgo_force,
+                    size_optimized,
+                ))
         {
             continue;
         }
@@ -4837,11 +4841,11 @@ fn callee_data_for(
                 && inst_count_for_static <= MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
                 && func.blocks.len() <= medium_block_limit)
                 || (has_loops
-                    && fits_static_loop_inline_limits(
+                    && (fits_static_loop_inline_limits(
                         inst_count_for_static,
                         func.blocks.len(),
                         direct_call_count,
-                    )));
+                    ) || is_pure_alu_loop_helper_blocks(&func.blocks, inst_count_for_static))));
         // A static (non-inline) function with exactly one call site in the
         // module is dead after inlining (net code shrink), so GCC -O2 inlines
         // it even when it exceeds the multi-call-site static limits above.
@@ -4993,7 +4997,8 @@ fn callee_data_for(
         ) || (is_static_like
             && !func.is_inline
             && has_loops
-            && fits_static_loop_inline_limits(inst_count, func.blocks.len(), direct_call_count))
+            && (fits_static_loop_inline_limits(inst_count, func.blocks.len(), direct_call_count)
+                || is_pure_alu_loop_helper_blocks(&func.blocks, inst_count)))
             // GNU89 `extern inline __attribute__((gnu_inline))` bodies exist
             // ONLY for inlining (no out-of-line copy is emitted in this TU);
             // a rejected site leaves a call to an external symbol that may
@@ -5533,6 +5538,158 @@ fn repeated_small_loop_clone_should_stay_outlined(
         && data.blocks.len() <= MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS
         && !caller_has_section
         && !pgo_force
+}
+
+fn is_pure_alu_inst(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::BinOp { op, .. } => !op.can_trap(),
+        Instruction::UnaryOp { .. }
+        | Instruction::Cmp { .. }
+        | Instruction::Cast { .. }
+        | Instruction::Copy { .. }
+        | Instruction::Select { .. }
+        | Instruction::Phi { .. }
+        | Instruction::ParamRef { .. } => true,
+        _ => false,
+    }
+}
+
+fn safe_param_home_allocas(blocks: &[BasicBlock]) -> FxHashSet<Value> {
+    let Some(entry) = blocks.first() else {
+        return FxHashSet::default();
+    };
+    let mut param_refs: FxHashSet<Value> = FxHashSet::default();
+    let mut candidates: FxHashSet<Value> = FxHashSet::default();
+    for inst in &entry.instructions {
+        match inst {
+            Instruction::ParamRef { dest, .. } => {
+                param_refs.insert(*dest);
+            }
+            Instruction::Alloca {
+                dest,
+                volatile: false,
+                semantic_volatile: false,
+                ..
+            } => {
+                candidates.insert(*dest);
+            }
+            _ => {}
+        }
+    }
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let mut stored_once: FxHashSet<Value> = FxHashSet::default();
+    let mut disqualified: FxHashSet<Value> = FxHashSet::default();
+    for (b_idx, block) in blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Alloca { dest, .. } if b_idx == 0 && candidates.contains(dest) => {}
+                Instruction::Load {
+                    ptr,
+                    volatile: false,
+                    ..
+                } if candidates.contains(ptr) => {}
+                Instruction::Store {
+                    val: Operand::Value(v),
+                    ptr,
+                    volatile: false,
+                    ..
+                } if b_idx == 0
+                    && candidates.contains(ptr)
+                    && param_refs.contains(v)
+                    && *ptr != *v
+                    && stored_once.insert(*ptr) => {}
+                _ => {
+                    inst.for_each_used_value(|u| {
+                        if candidates.contains(&Value(u)) {
+                            disqualified.insert(Value(u));
+                        }
+                    });
+                }
+            }
+        }
+        block.terminator.for_each_used_value(|u| {
+            if candidates.contains(&Value(u)) {
+                disqualified.insert(Value(u));
+            }
+        });
+    }
+    candidates.retain(|v| !disqualified.contains(v));
+    candidates
+}
+
+fn is_pure_alu_inst_with_param_allocas(
+    inst: &Instruction,
+    b_idx: usize,
+    param_allocas: &FxHashSet<Value>,
+) -> bool {
+    if is_pure_alu_inst(inst) {
+        return true;
+    }
+    match inst {
+        Instruction::Alloca { dest, .. } => b_idx == 0 && param_allocas.contains(dest),
+        Instruction::Load {
+            ptr,
+            volatile: false,
+            ..
+        } => param_allocas.contains(ptr),
+        Instruction::Store {
+            ptr,
+            volatile: false,
+            ..
+        } => b_idx == 0 && param_allocas.contains(ptr),
+        _ => false,
+    }
+}
+
+fn is_pure_alu_loop_helper_blocks(blocks: &[BasicBlock], raw_inst_count: usize) -> bool {
+    if raw_inst_count == 0 || raw_inst_count > 48 || blocks.len() > 16 {
+        return false;
+    }
+    let param_allocas = safe_param_home_allocas(blocks);
+    blocks.iter().enumerate().all(|(b_idx, b)| {
+        b.instructions
+            .iter()
+            .all(|inst| is_pure_alu_inst_with_param_allocas(inst, b_idx, &param_allocas))
+    })
+}
+
+fn is_small_readonly_loop_helper_blocks(
+    blocks: &[BasicBlock],
+    raw_inst_count: usize,
+    direct_call_count: usize,
+) -> bool {
+    if raw_inst_count == 0
+        || raw_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS
+        || blocks.len() > MAX_INLINE_BLOCKS
+        || direct_call_count > MAX_SMALL_STATIC_LOOP_INLINE_CLONES
+    {
+        return false;
+    }
+    let param_allocas = safe_param_home_allocas(blocks);
+    blocks.iter().enumerate().all(|(b_idx, b)| {
+        b.instructions.iter().all(|inst| {
+            is_pure_alu_inst_with_param_allocas(inst, b_idx, &param_allocas)
+                || matches!(
+                    inst,
+                    Instruction::GetElementPtr { .. }
+                        | Instruction::Load {
+                            volatile: false,
+                            ..
+                        }
+                )
+        })
+    })
+}
+
+fn small_loop_helper_exempt(data: &CalleeData, raw_inst_count: usize) -> bool {
+    is_pure_alu_loop_helper_blocks(&data.blocks, raw_inst_count)
+        || is_small_readonly_loop_helper_blocks(
+            &data.blocks,
+            raw_inst_count,
+            data.direct_call_count,
+        )
 }
 
 /// Return whether a descendant is selected by the inliner's unconditional
@@ -8955,6 +9112,93 @@ mod inline_limit_tests {
         assert!(!repeated_small_loop_clone_should_stay_outlined(
             &helper, 27, false, false, false
         ));
+    }
+
+    #[test]
+    fn small_loop_helper_exemption_admits_pure_alu_and_small_readonly_only() {
+        let mut alu = loop_helper_data(8, 34);
+        alu.is_plain_static = true;
+        alu.is_static_inline = false;
+        alu.direct_call_count = 5;
+        assert!(small_loop_helper_exempt(&alu, 34));
+        assert!(!small_loop_helper_exempt(&alu, 49));
+
+        // Adding a non-volatile load keeps a <=20-inst / <=6-blk / <=4-site
+        // helper exempt, but disqualifies the 34-inst or 5-site helper.
+        let load = Instruction::Load {
+            dest: Value(1),
+            ptr: Value(0),
+            ty: crate::common::types::IrType::U32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        alu.blocks[0].instructions[0] = load.clone();
+        assert!(!small_loop_helper_exempt(&alu, 34));
+
+        let mut ro = loop_helper_data(6, 19);
+        ro.is_plain_static = true;
+        ro.is_static_inline = false;
+        ro.direct_call_count = 4;
+        ro.blocks[0].instructions[0] = load;
+        assert!(small_loop_helper_exempt(&ro, 19));
+        ro.direct_call_count = 5;
+        assert!(!small_loop_helper_exempt(&ro, 19));
+
+        // Any store or trapping op fails closed.
+        let mut with_store = loop_helper_data(4, 10);
+        with_store.direct_call_count = 2;
+        with_store.blocks[0].instructions[0] = Instruction::Store {
+            val: Operand::Const(IrConst::I32(1)),
+            ptr: Value(0),
+            ty: crate::common::types::IrType::U32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        assert!(!small_loop_helper_exempt(&with_store, 10));
+
+        // Dead/param-only allocas in block 0 (unpromoted or post-mem2reg residue)
+        // stay exempt, whereas an escaping or mutably stored alloca fails closed.
+        let mut with_param_alloca = loop_helper_data(8, 35);
+        with_param_alloca.is_plain_static = true;
+        with_param_alloca.is_static_inline = false;
+        with_param_alloca.direct_call_count = 4;
+        with_param_alloca.blocks[0].instructions[0] = Instruction::Alloca {
+            dest: Value(10),
+            ty: crate::common::types::IrType::U32,
+            size: 4,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        with_param_alloca.blocks[0].instructions[1] = Instruction::ParamRef {
+            dest: Value(11),
+            param_idx: 0,
+            ty: crate::common::types::IrType::U32,
+        };
+        with_param_alloca.blocks[0].instructions[2] = Instruction::Store {
+            val: Operand::Value(Value(11)),
+            ptr: Value(10),
+            ty: crate::common::types::IrType::U32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        with_param_alloca.blocks[1].instructions[0] = Instruction::Load {
+            dest: Value(12),
+            ptr: Value(10),
+            ty: crate::common::types::IrType::U32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        assert!(small_loop_helper_exempt(&with_param_alloca, 35));
+
+        with_param_alloca.blocks[1].instructions[1] = Instruction::Store {
+            val: Operand::Const(IrConst::I32(2)),
+            ptr: Value(10),
+            ty: crate::common::types::IrType::U32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        assert!(!small_loop_helper_exempt(&with_param_alloca, 35));
     }
 }
 

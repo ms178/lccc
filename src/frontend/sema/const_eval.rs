@@ -18,7 +18,7 @@
 //! - Pointer arithmetic on global addresses
 //!   These remain in the lowerer since they require IR-level state.
 
-use super::analysis::FunctionInfo;
+use super::analysis::{FunctionInfo, ParamOverlay};
 use super::type_context::TypeContext;
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
@@ -29,6 +29,7 @@ use crate::frontend::parser::ast::{
     BinOp, DerivedDeclarator, Expr, ExprId, SizeofArg, StructFieldDecl, TypeSpecifier, UnaryOp,
 };
 use crate::ir::reexports::IrConst;
+use std::cell::RefCell;
 
 /// Map from AST expression node identity to its pre-computed compile-time constant.
 ///
@@ -78,6 +79,8 @@ pub struct SemaConstEval<'a> {
     /// _Static_assert(k, "");` is "not constant": GCC 16.2). Set for static
     /// assertions; the bottom-up cache, which holds such values, is skipped.
     pub named_constants_only: bool,
+    /// Temporary parameter/enumerator scope active while resolving a parameter list.
+    pub(crate) param_overlay: Option<&'a RefCell<Vec<ParamOverlay>>>,
 }
 
 impl<'a> SemaConstEval<'a> {
@@ -105,7 +108,8 @@ impl<'a> SemaConstEval<'a> {
     pub fn eval_const_expr(&self, expr: &Expr) -> Option<IrConst> {
         // Memoization: if this expression's constant value was already computed
         // during the bottom-up sema walk, return it in O(1).
-        if let Some(cache) = self.const_values {
+        let has_param_overlay = self.param_overlay.is_some_and(|o| !o.borrow().is_empty());
+        if !has_param_overlay && let Some(cache) = self.const_values {
             if let Some(cached) = cache.get(&expr.id()) {
                 return Some(*cached);
             }
@@ -504,6 +508,18 @@ impl<'a> SemaConstEval<'a> {
 
             // Identifier: enum constants
             Expr::Identifier(name, _) => {
+                if let Some(overlay) = self.param_overlay {
+                    let entries = overlay.borrow();
+                    for entry in entries.iter().rev() {
+                        match entry {
+                            ParamOverlay::Symbol(n, _) if n == name => return None,
+                            ParamOverlay::Enum(n, val, _) if n == name => {
+                                return Some(IrConst::I64(*val));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 // Objects and enumerators share the ordinary-identifier
                 // namespace (C11 6.2.3), so the innermost visible declaration
                 // decides. A folded const object's value comes first; any other
@@ -1304,6 +1320,7 @@ impl<'a> SemaConstEval<'a> {
             expr_types: self.expr_types,
             builtin_policy: self.builtin_policy.clone(),
             pre_c99: self.pre_c99,
+            param_overlay: self.param_overlay,
         }
     }
 

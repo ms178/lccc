@@ -47,7 +47,7 @@ impl Lowerer {
             CType::ComplexFloat => TypeSpecifier::ComplexFloat,
             CType::ComplexDouble => TypeSpecifier::ComplexDouble,
             CType::ComplexLongDouble => TypeSpecifier::ComplexLongDouble,
-            CType::Pointer(inner, _) => {
+            CType::Pointer(inner, ptr_quals) => {
                 // Special case: Pointer(Function(...)) -> FunctionPointer TypeSpecifier
                 // This preserves function pointer type info through the CType -> TypeSpecifier
                 // roundtrip, which is critical for typeof on function pointer variables.
@@ -93,7 +93,7 @@ impl Lowerer {
                 } else {
                     TypeSpecifier::Pointer(
                         Box::new(Self::ctype_to_type_spec(inner)),
-                        AddressSpace::Default,
+                        ptr_quals.space,
                     )
                 }
             }
@@ -569,14 +569,40 @@ impl Lowerer {
         }
     }
 
-    /// Get the CType for a struct field declaration, accounting for derived declarators.
-    /// For simple fields (derived is empty), just converts type_spec.
-    /// For complex fields (function pointers, etc.), uses build_full_ctype.
+    fn wrap_field_spec_base(spec: &TypeSpecifier, bytes: usize) -> TypeSpecifier {
+        match spec {
+            TypeSpecifier::Pointer(inner, space) => {
+                TypeSpecifier::Pointer(Box::new(Self::wrap_field_spec_base(inner, bytes)), *space)
+            }
+            TypeSpecifier::Array(inner, n) => TypeSpecifier::Array(
+                Box::new(Self::wrap_field_spec_base(inner, bytes)),
+                n.clone(),
+            ),
+            _ => TypeSpecifier::Vector(Box::new(spec.clone()), bytes),
+        }
+    }
+
+    /// Get the CType for a struct field declaration, accounting for derived declarators
+    /// and any deferred `vector_size_expr` attribute.
     pub(super) fn struct_field_ctype(&self, f: &StructFieldDecl) -> CType {
+        let deferred_bytes = f
+            .vector_size_expr
+            .as_deref()
+            .and_then(|e| self.eval_const_expr(e))
+            .and_then(|c| self.const_to_i64(&c))
+            .and_then(|v| usize::try_from(v).ok());
+        let owned_spec;
+        let spec: &TypeSpecifier = match deferred_bytes {
+            Some(bytes) => {
+                owned_spec = Self::wrap_field_spec_base(&f.type_spec, bytes);
+                &owned_spec
+            }
+            None => &f.type_spec,
+        };
         if f.derived.is_empty() {
-            self.type_spec_to_ctype(&f.type_spec)
+            self.type_spec_to_ctype(spec)
         } else {
-            self.build_full_ctype(&f.type_spec, &f.derived)
+            self.build_full_ctype(spec, &f.derived)
         }
     }
 

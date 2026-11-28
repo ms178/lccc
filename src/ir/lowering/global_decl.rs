@@ -91,14 +91,36 @@ impl Lowerer {
 
     // --- Global declaration lowering ---
 
+    fn resolve_global_type_spec<'a>(
+        &self,
+        decl: &'a Declaration,
+        resolved: &'a mut Option<TypeSpecifier>,
+    ) -> &'a TypeSpecifier {
+        if !matches!(&decl.type_spec, TypeSpecifier::AutoType) {
+            return &decl.type_spec;
+        }
+        let ts = if let Some(Initializer::Expr(init_expr)) =
+            decl.declarators.first().and_then(|d| d.init.as_ref())
+        {
+            self.get_expr_ctype(init_expr)
+                .map(|ct| Self::ctype_to_type_spec(&ct.decayed_value_ctype()))
+                .unwrap_or(TypeSpecifier::Int)
+        } else {
+            TypeSpecifier::Int
+        };
+        resolved.insert(ts)
+    }
+
     pub(super) fn lower_global_decl(&mut self, decl: &Declaration) {
-        self.register_struct_type(&decl.type_spec);
+        let mut resolved_type_spec = None;
+        let type_spec = self.resolve_global_type_spec(decl, &mut resolved_type_spec);
+        self.register_struct_type(type_spec);
         // The rebuilt layout lost the attribute (typedefs re-mark in
         // `lower_typedef`, once the typedef name resolves).
         if decl.is_transparent_union() && !decl.is_typedef() {
             self.mark_transparent_union(decl);
         }
-        self.collect_enum_constants(&decl.type_spec);
+        self.collect_enum_constants(type_spec);
         self.declare_declarator_type_name_tags(decl);
 
         if decl.is_typedef() {
@@ -108,7 +130,8 @@ impl Lowerer {
 
         // Freeze inherited qualifiers before a declarator can shadow the
         // `typeof` operand used by the remaining declarators.
-        let inherited_volatile = self.scalar_typeof_is_volatile(&decl.type_spec);
+        let inherited_volatile = self.scalar_typeof_is_volatile(type_spec);
+        let is_auto_type = matches!(&decl.type_spec, TypeSpecifier::AutoType);
         for declarator in &decl.declarators {
             if declarator.name.is_empty() {
                 continue;
@@ -169,13 +192,13 @@ impl Lowerer {
                 RedeclResult::Proceed { prior_was_weak } => prior_was_weak,
             };
 
-            let da = self.prepare_global_analysis(decl, declarator, inherited_volatile);
+            let da = self.prepare_global_analysis(decl, type_spec, declarator, inherited_volatile);
 
             let is_extern_decl = decl.is_extern() && declarator.init.is_none();
             if !is_extern_decl
                 && declarator.init.is_none()
                 && da.is_array
-                && self.declares_unsized_array(&decl.type_spec, &declarator.derived)
+                && self.declares_unsized_array(type_spec, &declarator.derived)
             {
                 self.tentative_incomplete_arrays
                     .insert(declarator.name.clone());
@@ -183,41 +206,34 @@ impl Lowerer {
 
             // Register before evaluating initializer so self-referential
             // initializers (e.g., `struct Node n = {&n}`) can resolve.
+            // For `auto` / `__auto_type`, defer registration until after the
+            // initializer has been evaluated.
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.address_space =
                 crate::common::type_builder::object_storage_address_space_with_object(
-                    self.declaration_address_space(decl.address_space, &decl.type_spec),
+                    self.declaration_address_space(decl.address_space, type_spec),
                     &declarator.derived,
                     declarator.attrs.object_space,
                 );
             if let Some(ref mut ct) = ginfo.var.c_type {
-                // OBJECT declaration: the space lands on the pointee only when
-                // the DECLARATOR supplies the pointer.  A pointer from the type
-                // specifier (typedef/typeof — the kernel's DEFINE_PER_CPU
-                // spelling) keeps its plain value type while the object's
-                // storage (`var.address_space` above, exactly as gcc models
-                // `&obj`) stays in the segment.  See
-                // apply_declaration_address_space_for_object.
                 crate::common::type_builder::apply_declaration_address_space_for_object(
                     ct,
-                    self.declaration_address_space(decl.address_space, &decl.type_spec),
+                    self.declaration_address_space(decl.address_space, type_spec),
                     &declarator.derived,
                 );
             }
-            self.globals.insert(declarator.name.clone(), ginfo);
+            if !is_auto_type {
+                self.globals.insert(declarator.name.clone(), ginfo.clone());
+            }
 
-            let init = self.lower_declarator_init(decl, declarator, &da);
-            let (align, explicit_request) =
-                self.compute_static_alignment(decl, &decl.type_spec, &da);
+            let init = self.lower_declarator_init(type_spec, declarator, &da);
+            if is_auto_type {
+                self.globals.insert(declarator.name.clone(), ginfo);
+            }
+            let (align, explicit_request) = self.compute_static_alignment(decl, type_spec, &da);
             let has_explicit_align = explicit_request.is_some();
-            let type_align = self
-                .typedef_alignment_for_type_spec(&decl.type_spec)
-                .copied();
+            let type_align = self.typedef_alignment_for_type_spec(type_spec).copied();
             if let Some(ginfo) = self.globals.get_mut(&declarator.name) {
-                // Record the REQUESTED alignment, not the merged object
-                // alignment: `alignof_expr` folds in the natural (or
-                // typedef-replaced) alignment itself, and a merged value
-                // would hide a typedef `aligned(N)` that lowers it.
                 ginfo.var.explicit_alignment = explicit_request;
                 ginfo.var.type_align = type_align;
             }
@@ -252,7 +268,9 @@ impl Lowerer {
                 &declarator.derived,
             );
             if !resolved_ctype.is_vector() {
-                if let Some(vector_ctype) = decl.resolve_vector_ctype(resolved_ctype.clone()) {
+                if let Some(vector_ctype) =
+                    self.resolve_decl_vector_ctype(decl, resolved_ctype.clone())
+                {
                     resolved_ctype = vector_ctype;
                 }
             }
@@ -364,7 +382,7 @@ impl Lowerer {
         }
         let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
         self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
-        da.apply_decl_vector_type(decl);
+        self.apply_decl_vector_type(&mut da, decl);
         let mut ginfo = GlobalInfo::from_analysis(&da);
         ginfo.asm_register = Some(reg_name.clone());
         ginfo.var.address_space =
@@ -417,7 +435,7 @@ impl Lowerer {
         if !self.globals.contains_key(&declarator.name) {
             let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
             self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
-            da.apply_decl_vector_type(decl);
+            self.apply_decl_vector_type(&mut da, decl);
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.address_space =
                 crate::common::type_builder::object_storage_address_space_with_object(
@@ -488,7 +506,7 @@ impl Lowerer {
             return;
         }
         let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
-        da.apply_decl_vector_type(decl);
+        self.apply_decl_vector_type(&mut da, decl);
         self.module.globals.push(IrGlobal {
             name: declarator.name.clone(),
             ty: da.var_ty,
@@ -665,26 +683,22 @@ impl Lowerer {
     fn prepare_global_analysis(
         &self,
         decl: &Declaration,
+        type_spec: &TypeSpecifier,
         declarator: &InitDeclarator,
         inherited_volatile: bool,
     ) -> DeclAnalysis {
-        let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+        let mut da = self.analyze_declaration(type_spec, &declarator.derived);
         self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
-        da.apply_decl_vector_type(decl);
+        self.apply_decl_vector_type(&mut da, decl);
         if da.is_array_of_pointers || da.is_array_of_func_ptrs {
             da.struct_layout = None;
             da.is_struct = false;
         }
-        self.fixup_unsized_array(
-            &mut da,
-            &decl.type_spec,
-            &declarator.derived,
-            &declarator.init,
-        );
+        self.fixup_unsized_array(&mut da, type_spec, &declarator.derived, &declarator.init);
         if declarator.init.is_none()
             && !decl.is_extern()
             && da.is_array
-            && self.declares_unsized_array(&decl.type_spec, &declarator.derived)
+            && self.declares_unsized_array(type_spec, &declarator.derived)
         {
             // A tentative definition whose array type is still incomplete
             // at the end of the translation unit behaves as if it had a zero
@@ -702,7 +716,7 @@ impl Lowerer {
             da.alloc_size = one;
             da.actual_alloc_size = one;
         }
-        self.fix_static_scalar_size(&mut da, &decl.type_spec);
+        self.fix_static_scalar_size(&mut da, type_spec);
         da
     }
 
@@ -725,7 +739,7 @@ impl Lowerer {
 
     fn lower_declarator_init(
         &mut self,
-        decl: &Declaration,
+        type_spec: &TypeSpecifier,
         declarator: &InitDeclarator,
         da: &DeclAnalysis,
     ) -> GlobalInit {
@@ -754,7 +768,7 @@ impl Lowerer {
             };
             self.lower_global_init(
                 initializer,
-                &decl.type_spec,
+                type_spec,
                 init_base_ty,
                 da.is_array,
                 da.elem_size,
