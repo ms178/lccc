@@ -716,7 +716,7 @@ the same sources agrees with every row) and the corpus test
 `tests/regression/x86_vector_load_const_offset.c` (35 functions, executed,
 output against GCC's).
 
-### 2.8 Constant arguments
+### 2.8 Scalar arguments
 
 The scalar parameter of an intrinsic is an `int`, a `char`, a `long long`
 or a `float`, and C converts the argument to it as an assignment would.
@@ -739,6 +739,27 @@ of zeros, `_mm_slli_epi32(v, 2.9)` a shift by none and
 differential (57 rows: floating constants for integer parameters of every
 width, integer constants of another width or signedness, floating
 parameters; with and without optimization, against GCC 16.2).
+
+An argument that is no constant is converted by the same function, to the
+type the tables give the parameter: the generated table of GCC's builtins
+(`x86_builtin_types::argument_scalar_types`), the prototype a header
+declares, or, for the builtins only lccc's headers call,
+`private_x86_argument_scalar_types`. A builtin none of them described
+took its scalar argument as written. That was the element of
+`_mm_insert_epi8/16/32/64` (macros over `__builtin_ia32_pinsr[bwdq]128`):
+a `double` element inserted the low bits of the double, and an `int`
+element of `_mm_insert_epi64` was not extended without optimization. And a
+macro that used a mask argument directly (`(__k) & compare(...)`, the 168
+`_mask_cmp*_mask` forms of `lcccsimd.h`) had no conversion at all; the
+generator casts the mask to its type now.
+
+Gate: the value differential calls every intrinsic that has a scalar
+parameter twice more, with its scalar arguments in objects of another
+arithmetic type (`name@`: an integer in a `double` with a fraction that
+only truncation removes, a floating value as a `long long`; `name&`: an
+integer in an integer of another width). A unit test requires every
+`__builtin_ia32_*` name a bundled header calls to be in one of the two
+builtin tables.
 
 ## 3. Call-frame information
 
@@ -778,6 +799,8 @@ instructions.
 | `check_x86_int_map_registers.sh` | Packed operations on registers and on a folded load: budgets per shape, values against a scalar reference and GCC, and (section 4b) the displacement of a constant offset in the load's address (§2.7) |
 | `tests/regression/x86_vector_load_const_offset.c` (corpus) | §2.7: 35 ways of writing `pointer + constant` inside a packed operation, executed, output against GCC's |
 | `tests/intrinsics/cases/constant_arguments.c` (intrinsic differential, `-O2` and `-O0`) | §2.8: a constant argument is converted to its parameter's type once; 57 rows against GCC |
+| `scripts/x86_intrinsic_values.py --check` (the `@` and `&` tests) | §2.8: every intrinsic with a scalar parameter, its scalar arguments passed in objects of another arithmetic type, result against GCC's |
+| `every_builtin_the_headers_call_has_its_scalar_operands_typed` (unit) | §2.8: each `__builtin_ia32_*` name of the bundled headers is in the generated table or in the private one, and in one only |
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |
 | `check_target_attribute_isa.sh` | `target()` scoping, ordering, errors and intrinsic verdicts, re-measured on GCC |
 | `check_target_attribute_arguments.py` | The arguments of `target("...")` on definitions and prototypes and of `#pragma GCC target`: errors, order and position against GCC 16.2 |

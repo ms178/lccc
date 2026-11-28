@@ -3594,7 +3594,12 @@ impl Lowerer {
         arg: &Expr,
         index: usize,
     ) -> Operand {
-        let target = match crate::common::x86_builtin_types::argument_scalar_types(name) {
+        let generated = crate::common::x86_builtin_types::argument_scalar_types(name);
+        let private = match generated {
+            Some(_) => None,
+            None => private_x86_argument_scalar_types(name),
+        };
+        let target = match generated.or(private) {
             Some(types) => types.get(index).copied().flatten(),
             None => self
                 .func_meta
@@ -3614,12 +3619,22 @@ impl Lowerer {
         // A floating constant read that way is the `int` the call converts
         // it to, which a floating parameter does not do: there the
         // expression is the operand. (An operand without a type here is an
-        // integer one the tables do not describe, the element of
-        // `_mm_insert_epi32` for one, and keeps the integer reading.)
+        // integer one the tables do not describe and keeps the integer
+        // reading.)
         let floating = self.expr_ctype(arg).is_floating();
         let constant = self
             .integer_constant_argument(arg)
             .filter(|_| !(floating && target.is_some_and(|target| target.is_float())));
+        // A constant operand of one of lccc's own builtins is handed over
+        // as its value. Their scalar operands are integers an instruction
+        // takes the low bits of (the element of PINSR), so the value is the
+        // operand at any width, and the emitter loads it in the shortest
+        // form the value has. Narrowed to the parameter's type first,
+        // `_mm_insert_epi32(v, 0xDEADBEEF, 1)` loaded its element with
+        // `movq $-559038737, %rcx` where it had `movl $3735928559, %ecx`.
+        if let (Some(_), Some(value)) = (private, constant) {
+            return Operand::Const(value);
+        }
         let lowered = |this: &mut Self| match constant {
             Some(value) => Operand::Const(value),
             None => this.lower_expr(arg),
@@ -4302,6 +4317,61 @@ impl Lowerer {
 /// A floating value converted to `int` as C converts it (toward zero), where
 /// `int` holds the result; `None` for a value it does not hold, a NaN among
 /// them, which C leaves undefined and no immediate can be.
+/// The scalar value operands of the builtins the bundled headers call that
+/// the generated table has no row for: lccc's own names, mostly.
+///
+/// GCC has other names for these operations, so the generated table of GCC's
+/// builtins (`x86_builtin_types::argument_scalar_types`) does not list
+/// them, and no header declares them. A builtin without a row took a scalar
+/// argument as it was written: `_mm_insert_epi32(v, d, 1)` with a `double d`
+/// inserted the low half of the double, and `_mm_insert_epi64(v, i, 0)` with
+/// an `int i` inserted, without optimization, whatever stood above the `int`
+/// in its register. GCC converts both, to the `int` and the `long long` its
+/// macros cast to.
+///
+/// One entry per operand up to the last scalar value, `None` for a vector
+/// or an address. An immediate has no entry: `x86_immediate` checks it and
+/// hands the emitter the constant. Every `__builtin_ia32_*` name a bundled
+/// header calls is in the generated table or here
+/// (`every_builtin_the_headers_call_has_its_scalar_operands_typed`), so a
+/// new private builtin cannot be added without deciding this.
+pub(super) fn private_x86_argument_scalar_types(name: &str) -> Option<&'static [Option<IrType>]> {
+    const INT: Option<IrType> = Some(IrType::I32);
+    const LONG_LONG: Option<IrType> = Some(IrType::I64);
+    Some(match name {
+        // (vector, element, lane): the element is an `int`, of which the
+        // instruction takes the low 8, 16 or 32 bits; a `long long` for PINSRQ.
+        "__builtin_ia32_pinsrb128" | "__builtin_ia32_pinsrw128" | "__builtin_ia32_pinsrd128" => {
+            &[None, INT]
+        }
+        "__builtin_ia32_pinsrq128" => &[None, LONG_LONG],
+        "__builtin_ia32_cvtsi32si128" => &[INT],
+        // Vectors, addresses and immediates only.
+        "__builtin_ia32_aesdec256"
+        | "__builtin_ia32_aesdeclast256"
+        | "__builtin_ia32_aesenc256"
+        | "__builtin_ia32_aesenclast256"
+        | "__builtin_ia32_clflush"
+        | "__builtin_ia32_cvtsi128si32"
+        | "__builtin_ia32_cvtsi128si64"
+        | "__builtin_ia32_loadldi128"
+        | "__builtin_ia32_mfence"
+        | "__builtin_ia32_pand256"
+        | "__builtin_ia32_pextrb128"
+        | "__builtin_ia32_pextrd128"
+        | "__builtin_ia32_pextrq128"
+        | "__builtin_ia32_pextrw128"
+        | "__builtin_ia32_prefetch"
+        | "__builtin_ia32_pshufd128"
+        | "__builtin_ia32_pshufhw128"
+        | "__builtin_ia32_pshuflw128"
+        | "__builtin_ia32_storeldi128"
+        | "__builtin_ia32_vbroadcasti128"
+        | "__builtin_ia32_vpclmulqdq256" => &[],
+        _ => return None,
+    })
+}
+
 fn converted_to_int(value: f64) -> Option<i64> {
     let truncated = value.trunc();
     // False for a NaN, which compares with nothing.
@@ -5740,6 +5810,159 @@ mod x86_var_shift_arity_tests {
             assert_eq!(x86_var_shift_arity(&intrinsic), Some(2), "{intrinsic:?}");
         }
         assert_eq!(x86_var_shift_arity(&B::X86Pmulhw128), None);
+    }
+}
+
+#[cfg(test)]
+mod private_x86_argument_tests {
+    use super::private_x86_argument_scalar_types as private;
+    use crate::common::types::IrType;
+    use crate::common::x86_builtin_types::argument_scalar_types as generated;
+
+    /// The text of a header without its comments: a comment may name a
+    /// builtin of GCC's that lccc does not call.
+    fn code_of(text: &str) -> String {
+        let mut code = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find("/*") {
+            code.push_str(&rest[..start]);
+            code.push(' ');
+            rest = rest[start + 2..]
+                .split_once("*/")
+                .map_or("", |(_, after)| after);
+        }
+        code.push_str(rest);
+        code.lines()
+            .map(|line| line.split_once("//").map_or(line, |(before, _)| before))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn builtins_the_headers_call() -> std::collections::BTreeSet<String> {
+        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/include");
+        let mut names = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(directory).expect("the bundled headers") {
+            let path = entry.expect("a directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("h") {
+                continue;
+            }
+            let code = code_of(&std::fs::read_to_string(&path).expect("a header"));
+            let mut rest = code.as_str();
+            while let Some(at) = rest.find("__builtin_ia32_") {
+                let name: String = rest[at..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                rest = &rest[at + name.len()..];
+                // A name pasted together by a macro (`__builtin_ia32_##op`)
+                // is written out where the macro is used, not here.
+                if !name.ends_with('_') && !rest.trim_start().starts_with("##") {
+                    names.insert(name);
+                }
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn every_builtin_the_headers_call_has_its_scalar_operands_typed() {
+        let names = builtins_the_headers_call();
+        assert!(
+            names.len() > 200,
+            "the headers were not read: {} names",
+            names.len()
+        );
+        let untyped: Vec<_> = names
+            .iter()
+            .filter(|name| generated(name).is_none() && private(name).is_none())
+            .collect();
+        assert!(
+            untyped.is_empty(),
+            "builtins a header calls whose scalar operands nothing describes (a scalar \
+             argument of one is passed as written, unconverted): {untyped:?}"
+        );
+    }
+
+    #[test]
+    fn the_two_tables_share_no_name_and_the_private_one_has_no_stale_row() {
+        let names = builtins_the_headers_call();
+        for name in &names {
+            assert!(
+                generated(name).is_none() || private(name).is_none(),
+                "{name} is in the generated table and in the private one"
+            );
+        }
+        // Every row is for a builtin a header calls.
+        for name in [
+            "__builtin_ia32_pinsrb128",
+            "__builtin_ia32_pinsrw128",
+            "__builtin_ia32_pinsrd128",
+            "__builtin_ia32_pinsrq128",
+            "__builtin_ia32_cvtsi32si128",
+            "__builtin_ia32_aesdec256",
+            "__builtin_ia32_aesdeclast256",
+            "__builtin_ia32_aesenc256",
+            "__builtin_ia32_aesenclast256",
+            "__builtin_ia32_clflush",
+            "__builtin_ia32_cvtsi128si32",
+            "__builtin_ia32_cvtsi128si64",
+            "__builtin_ia32_loadldi128",
+            "__builtin_ia32_mfence",
+            "__builtin_ia32_pand256",
+            "__builtin_ia32_pextrb128",
+            "__builtin_ia32_pextrd128",
+            "__builtin_ia32_pextrq128",
+            "__builtin_ia32_pextrw128",
+            "__builtin_ia32_prefetch",
+            "__builtin_ia32_pshufd128",
+            "__builtin_ia32_pshufhw128",
+            "__builtin_ia32_pshuflw128",
+            "__builtin_ia32_storeldi128",
+            "__builtin_ia32_vbroadcasti128",
+            "__builtin_ia32_vpclmulqdq256",
+        ] {
+            assert!(private(name).is_some(), "{name} lost its row");
+            assert!(
+                names.contains(name),
+                "{name} has a row and no header calls it"
+            );
+        }
+        assert!(private("__builtin_ia32_paddd128").is_none());
+        assert!(private("_mm_insert_epi32").is_none());
+    }
+
+    #[test]
+    fn an_inserted_element_is_converted_to_the_type_gcc_casts_it_to() {
+        let int = Some(IrType::I32);
+        for name in [
+            "__builtin_ia32_pinsrb128",
+            "__builtin_ia32_pinsrw128",
+            "__builtin_ia32_pinsrd128",
+        ] {
+            let row = private(name).expect("a row");
+            // The vector is an object, the element an `int`, and the lane
+            // (an immediate) has no entry.
+            assert_eq!(row, &[None, int], "{name}");
+        }
+        assert_eq!(
+            private("__builtin_ia32_pinsrq128").expect("a row"),
+            &[None, Some(IrType::I64)]
+        );
+        assert_eq!(
+            private("__builtin_ia32_cvtsi32si128").expect("a row"),
+            &[int]
+        );
+        // An extraction's lane and a shuffle's selector are immediates.
+        for name in ["__builtin_ia32_pextrd128", "__builtin_ia32_pshufd128"] {
+            assert!(private(name).expect("a row").is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn comments_are_not_code() {
+        let code = code_of("a /* __builtin_ia32_x */ b // __builtin_ia32_y\nc /* open");
+        assert!(!code.contains("__builtin_ia32_"));
+        assert!(code.contains('a') && code.contains('b') && code.contains('c'));
     }
 }
 

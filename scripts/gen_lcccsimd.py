@@ -557,6 +557,17 @@ w("#define __CCC_M512I_FROM_BUILTIN(e) (*(__m512i *)(e))")
 w("#define __CCC_M512_FROM_BUILTIN(e)  (*(__m512 *)(e))")
 w("#define __CCC_M512D_FROM_BUILTIN(e) (*(__m512d *)(e))")
 w("")
+w("/* A mask argument of a macro, as the mask parameter of GCC's function takes")
+w(" * it. A floating value is converted to the mask type: a macro has no")
+w(" * parameter to do that, and `(k) & compare(...)` with a `double` k is no")
+w(" * expression at all. An integer is left as it is written: the compare it is")
+w(" * ANDed with has no bit above the mask's width, so the AND is the")
+w(" * conversion, and a cast in front of it would cost a second truncation of a")
+w(" * mask kept in a wider object. The selection is made when the macro is")
+w(" * compiled, and the argument is evaluated once. */")
+w("#define __CCC_MASK_ARG(T, k) \\")
+w("    _Generic((k), float: (T)(k), double: (T)(k), long double: (T)(k), default: (k))")
+w("")
 
 ALWAYS = "__attribute__((__always_inline__, __artificial__))"
 
@@ -709,9 +720,18 @@ for name, mn, mty, has_imm in CMP_MASK:
                 macro(f"{pfx}{predicate}_{element}_mask(__a, __b)",
                       f"({mty})__lccc_simd512_i_{mn}({imm}, __a, __b)")
             macro(f"{pfx}mask_{predicate}_{element}_mask(__k, __a, __b)",
-                  f"({mty})((__k) & __lccc_simd512_i_{mn}({imm}, __a, __b))")
+                  f"({mty})(__CCC_MASK_ARG({mty}, __k) & "
+                  f"__lccc_simd512_i_{mn}({imm}, __a, __b))")
+        # The mask goes through `__CCC_MASK_ARG`: `(__k) &` took whatever
+        # was written, and a `double` there was no operand of `&` at all
+        # (and the compiler stopped with an internal error where it should
+        # have said so). A plain cast to the mask type would be right too
+        # and is not free: in a function that keeps one mask in a wider
+        # object and uses it at several widths, it is a `movzwl` per call
+        # (66 instructions in tests/regression/avx512_mask_compare_names.c).
         macro(f"{pfx}mask_cmp_{element}_mask(__k, __a, __b, __imm)",
-              f"({mty})((__k) & __lccc_simd512_i_{mn}(__imm, __a, __b))")
+              f"({mty})(__CCC_MASK_ARG({mty}, __k) & "
+              f"__lccc_simd512_i_{mn}(__imm, __a, __b))")
     else:
         macro(f"{pfx}{name}(__a, __b)",
               f"({mty})__lccc_simd512_i_{mn}(0, __a, __b)")
