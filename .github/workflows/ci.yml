@@ -1185,6 +1185,17 @@ jobs:
     # coverage is not uniform (it arity-checks `memcpy` and stays silent for
     # `puts`, but checks `__builtin_puts`). Keep both driver paths in lockstep
     # with the table, including the legacy dialect and withdrawal cases.
+    # The types of the library builtins, measured from GCC as well: a builtin
+    # carries its prototype (`__builtin_sqrt(n)` converts an `int`), and the
+    # table that says so is GCC's answer, not a list kept by hand. The same
+    # script writes tests/regression/builtin_library_arguments.c, which the
+    # regression corpus runs against GCC. Before the arity table: that one
+    # reads the builtins from this one.
+    - name: Library builtin prototypes match GCC 16.2
+      run: |
+        set -euo pipefail
+        python3 scripts/gen_libc_builtin_types.py --self-test
+        python3 scripts/gen_libc_builtin_types.py --gcc gcc-16 --check
     - name: Libc builtin arity table matches GCC 16.2
       run: |
         set -euo pipefail

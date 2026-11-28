@@ -90,13 +90,15 @@ BINARY_OPERATORS = ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "==", "!
 UNARY_OPEN = {("bitint", operator): "refuses" for operator in UNARY_OPERATORS}
 # Binary cells lccc accepts and GCC refuses, by what an operand is. Measured
 # 2026-11-28; a count may only fall.
-#   builtin  an operand is the result of a builtin, which the analyzer does
-#            not type (a floating operand that decides an integer-only
-#            operator is judged all the same)
+#   builtin  an operand is the result of a builtin the analyzer does not
+#            type: one that is no library function (`__builtin_popcount`).
+#            A library builtin has the result of GCC's prototype (1494 cells
+#            before that), and a floating operand that decides an
+#            integer-only operator is judged whatever the builtin
 #   vector   a GNU vector against a scalar GCC does not convert to it, or
 #            `&&`/`||` of a vector
 #   plain    differences of pointers to incompatible types
-BINARY_OPEN = {"builtin": 1494, "vector": 752, "plain": 22}
+BINARY_OPEN = {"builtin": 295, "vector": 752, "plain": 22}
 
 CRASH = re.compile(r"panicked at|internal error|internal compiler error|RUST_BACKTRACE")
 

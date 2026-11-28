@@ -28,13 +28,16 @@ LOOP = re.compile(
     r"for &\(builtin, libc_name\) in &\[(.*?)\]\s*\{\s*"
     r"m\.insert\(builtin, BuiltinInfo::simple\(libc_name\)\);\s*\}", re.S,
 )
+PROTOTYPE = re.compile(r'^    \("(__builtin_[A-Za-z_0-9]+)", LibcPrototype ', re.M)
+PROTOTYPES = BUILTINS.with_name("libc_builtin_types.rs")
 DIAGNOSTIC = re.compile(
     rf":\d+:\d+: error: too (few|many) arguments to function '{IDENT}'; "
     r"expected (at least )?(\d+), have (\d+)$",
 )
 
 
-def candidates(source: str) -> list[str]:
+def registered(source: str) -> list[str]:
+    """Both spellings of every alias builtins.rs writes out by name."""
     direct = DIRECT.findall(source)
     loops = LOOP.findall(source)
     if len(direct) + len(loops) != source.count("BuiltinInfo::simple("):
@@ -43,6 +46,19 @@ def candidates(source: str) -> list[str]:
     if not records:
         raise ValueError("no libc alias registrations found")
     return sorted({name for pair in records for name in pair})
+
+
+def candidates(source: str, prototypes: str) -> list[str]:
+    """The aliases written out by name and those registered from the table of
+    GCC's prototypes (`BuiltinInfo::library`): every builtin of that table is
+    one, and its library function is the name without the prefix."""
+    if "BuiltinInfo::library(name)" not in source:
+        raise ValueError("builtins.rs no longer registers the prototype table")
+    listed = PROTOTYPE.findall(prototypes)
+    if not listed:
+        raise ValueError("no prototype in libc_builtin_types.rs")
+    return sorted(set(registered(source)) | {
+        name for builtin in listed for name in (builtin, builtin.removeprefix("__builtin_"))})
 
 
 def probe_source(names: list[str]) -> str:
@@ -158,9 +174,19 @@ def self_test() -> None:
         expected = "at least " if variadic else ""
         return f"probe.c:1:2: error: too {direction} arguments to function '{name}'; expected {expected}{arity}, have {count}\n"
 
-    names = candidates(BUILTINS.read_text(encoding="utf-8"))
+    names = candidates(BUILTINS.read_text(encoding="utf-8"),
+                       PROTOTYPES.read_text(encoding="utf-8"))
     assert {"bzero", "__builtin_bzero", "memcpy", "__builtin_memcpy"} <= set(names)
     assert "__builtin___clear_cache" in names and "__clear_cache" in names
+    assert {"tan", "__builtin_tan", "strnlen", "__builtin_strnlen"} <= set(names)
+    row = '    ("__builtin_tan", LibcPrototype { result: LibcType::Double, parameters: &[] }),\n'
+    assert PROTOTYPE.findall("const P: &[(&str, LibcPrototype)] = &[\n" + row) == ["__builtin_tan"]
+    for source, prototypes in (("", row), ("BuiltinInfo::library(name)", "")):
+        try:
+            candidates(source + 'm.insert("a", BuiltinInfo::simple("b"))', prototypes)
+        except ValueError:
+            continue
+        raise AssertionError("accepted a builtin table without the prototype registration")
     explicit = ''.join(diagnostic("__builtin_abs", i, 1, False)
                        for i in range(MAX_ARGS + 1) if i != 1)
     variadic = diagnostic("printf", 0, 1, True)
@@ -188,7 +214,8 @@ def main() -> int:
     if args.self_test:
         self_test()
         return 0
-    names = candidates(BUILTINS.read_text(encoding="utf-8"))
+    names = candidates(BUILTINS.read_text(encoding="utf-8"),
+                       PROTOTYPES.read_text(encoding="utf-8"))
     table = measure(args.gcc, names)
     data = render(table, len(names))
     if args.dump:

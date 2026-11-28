@@ -28,12 +28,15 @@ under `-fsyntax-only`, the cell is the first error of each.
 | table | cells | differ before | differ now |
 |---|---|---|---|
 | unary: 20 operand kinds, 10 operators | 200 | 55 | 10 |
-| binary: 28 kinds squared, 18 operators | 14,112 | 3,134 | 2,330 |
+| binary: 28 kinds squared, 18 operators | 14,112 | 3,134 | 1,139 |
 
 The ten unary cells left are `_BitInt`, a type lccc does not have. Of the
-binary cells, 62 are both compilers refusing in other words; in the other
-2,268 lccc accepts a program GCC refuses. In no cell, before or after,
-does lccc refuse a program GCC accepts.
+binary cells, 70 are both compilers refusing in other words; in the other
+1,069 lccc accepts a program GCC refuses. In no cell, before or after,
+does lccc refuse a program GCC accepts. (The binary count was 2,330 when
+this work landed, 62 worded otherwise and 2,268 accepted; the library
+builtins' prototypes closed 1,199 of those, and eight of them are refused
+in other words now.)
 
 ## What is closed
 
@@ -62,7 +65,7 @@ The gate holds each number as a ceiling (`BINARY_OPEN` in the script).
 
 | operand | cells | what it takes |
 |---|---|---|
-| the result of a builtin | 1,494 | A type for a builtin call that the constraints may trust. The analyzer has none because a builtin's declared type is not always what it yields (the vector builtins yield an address) and some return the type of an argument. A table of the builtins whose result type is fixed closes these. |
+| the result of a builtin | 295 (1,494 at first) | A type for a builtin call that the constraints may trust. The analyzer has none because a builtin's declared type is not always what it yields (the vector builtins yield an address) and some return the type of an argument. A library builtin now has the result of GCC's prototype (`FOLLOWUP-2026-11-28-library-builtin-prototypes.md`), which closed 1,199 cells; the rest are builtins that are no library function (`__builtin_popcount`), and the same table closes them once it has their rows. |
 | a GNU vector | 752 | GCC's scalar-to-vector rule: a scalar operand is converted to the vector's element type when that loses nothing, and refused otherwise ("conversion of scalar 'int' to vector '__vector(4) float' involves truncation"); `&&` and `||` take no vector. |
 | pointers | 22 | The difference of pointers to incompatible types (`int *` minus `void *`). |
 

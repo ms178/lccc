@@ -1576,6 +1576,10 @@ gate "intrinsic-arity-selftest" fast \
     python3 scripts/check_intrinsic_arity.py --self-test
 gate "intrinsic-arity" fast \
     python3 scripts/check_intrinsic_arity.py --check
+gate "libc-builtin-types-selftest" fast \
+    python3 scripts/gen_libc_builtin_types.py --self-test
+gate "libc-builtin-types" fast \
+    python3 scripts/gen_libc_builtin_types.py --gcc "${GCC16:-gcc-16}" --check
 gate "libc-builtin-arity-selftest" fast \
     python3 scripts/check_libc_builtin_arity.py --self-test
 gate "libc-builtin-arity" fast \

@@ -492,175 +492,40 @@ impl Lowerer {
         // A NaN builtin whose payload is not a string literal cannot fold: it
         // is a call to the library function (GCC: `__builtin_nan(s)` calls
         // `nan(s)`), not the canonical NaN.
-        let nan_call;
-        let kind = match (&builtin_info.kind, nan_library_function(name)) {
-            (BuiltinKind::ConstantF64(_) | BuiltinKind::ConstantF128(_), Some(lib))
-                if args
-                    .first()
-                    .is_some_and(|a| !matches!(a, Expr::StringLiteral(..))) =>
-            {
-                nan_call = BuiltinKind::LibcAlias(lib.to_string());
-                &nan_call
+        if matches!(
+            builtin_info.kind,
+            BuiltinKind::ConstantF64(_) | BuiltinKind::ConstantF128(_)
+        ) && args
+            .first()
+            .is_some_and(|a| !matches!(a, Expr::StringLiteral(..)))
+        {
+            if let Some((library_name, prototype)) = nan_library_function(name) {
+                return Some(self.lower_library_builtin_call(
+                    name,
+                    library_name,
+                    prototype,
+                    args,
+                    Self::builtin_arg_span(args),
+                ));
             }
-            (kind, _) => kind,
-        };
-        match kind {
+        }
+        match &builtin_info.kind {
             BuiltinKind::LibcAlias(libc_name) => {
-                // Source types must describe the values `lower_expr` really
-                // produces (see the long note in `expr_calls.rs`):
-                // `get_expr_type` reports the storage-level width and lies
-                // about `i + 1`, which is an `int`.
-                let mut arg_types: Vec<IrType> =
-                    args.iter().map(|a| self.value_ir_type(a)).collect();
-                let mut arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
-                // A `__builtin_*` call carries the libc function's signature
-                // whether or not the TU declared the libc symbol, so the
-                // parameter conversions are part of the builtin's contract.
-                // Without them `__builtin_memcmp(p, q, i + 1)` passed a raw
-                // 32-bit `int` where `size_t` was expected: at -O0 the 8-byte
-                // argument load read the neighbouring 4-byte slot as the high
-                // half (gcc.c-torture `pr59229.c`), and a negative length was
-                // zero-extended instead of sign-extended.
-                if let Some(params) = builtins::libc_alias_param_types(libc_name.as_str()) {
-                    for (i, &param_ty) in params.iter().enumerate() {
-                        if i >= arg_vals.len() {
-                            break;
-                        }
-                        let from = arg_types[i];
-                        if from == param_ty
-                            || from == IrType::Ptr
-                            || param_ty == IrType::Ptr
-                            || !from.is_integer()
-                            || !param_ty.is_integer()
-                        {
-                            continue;
-                        }
-                        arg_vals[i] = self.emit_implicit_cast(arg_vals[i].clone(), from, param_ty);
-                        arg_types[i] = param_ty;
+                if libc_name == "memcpy" {
+                    if let Some(dest) = self.try_lower_constant_memcpy(args) {
+                        return Some(dest);
                     }
                 }
-                // -----------------------------------------------------------------
-                // Constant-size `__builtin_memcpy` / `__builtin_mempcpy`.  The
-                // libc forwarding below would emit a real `call memcpy`, but a copy
-                // of compile-time-constant size is better modelled by the native IR
-                // `Memcpy` instruction: the backend inlines small copies, and the
-                // SROA / store-load-forwarding passes can then forward a load out of
-                // the destination (read64's `__builtin_memcpy(&v, p, 8); return v`
-                // collapses to a single unaligned load) instead of leaving a
-                // store-to-temp + reload in every hot loop that does an unaligned
-                // 64-bit read.  This fires ONLY for the *builtin* spelling, which by
-                // construction names the libc function; a plain `memcpy(...)` call
-                // (which could be a user-provided function of that name) stays a
-                // call, preserving exact user semantics.  `memmove` is never
-                // rewritten because its overlap contract is different.
-                //
-                // SOUNDNESS for the native Memcpy: C `memcpy` already has the
-                // no-overlap precondition (overlap is UB), which is exactly the
-                // contract `Instruction::Memcpy` assumes, so lowering a valid
-                // `memcpy` to it is value-preserving.  The result of `memcpy` is the
-                // destination pointer, so on success we yield that operand directly.
-                if libc_name == "memcpy" && arg_vals.len() == 3 {
-                    // The size argument is promoted to `size_t` (U64) by the
-                    // libc-alias cast above, so even a literal `8` lowers to a
-                    // ZExt/Cast *value*, not a `Const`.  Const-evaluate the
-                    // source expression directly rather than inspecting the
-                    // lowered operand.
-                    let size = match self.eval_const_expr(&args[2]) {
-                        Some(IrConst::I64(v)) if v > 0 => v as usize,
-                        Some(IrConst::I32(v)) if v > 0 => v as usize,
-                        Some(IrConst::I128(v)) if v > 0 && v <= usize::MAX as i128 => v as usize,
-                        _ => 0,
-                    };
-                    if size > 0 {
-                        if let (Operand::Value(dp), Operand::Value(sp)) =
-                            (&arg_vals[0], &arg_vals[1])
-                        {
-                            let dp = *dp;
-                            let sp = *sp;
-                            // A whole-register vector copy (`memcpy(&v, p,
-                            // sizeof v)` / `memcpy(p, &v, sizeof v)`) is a
-                            // packed load + store the vector passes see
-                            // through (`vec_ssa` dissolves the temporary).
-                            if self.try_emit_vector_memcpy(&args[0], &args[1], dp, sp, size) {
-                                return Some(Operand::Value(dp));
-                            }
-                            self.emit(Instruction::Memcpy {
-                                dest: dp,
-                                src: sp,
-                                size,
-                            });
-                            // `__builtin_memcpy` returns its destination.
-                            return Some(Operand::Value(dp));
-                        }
-                    }
-                }
-                let dest = self.fresh_value();
-                // The builtin is callable without a prior libc prototype
-                // (`__builtin_printf("%g", f)` in a TU that never includes
-                // <stdio.h>).  The variadic contract of the printf family is
-                // part of the builtin's own signature, so it must not depend
-                // on whether the user happened to declare the libc symbol:
-                // without it, a `float` argument was passed as a 4-byte F32
-                // in an XMM register and printf read garbage (C11 6.5.2.2p6
-                // requires float->double, char/short->int promotion).
-                let libc_sig = self.func_meta.sigs.get(libc_name.as_str());
-                let (variadic, n_fixed) = match libc_sig {
-                    Some(sig) if sig.is_variadic => (true, sig.param_types.len()),
-                    // Unprototyped declaration (`int printf();`): the default
-                    // argument promotions apply to EVERY argument (C11
-                    // 6.5.2.2p6), and the callee is the real variadic libc
-                    // function — use the builtin's own fixed-arity contract.
-                    Some(sig) if sig.param_types.is_empty() => {
-                        match builtin_variadic_fixed_arity(libc_name.as_str()) {
-                            Some(n) => (true, n),
-                            None => (true, arg_vals.len()),
-                        }
-                    }
-                    Some(_) => (false, arg_vals.len()),
-                    None => match builtin_variadic_fixed_arity(libc_name.as_str()) {
-                        Some(n) => (true, n),
-                        None => (false, arg_vals.len()),
-                    },
-                };
-                let libc_return_type = libc_sig.map(|s| s.return_type);
-                if variadic {
-                    self.promote_variadic_args(&mut arg_vals, &mut arg_types, n_fixed);
-                }
-                let return_type = self
-                    .builtin_return_type(name)
-                    .or(libc_return_type)
-                    .unwrap_or(crate::common::types::target_int_ir_type());
-                let struct_arg_sizes = vec![None; arg_vals.len()];
-                self.emit(Instruction::Call {
-                    func: libc_name.clone(),
-                    info: CallInfo {
-                        dest: Some(dest),
-                        args: arg_vals,
-                        arg_types,
-                        return_type,
-                        is_variadic: variadic,
-                        num_fixed_args: n_fixed,
-                        struct_arg_sizes,
-                        struct_arg_aligns: vec![],
-                        struct_arg_classes: Vec::new(),
-                        struct_arg_fp_agg_classes: Vec::new(),
-                        struct_arg_is_f128_sse: Vec::new(),
-                        is_sret: false,
-                        calling_convention: crate::common::types::CallingConvention::Default,
-                        is_fastcall: false,
-                        regparm: None,
-                        is_pure: false,
-                        is_const: false,
-                        memory: Default::default(),
-                        // Spelled `__builtin_<name>`: the library function by definition.
-                        assume_library: true,
-                        ret_eightbyte_classes: Vec::new(),
-                        ret_is_f128_sse: false,
-                        ret_is_vector128: false,
-                        cold: false,
-                    },
-                });
-                Some(Operand::Value(dest))
+                // No alias is registered without GCC's prototype of it
+                // (`library_builtin_tests`).
+                let (library_name, prototype) = builtins::library_alias(name)?;
+                Some(self.lower_library_builtin_call(
+                    name,
+                    library_name,
+                    prototype,
+                    args,
+                    Self::builtin_arg_span(args),
+                ))
             }
             BuiltinKind::Identity => Some(
                 args.first()
@@ -702,6 +567,61 @@ impl Lowerer {
                 self.lower_builtin_intrinsic(intrinsic, name, args)
             }
         }
+    }
+
+    /// `__builtin_memcpy(d, s, N)` with a positive constant `N`: the native
+    /// IR `Memcpy` instead of `call memcpy`, and its destination as the
+    /// value. `None`, with nothing lowered, for every other call.
+    ///
+    /// The backend inlines small copies, and the SROA / store-load-forwarding
+    /// passes can then forward a load out of the destination (read64's
+    /// `__builtin_memcpy(&v, p, 8); return v` collapses to a single unaligned
+    /// load) instead of leaving a store-to-temp + reload in every hot loop
+    /// that does an unaligned 64-bit read. This fires ONLY for the *builtin*
+    /// spelling, which by construction names the libc function; a plain
+    /// `memcpy(...)` call (which could be a user-provided function of that
+    /// name) stays a call, preserving exact user semantics. `memmove` is
+    /// never rewritten because its overlap contract is different.
+    ///
+    /// SOUNDNESS for the native Memcpy: C `memcpy` already has the
+    /// no-overlap precondition (overlap is UB), which is exactly the
+    /// contract `Instruction::Memcpy` assumes, so lowering a valid `memcpy`
+    /// to it is value-preserving.
+    fn try_lower_constant_memcpy(&mut self, args: &[Expr]) -> Option<Operand> {
+        let [dest, src, size] = args else {
+            return None;
+        };
+        // The size is converted to `size_t` when the call is lowered, so the
+        // expression itself is evaluated: a constant expression has no side
+        // effect to keep.
+        let size = match self.eval_const_expr(size)? {
+            IrConst::I64(v) if v > 0 => v as usize,
+            IrConst::I32(v) if v > 0 => v as usize,
+            IrConst::I128(v) if v > 0 && v <= usize::MAX as i128 => v as usize,
+            _ => return None,
+        };
+        // Only pointers: an argument of another type is converted by the
+        // call (and GCC refuses most of them).
+        let is_pointer = |this: &Self, e: &Expr| this.value_ir_type(e) == IrType::Ptr;
+        if !is_pointer(self, dest) || !is_pointer(self, src) {
+            return None;
+        }
+        let dest_value = self.lower_expr(dest);
+        let src_value = self.lower_expr(src);
+        let dp = self.operand_to_value(dest_value);
+        let sp = self.operand_to_value(src_value);
+        // A whole-register vector copy (`memcpy(&v, p, sizeof v)` /
+        // `memcpy(p, &v, sizeof v)`) is a packed load + store the vector
+        // passes see through (`vec_ssa` dissolves the temporary).
+        if !self.try_emit_vector_memcpy(dest, src, dp, sp, size) {
+            self.emit(Instruction::Memcpy {
+                dest: dp,
+                src: sp,
+                size,
+            });
+        }
+        // `__builtin_memcpy` returns its destination.
+        Some(Operand::Value(dp))
     }
 
     // --- Builtin-call diagnostics (AUD-ICE-1 / AUD-DIAG-1) -------------------
@@ -1385,13 +1305,11 @@ impl Lowerer {
             BuiltinIntrinsic::Parity => self.lower_parity_intrinsic(name, args),
             BuiltinIntrinsic::ComplexReal => self.lower_complex_part(name, args, true),
             BuiltinIntrinsic::ComplexImag => self.lower_complex_part(name, args, false),
-            BuiltinIntrinsic::ComplexConj => {
-                if !args.is_empty() {
-                    Some(self.lower_complex_conj(&args[0]))
-                } else {
-                    Some(Operand::Const(IrConst::F64(0.0)))
-                }
-            }
+            BuiltinIntrinsic::ComplexConj => match (args.first(), Self::complex_conj_ctype(name)) {
+                (Some(arg), Some(target)) => Some(self.lower_complex_conj_as(arg, &target)),
+                (Some(arg), None) => Some(self.lower_complex_conj(arg)),
+                (None, _) => Some(Operand::Const(IrConst::F64(0.0))),
+            },
             BuiltinIntrinsic::Fence => Some(Operand::Const(IrConst::I64(0))),
             BuiltinIntrinsic::FpClassify => self.lower_builtin_fpclassify(args),
             BuiltinIntrinsic::IsNan => self.lower_builtin_isnan(args),
@@ -1418,7 +1336,6 @@ impl Lowerer {
             BuiltinIntrinsic::StackSave => self.lower_builtin_stack_save(args),
             BuiltinIntrinsic::StackRestore => self.lower_builtin_stack_restore(args),
             BuiltinIntrinsic::Cexpi => self.lower_builtin_cexpi(args),
-            BuiltinIntrinsic::Cpow => self.lower_builtin_cpow(args),
             BuiltinIntrinsic::Gcc16GenericBit => self.lower_gcc16_generic_bit_builtin(name, args),
             BuiltinIntrinsic::Gcc16Carry => self.lower_gcc16_carry_builtin(name, args),
             BuiltinIntrinsic::Gcc16BswapBitrev => self.lower_gcc16_bswap_bitrev_builtin(name, args),
@@ -1922,9 +1839,6 @@ impl Lowerer {
             BuiltinIntrinsic::X86AvxWiden(op) => self.lower_avx_widen(*op, name, args),
             BuiltinIntrinsic::X86AvxTest(test) => self.lower_avx_test(*test, name, args),
             BuiltinIntrinsic::LcccSimd => self.lower_lccc_simd(name, args),
-            // __builtin___*_chk: fortification builtins forward to unchecked libc equivalents.
-            // Each __builtin___X_chk(args..., extra_check_args...) becomes X(args...).
-            BuiltinIntrinsic::FortifyChk => self.lower_fortify_chk(name, args),
             // __builtin_va_arg_pack / __builtin_va_arg_pack_len: forward the
             // wrapper's caller variadic arguments during inlining.  Lowered
             // to a zero-arg sentinel CALL (`__lccc_va_arg_pack` /
@@ -2150,137 +2064,6 @@ impl Lowerer {
                     Some(Operand::Const(IrConst::I64(0)))
                 }
             }
-        }
-    }
-
-    /// Lower __builtin___X_chk fortification builtins by forwarding all arguments
-    /// to the glibc __X_chk runtime function (e.g., __builtin___snprintf_chk -> __snprintf_chk).
-    /// This avoids infinite recursion when glibc's fortification headers redefine functions
-    /// like snprintf as always_inline wrappers that call __builtin___snprintf_chk.
-    fn lower_fortify_chk(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
-        // Map __builtin___X_chk to the glibc runtime __X_chk function.
-        // All arguments are forwarded as-is (the runtime function does the checking).
-        let libc_chk_name: &str = match name {
-            "__builtin___memcpy_chk" => "__memcpy_chk",
-            "__builtin___memmove_chk" => "__memmove_chk",
-            "__builtin___memset_chk" => "__memset_chk",
-            "__builtin___strcpy_chk" => "__strcpy_chk",
-            "__builtin___strncpy_chk" => "__strncpy_chk",
-            "__builtin___strcat_chk" => "__strcat_chk",
-            "__builtin___strncat_chk" => "__strncat_chk",
-            "__builtin___sprintf_chk" => "__sprintf_chk",
-            "__builtin___snprintf_chk" => "__snprintf_chk",
-            "__builtin___dprintf_chk" => "__dprintf_chk",
-            "__builtin___vsprintf_chk" => "__vsprintf_chk",
-            "__builtin___vsnprintf_chk" => "__vsnprintf_chk",
-            "__builtin___printf_chk" => "__printf_chk",
-            "__builtin___fprintf_chk" => "__fprintf_chk",
-            "__builtin___vprintf_chk" => "__vprintf_chk",
-            "__builtin___vfprintf_chk" => "__vfprintf_chk",
-            "__builtin___mempcpy_chk" => "__mempcpy_chk",
-            "__builtin___stpcpy_chk" => "__stpcpy_chk",
-            "__builtin___stpncpy_chk" => "__stpncpy_chk",
-            _ => {
-                // Unknown _chk variant: lower all args for side effects, return 0
-                for arg in args {
-                    self.lower_expr(arg);
-                }
-                return Some(Operand::Const(IrConst::I64(0)));
-            }
-        };
-
-        // Only the non-v* printf-family _chk builtins are truly variadic (they take ...).
-        // The v* variants (vsprintf_chk, etc.) take a va_list argument instead, which is
-        // a regular pointer parameter, not variadic.
-        let is_variadic = matches!(
-            name,
-            "__builtin___sprintf_chk"
-                | "__builtin___snprintf_chk"
-                | "__builtin___dprintf_chk"
-                | "__builtin___printf_chk"
-                | "__builtin___fprintf_chk"
-        );
-
-        // Lower all arguments in order
-        let mut arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
-        let mut arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
-
-        let dest = self.fresh_value();
-        let return_type = self
-            .builtin_return_type(name)
-            .unwrap_or(crate::common::types::target_int_ir_type());
-        // The fortified printf family has a fixed prefix (flag/size/format
-        // operands) followed by `...`.  Everything past the prefix is a
-        // variadic argument and must receive the default argument
-        // promotions, exactly as for the unfortified builtin: glibc's
-        // <stdio.h> rewrites `printf("%g", f)` into
-        // `__builtin___printf_chk(1, "%g", f)` and a float passed as F32
-        // there was read by glibc as a double.  The count also matters for
-        // the SysV `%al` XMM-count and the i686 stack layout.
-        let n_fixed = if is_variadic {
-            builtin_variadic_fixed_arity(libc_chk_name).unwrap_or(arg_vals.len())
-        } else {
-            arg_vals.len()
-        };
-        if is_variadic {
-            self.promote_variadic_args(&mut arg_vals, &mut arg_types, n_fixed);
-        }
-        let struct_arg_sizes = vec![None; arg_vals.len()];
-        self.emit(Instruction::Call {
-            func: libc_chk_name.to_string(),
-            info: CallInfo {
-                dest: Some(dest),
-                args: arg_vals,
-                arg_types,
-                return_type,
-                is_variadic,
-                num_fixed_args: n_fixed,
-                struct_arg_sizes,
-                struct_arg_aligns: vec![],
-                struct_arg_classes: Vec::new(),
-                struct_arg_fp_agg_classes: Vec::new(),
-                struct_arg_is_f128_sse: Vec::new(),
-                is_sret: false,
-                calling_convention: crate::common::types::CallingConvention::Default,
-                is_fastcall: false,
-                regparm: None,
-                is_pure: false,
-                is_const: false,
-                memory: Default::default(),
-                // Spelled `__builtin___<name>_chk`: the fortified builtin by definition.
-                assume_library: true,
-                ret_eightbyte_classes: Vec::new(),
-                ret_is_f128_sse: false,
-                ret_is_vector128: false,
-                cold: false,
-            },
-        });
-        Some(Operand::Value(dest))
-    }
-
-    /// Apply the C11 6.5.2.2p6 default argument promotions to every argument at
-    /// index >= `n_fixed` of a variadic call: `float` -> `double`,
-    /// `char`/`short` (any signedness) -> `int`.  `arg_types` is rewritten in
-    /// lock-step so the backend classifies the promoted value (F64 travels in
-    /// an XMM register and is counted in `%al`; I32 is a GPR/stack slot).
-    /// `_Bool` is already materialised as an I8 0/1 and widens to `int` here as
-    /// well, which is what the C standard requires.
-    pub(super) fn promote_variadic_args(
-        &mut self,
-        arg_vals: &mut [Operand],
-        arg_types: &mut [IrType],
-        n_fixed: usize,
-    ) {
-        for i in n_fixed..arg_vals.len() {
-            let ty = arg_types[i];
-            let promoted = match ty {
-                IrType::F32 => IrType::F64,
-                IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => IrType::I32,
-                _ => continue,
-            };
-            let val = std::mem::replace(&mut arg_vals[i], Operand::Const(IrConst::I64(0)));
-            arg_vals[i] = self.emit_implicit_cast(val, ty, promoted);
-            arg_types[i] = promoted;
         }
     }
 
@@ -4017,32 +3800,6 @@ enum X86IntrinsicKind {
     CastReinterpret,
 }
 
-/// Map a BuiltinIntrinsic to its emission pattern.
-/// Number of fixed (non-variadic) parameters of the variadic libc / glibc
-/// fortification functions reachable through `__builtin_*`.  This is the
-/// builtin's own contract and is consulted when the translation unit never
-/// declared the libc symbol (or declared it without a prototype), so the
-/// trailing arguments still receive the default argument promotions and the
-/// SysV XMM count in `%al` is correct.
-fn builtin_variadic_fixed_arity(libc_name: &str) -> Option<usize> {
-    Some(match libc_name {
-        "printf" => 1,
-        "fprintf" | "sprintf" | "dprintf" => 2,
-        "snprintf" => 3,
-        // __printf_chk(flag, fmt, ...)
-        "__printf_chk" => 2,
-        // __fprintf_chk(fp, flag, fmt, ...)
-        "__fprintf_chk" => 3,
-        // __sprintf_chk(s, flag, slen, fmt, ...)
-        "__sprintf_chk" => 4,
-        // __snprintf_chk(s, maxlen, flag, slen, fmt, ...)
-        "__snprintf_chk" => 5,
-        // __dprintf_chk(fd, flag, fmt, ...)
-        "__dprintf_chk" => 3,
-        _ => return None,
-    })
-}
-
 /// One `__builtin_prefetch` hint argument after constant evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrefetchArg {
@@ -5777,15 +5534,17 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
     }
 }
 
-/// The C library function a non-constant NaN builtin calls.
-fn nan_library_function(name: &str) -> Option<&'static str> {
-    Some(match name {
+/// The C library function a non-constant NaN builtin calls, and the
+/// builtin's prototype.
+fn nan_library_function(name: &str) -> Option<(&'static str, &'static builtins::LibcPrototype)> {
+    let library_name = match name {
         "__builtin_nan" => "nan",
         "__builtin_nanf" => "nanf",
         "__builtin_nanl" => "nanl",
         "__builtin_nanf128" | "__builtin_nanq" => "nanf128",
         _ => return None,
-    })
+    };
+    Some((library_name, builtins::libc_builtin_prototype(name)?))
 }
 
 #[cfg(test)]

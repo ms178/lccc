@@ -4903,9 +4903,10 @@ impl SemanticAnalyzer {
 
     /// The type of `expr` as the operand constraints judge it: the decayed
     /// value type, `None` when unknown. A `void` type counts only where it is
-    /// exact -- a cast to `void`, or a call to a declared, non-builtin
-    /// function -- because builtin signatures are not all modelled and a
-    /// wrong `void` would reject a valid program.
+    /// exact -- a cast to `void`, a call to a declared, non-builtin function,
+    /// or a library builtin with GCC's prototype -- because the other builtin
+    /// signatures are not all modelled and a wrong `void` would reject a
+    /// valid program.
     fn constraint_operand(&self, expr: &Expr) -> Option<CType> {
         // GCC types `c ? v() : 1` as `void` (its one-void-arm extension), so
         // using the value is the void-value error.
@@ -4919,11 +4920,16 @@ impl SemanticAnalyzer {
         // `__builtin_ia32_*` vector builtins are declared to return a vector
         // struct but yield a pointer to the result slot, which
         // `__CCC_M128I_FROM_BUILTIN(e)` = `*(__m128i *)(e)` dereferences.
+        //
+        // A library builtin is the exception: its type is the result of
+        // GCC's prototype of it (`__builtin_strlen(s)` is a `size_t`,
+        // `__builtin_free(p)` a `void`), and the call is lowered by that
+        // prototype.
         if let Expr::FunctionCall(callee, ..) = expr {
-            if matches!(callee.as_ref(), Expr::Identifier(name, _) if builtins::is_builtin(name)
-                && name != "__builtin_choose_expr")
-            {
-                return None;
+            if let Expr::Identifier(name, _) = callee.as_ref() {
+                if builtins::is_builtin(name) && name != "__builtin_choose_expr" {
+                    return builtins::libc_builtin_prototype(name).map(|p| p.result.ctype());
+                }
             }
         }
         let ty = self.expr_type_checker().infer_value_ctype(expr)?;
@@ -5057,8 +5063,9 @@ impl SemanticAnalyzer {
     }
 
     /// Whether an inferred `void` type of `expr` can be trusted: a `(void)`
-    /// cast, or a call to a declared non-builtin function. Callers must have
-    /// inferred `void` first.
+    /// cast, a call to a declared non-builtin function, or a call of a
+    /// library builtin GCC's prototype gives no result
+    /// (`__builtin_abort()`). Callers must have inferred `void` first.
     fn is_exact_void(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Cast(TypeSpecifier::Void, ..) => true,
@@ -5082,7 +5089,9 @@ impl SemanticAnalyzer {
             Expr::FunctionCall(callee, _, _) => matches!(
                 callee.as_ref(),
                 Expr::Identifier(name, _)
-                    if self.result.functions.contains_key(name) && !builtins::is_builtin(name)
+                    if (self.result.functions.contains_key(name) && !builtins::is_builtin(name))
+                        || builtins::libc_builtin_prototype(name)
+                            .is_some_and(|p| p.result == builtins::LibcType::Void)
             ),
             _ => false,
         }
@@ -6582,6 +6591,18 @@ dereference it before applying '->' to it?"
                 span,
             );
         }
+        self.check_argument_conversions(name, args, params);
+    }
+
+    /// Each argument of a call of `name` against the parameter it is
+    /// converted to, as if by assignment (C23 6.5.2.2p7); how many arguments
+    /// the call may have is the caller's to judge.
+    fn check_argument_conversions(
+        &self,
+        name: &str,
+        args: &[Expr],
+        params: &[(CType, Option<String>)],
+    ) {
         let checker = self.expr_type_checker();
         // Arguments past the prototype only need a value (C23 6.5.2.2p7).
         for arg in args.iter().skip(params.len()) {
@@ -8373,26 +8394,57 @@ dereference it before applying '->' to it?"
         }
     }
 
+    /// How many arguments a library function called without a declaration
+    /// takes: a builtin's prototype says it (`__builtin_tan`), and for the
+    /// plain names (`memcpy(d, s)` in a dialect with implicit declarations)
+    /// the table of GCC's verdicts does.
     fn check_libc_builtin_arity(&self, name: &str, argc: usize, span: Span) {
-        let Some(arity) = libc_builtin_arity::libc_builtin_arity(name) else {
-            return;
+        let (min_args, variadic) = match builtins::libc_builtin_prototype(name) {
+            Some(prototype) => (prototype.parameters.len(), prototype.variadic),
+            None => match libc_builtin_arity::libc_builtin_arity(name) {
+                Some(arity) => (arity.min_args, arity.variadic),
+                None => return,
+            },
         };
-        let too_few = argc < arity.min_args;
-        if !too_few && (arity.variadic || argc == arity.min_args) {
+        let too_few = argc < min_args;
+        if !too_few && (variadic || argc == min_args) {
             return;
         }
-        let expected = if arity.variadic { "at least " } else { "" };
+        let expected = if variadic { "at least " } else { "" };
         self.diagnostics.borrow_mut().error(
             format!(
                 "{} arguments to function '{}'; expected {}{}, have {}",
                 if too_few { "too few" } else { "too many" },
                 name,
                 expected,
-                arity.min_args,
+                min_args,
                 argc,
             ),
             span,
         );
+    }
+
+    /// The arguments of a call of a library builtin against GCC's prototype
+    /// of it; `false` for a name that has none.
+    ///
+    /// Nothing checked them: the builtin has no declaration for the call
+    /// checker to read, so `__builtin_strlen(5)`, `__builtin_sqrt("a")` and
+    /// `__builtin_memcpy(d, s, p)` with a pointer `p` were accepted in
+    /// silence and lowered as whatever conversion the two IR types named.
+    /// The number of arguments is judged where the call is seen
+    /// (`check_libc_builtin_arity`).
+    fn check_library_builtin_call(&self, name: &str, args: &[Expr]) -> bool {
+        let Some(prototype) = builtins::libc_builtin_prototype(name) else {
+            return false;
+        };
+        let va_list = self.result.type_context.typedefs.get("__builtin_va_list");
+        let params: Vec<(CType, Option<String>)> = prototype
+            .parameters
+            .iter()
+            .map(|parameter| (parameter.parameter_ctype(va_list), None))
+            .collect();
+        self.check_argument_conversions(name, args, &params);
+        true
     }
 
     fn check_c2y_builtin_call(&mut self, name: &str, args: &[Expr], span: Span) {
@@ -8566,6 +8618,11 @@ dereference it before applying '->' to it?"
     /// than duplicating arity, pointer, record, and conversion rules here.
     /// Returning true means the name was handled, including an arity error.
     fn check_gcc17_builtin_call(&self, name: &str, args: &[Expr], span: Span) -> bool {
+        // A library builtin has GCC's prototype; the four below are builtins
+        // GCC gives no type as a value, and have no library function.
+        if self.check_library_builtin_call(name, args) {
+            return true;
+        }
         let void_ptr = || CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
         let const_void_ptr = || {
             CType::Pointer(
@@ -8573,54 +8630,23 @@ dereference it before applying '->' to it?"
                 PtrQuals::recorded(AddressSpace::Default, PtrQuals::CONST),
             )
         };
-        let const_char_ptr = || {
-            CType::Pointer(
-                Box::new(CType::Char),
-                PtrQuals::recorded(AddressSpace::Default, PtrQuals::CONST),
-            )
-        };
-        let double_ptr = || CType::Pointer(Box::new(CType::Double), PtrQuals::GENERIC);
-        let float_ptr = || CType::Pointer(Box::new(CType::Float), PtrQuals::GENERIC);
         let param = |ty| (ty, None);
         let size_t = if crate::common::types::target_is_32bit() {
             CType::UInt
         } else {
             CType::ULong
         };
-        let const_void_param = param(const_void_ptr());
-        let const_char_param = param(const_char_ptr());
-        let size_param = param(size_t);
         let params = match name {
-            // GCC's GNU aliases have no ordinary declaration to validate the
-            // call against. Their libc signatures still matter: a wrong
-            // pointer or width here is a silent ABI miscompile, not merely a
-            // missing diagnostic.
-            "__builtin_bcmp" => {
-                vec![
-                    const_void_param.clone(),
-                    const_void_param.clone(),
-                    size_param,
-                ]
-            }
-            "__builtin_bzero" => vec![param(void_ptr()), size_param],
-            "__builtin_bcopy" => {
-                vec![const_void_param, param(void_ptr()), size_param]
-            }
-            "__builtin_strdup" => vec![const_char_param],
-            "__builtin_strndup" => vec![const_char_param, size_param],
-            "__builtin_ilogb" => vec![param(CType::Double)],
-            "__builtin_modf" => vec![param(CType::Double), param(double_ptr())],
-            "__builtin_modff" => vec![param(CType::Float), param(float_ptr())],
-            "__builtin_strncasecmp" => {
-                vec![const_char_param.clone(), const_char_param, size_param]
-            }
             "__builtin_memcmp_eq" => {
-                vec![const_void_param.clone(), const_void_param, size_param]
+                vec![
+                    param(const_void_ptr()),
+                    param(const_void_ptr()),
+                    param(size_t),
+                ]
             }
             "__builtin_stack_save" => Vec::new(),
             "__builtin_stack_restore" => vec![param(void_ptr())],
             "__builtin_cexpi" => vec![param(CType::Double)],
-            "__builtin_cpow" => vec![param(CType::ComplexDouble), param(CType::ComplexDouble)],
             _ => return false,
         };
         self.check_call_arguments(name, args, &params, false, span);

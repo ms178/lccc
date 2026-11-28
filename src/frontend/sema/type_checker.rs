@@ -1567,59 +1567,11 @@ impl<'a> ExprTypeChecker<'a> {
                 Some(CType::ULongLong)
             }
             // Float-returning builtins
-            "__builtin_inf"
-            | "__builtin_huge_val"
-            | "__builtin_nan"
-            | "__builtin_nans"
-            | "__builtin_fma"
-            | "__builtin_trunc"
-            | "__builtin_rint"
-            | "__builtin_nearbyint"
-            | "__builtin_roundeven"
-            | "__builtin_fabs"
-            | "__builtin_sqrt"
-            | "__builtin_sin"
-            | "__builtin_cos"
-            | "__builtin_log"
-            | "__builtin_log2"
-            | "__builtin_exp"
-            | "__builtin_pow"
-            | "__builtin_floor"
-            | "__builtin_ceil"
-            | "__builtin_round"
-            | "__builtin_fmin"
-            | "__builtin_fmax"
-            | "__builtin_copysign"
-            | "__builtin_nextafter" => Some(CType::Double),
+            "__builtin_inf" | "__builtin_huge_val" | "__builtin_nans" => Some(CType::Double),
 
-            "__builtin_inff"
-            | "__builtin_huge_valf"
-            | "__builtin_nanf"
-            | "__builtin_nansf"
-            | "__builtin_fmaf"
-            | "__builtin_truncf"
-            | "__builtin_rintf"
-            | "__builtin_nearbyintf"
-            | "__builtin_roundevenf"
-            | "__builtin_fabsf"
-            | "__builtin_sqrtf"
-            | "__builtin_sinf"
-            | "__builtin_cosf"
-            | "__builtin_logf"
-            | "__builtin_expf"
-            | "__builtin_powf"
-            | "__builtin_floorf"
-            | "__builtin_ceilf"
-            | "__builtin_roundf"
-            | "__builtin_copysignf"
-            | "__builtin_nextafterf" => Some(CType::Float),
+            "__builtin_inff" | "__builtin_huge_valf" | "__builtin_nansf" => Some(CType::Float),
 
-            "__builtin_infl"
-            | "__builtin_huge_vall"
-            | "__builtin_nanl"
-            | "__builtin_nansl"
-            | "__builtin_fabsl"
-            | "__builtin_nextafterl" => Some(CType::LongDouble),
+            "__builtin_infl" | "__builtin_huge_vall" | "__builtin_nansl" => Some(CType::LongDouble),
 
             // _Float16 & __bf16 builtins (GCC 16.2 / C23 TS 18661-3).
             "__builtin_inff16"
@@ -1645,16 +1597,10 @@ impl<'a> ExprTypeChecker<'a> {
             // _Float128 builtins (sema/builtins.rs): binary128 results.
             "__builtin_inff128"
             | "__builtin_huge_valf128"
-            | "__builtin_nanf128"
             | "__builtin_nansf128"
-            | "__builtin_copysignf128"
-            | "__builtin_fabsf128"
             | "__builtin_infq"
             | "__builtin_huge_valq"
-            | "__builtin_nanq"
-            | "__builtin_nansq"
-            | "__builtin_copysignq"
-            | "__builtin_fabsq" => Some(CType::Float128),
+            | "__builtin_nansq" => Some(CType::Float128),
 
             // Integer-returning builtins
             "__builtin_fpclassify"
@@ -1695,9 +1641,6 @@ impl<'a> ExprTypeChecker<'a> {
             | "__builtin_parity"
             | "__builtin_parityl"
             | "__builtin_parityll"
-            | "__builtin_ffs"
-            | "__builtin_ffsl"
-            | "__builtin_ffsll"
             | "__builtin_types_compatible_p"
             | "__builtin_classify_type"
             | "__builtin_constant_p"
@@ -1711,23 +1654,17 @@ impl<'a> ExprTypeChecker<'a> {
             "__builtin_expect" | "__builtin_expect_with_probability" => Some(CType::Long),
 
             // Complex component extraction
-            "creal" | "__builtin_creal" | "cimag" | "__builtin_cimag" => Some(CType::Double),
-            "crealf" | "__builtin_crealf" | "cimagf" | "__builtin_cimagf" => Some(CType::Float),
-            "creall" | "__builtin_creall" | "cimagl" | "__builtin_cimagl" => {
-                Some(CType::LongDouble)
-            }
-            "cabs" | "__builtin_cabs" => Some(CType::Double),
-            "cabsf" | "__builtin_cabsf" => Some(CType::Float),
-            "cabsl" | "__builtin_cabsl" => Some(CType::LongDouble),
-            "carg" | "__builtin_carg" => Some(CType::Double),
-            "cargf" | "__builtin_cargf" => Some(CType::Float),
+            "creal" | "cimag" => Some(CType::Double),
+            "crealf" | "cimagf" => Some(CType::Float),
+            "creall" | "cimagl" => Some(CType::LongDouble),
+            "cabs" => Some(CType::Double),
+            "cabsf" => Some(CType::Float),
+            "cabsl" => Some(CType::LongDouble),
+            "carg" => Some(CType::Double),
+            "cargf" => Some(CType::Float),
 
             // Memory/string builtins returning pointers
-            "__builtin_memcpy"
-            | "__builtin_memmove"
-            | "__builtin_memset"
-            | "__builtin_alloca"
-            | "__builtin_alloca_with_align"
+            "__builtin_alloca_with_align"
             | "alloca"
             | "__builtin_frame_address"
             | "__builtin_return_address"
@@ -1742,13 +1679,10 @@ impl<'a> ExprTypeChecker<'a> {
             | "__builtin_va_start"
             | "__builtin_va_end"
             | "__builtin_va_copy"
-            | "__builtin_abort"
-            | "__builtin_exit"
             | "__builtin_trap"
             | "__builtin_unreachable"
             | "__builtin_prefetch"
             | "__builtin_ia32_prefetch"
-            | "__builtin___clear_cache"
             | "__builtin_cpu_init" => Some(CType::Void),
 
             // CPU feature detection

@@ -433,7 +433,23 @@ impl Lowerer {
 
     /// Return the IR type for known builtins that return float or specific types.
     /// Returns None for builtins without special return type handling.
+    ///
+    /// A library builtin has the result of GCC's prototype
+    /// (`libc_builtin_prototype`). One that is a call of the library
+    /// function comes back as that call does (`call_result_ir_type`: a
+    /// complex value in registers); one lccc lowers itself
+    /// (`__builtin_creal`, `__builtin_conj`) yields the value, a complex one
+    /// as the address of its two parts.
     pub(super) fn builtin_return_type(&self, name: &str) -> Option<IrType> {
+        use crate::frontend::sema::builtins;
+        if let Some(prototype) = builtins::libc_builtin_prototype(name) {
+            let result = prototype.result.ctype();
+            return Some(if builtins::library_alias(name).is_some() {
+                self.call_result_ir_type(&result)
+            } else {
+                IrType::from_ctype(&result)
+            });
+        }
         if let Some(result) = crate::common::x86_builtin_types::result_type(name) {
             return Some(IrType::from_ctype(&result));
         }
@@ -467,132 +483,18 @@ impl Lowerer {
             // carrier (F128 is the x87 long double type).
             "__builtin_inff128"
             | "__builtin_huge_valf128"
-            | "__builtin_nanf128"
             | "__builtin_nansf128"
             | "__builtin_infq"
             | "__builtin_huge_valq"
-            | "__builtin_nanq"
             | "__builtin_nansq" => Some(IrType::U128),
-            "__builtin_nan" | "__builtin_nans" => Some(IrType::F64),
-            "__builtin_nanf" | "__builtin_nansf" => Some(IrType::F32),
-            "__builtin_nanl" | "__builtin_nansl" => Some(IrType::F128),
-            "__builtin_fma"
-            | "__builtin_trunc"
-            | "__builtin_rint"
-            | "__builtin_nearbyint"
-            | "__builtin_roundeven"
-            | "__builtin_fabs"
-            | "__builtin_sqrt"
-            | "__builtin_sin"
-            | "__builtin_cos"
-            | "__builtin_log"
-            | "__builtin_log2"
-            | "__builtin_exp"
-            | "__builtin_pow"
-            | "__builtin_floor"
-            | "__builtin_ceil"
-            | "__builtin_round"
-            | "__builtin_fmin"
-            | "__builtin_fmax"
-            | "__builtin_copysign"
-            | "__builtin_nextafter" => Some(IrType::F64),
-            "__builtin_fmaf"
-            | "__builtin_truncf"
-            | "__builtin_rintf"
-            | "__builtin_nearbyintf"
-            | "__builtin_roundevenf"
-            | "__builtin_fabsf"
-            | "__builtin_sqrtf"
-            | "__builtin_sinf"
-            | "__builtin_cosf"
-            | "__builtin_logf"
-            | "__builtin_expf"
-            | "__builtin_powf"
-            | "__builtin_floorf"
-            | "__builtin_ceilf"
-            | "__builtin_roundf"
-            | "__builtin_copysignf"
-            | "__builtin_nextafterf"
-            // The float twins of `fmax`/`fmin`/`log2`. Their absence here was
-            // a silent miscompile, not a missing symbol: the libc-alias
-            // lowering asks THIS table for the call's result type, so an
-            // unlisted name fell through to I64 and the caller converted the
-            // callee's %xmm0 return with `cvtsi2ssq` -- `__builtin_fmaxf(1.5f,
-            // 2.5f)` evaluated to 1.08842e+09 (the raw low word reinterpreted as
-            // an integer) where GCC 16.2 answers 2.5.  This table and
-            // `builtins.rs`'s alias map are two halves of one contract, which is
-            // exactly why `tests/regression/check_builtin_float_aliases.py`
-            // derives the class from GCC and checks the RESULT rather than the
-            // tables: drift in either half fails there.
-            | "__builtin_fmaxf"
-            | "__builtin_fminf"
-            | "__builtin_log2f" => Some(IrType::F32),
-            "__builtin_fabsl" | "__builtin_sqrtl" | "__builtin_nextafterl" => Some(IrType::F128),
-            // __builtin_* variants: the LibcAlias lowering asks for the
-            // BUILTIN name (e.g. "__builtin_copysignl"), not the libc name.
-            // Without these, the call was typed I64 -> the caller cast the
-            // x87 result via fildq (bit-pattern corruption) or lost it.
-            "__builtin_copysignl"
-            | "__builtin_truncl"
-            | "__builtin_floorl"
-            | "__builtin_ceill"
-            | "__builtin_rintl"
-            | "__builtin_nearbyintl"
-            | "__builtin_roundl"
-            | "__builtin_fmodl"
-            | "__builtin_remainderl"
-            | "__builtin_powl"
-            | "__builtin_sinl"
-            | "__builtin_cosl"
-            | "__builtin_tanl"
-            | "__builtin_asinl"
-            | "__builtin_acosl"
-            | "__builtin_atanl"
-            | "__builtin_atan2l"
-            | "__builtin_sinhl"
-            | "__builtin_coshl"
-            | "__builtin_tanhl"
-            | "__builtin_asinhl"
-            | "__builtin_acoshl"
-            | "__builtin_atanhl"
-            | "__builtin_exp2l"
-            | "__builtin_expm1l"
-            | "__builtin_log1pl"
-            | "__builtin_log10l"
-            | "__builtin_log2l"
-            | "__builtin_fmaxl"
-            | "__builtin_fminl"
-            | "__builtin_fdiml"
-            | "__builtin_fmal"
-            | "__builtin_hypotl"
-            | "__builtin_cbrtl"
-            | "__builtin_frexpl"
-            | "__builtin_ldexpl"
-            | "__builtin_scalbnl"
-            | "__builtin_scalblnl"
-            | "__builtin_modfl"
-            | "__builtin_erfl"
-            | "__builtin_erfcl"
-            | "__builtin_tgammal"
-            | "__builtin_lgammal"
-            | "__builtin_j0l"
-            | "__builtin_j1l"
-            | "__builtin_jnl"
-            | "__builtin_y0l"
-            | "__builtin_y1l"
-            | "__builtin_ynl" => Some(IrType::F128),
+            "__builtin_nans" => Some(IrType::F64),
+            "__builtin_nansf" => Some(IrType::F32),
+            "__builtin_nansl" => Some(IrType::F128),
             // plain libm names used by simplify's binary/unary intrinsic folds
             // (copysignl/fabsl -> LDCopysign/LDFabs); wrong default typing
             // (I64) made the return cast the x87 result via fildq.
             "copysignl" | "fabsl" | "truncl" | "floorl" | "ceill" | "rintl" | "nearbyintl"
             | "sqrtl" => Some(IrType::F128),
-            // _Float128-specific builtins: results are 16-byte binary128 BIT
-            // PATTERNS (U128). Returning F128 here makes the caller cast
-            // F128->U128 via __fixunstfti, corrupting the value.
-            "__builtin_copysignf128"
-            | "__builtin_fabsf128"
-            | "__builtin_copysignq"
-            | "__builtin_fabsq" => Some(IrType::U128),
             "__builtin_inff16"
             | "__builtin_huge_valf16"
             | "__builtin_nanf16"
@@ -651,16 +553,7 @@ impl Lowerer {
             | "__builtin_popcountll"
             | "__builtin_parity"
             | "__builtin_parityl"
-            | "__builtin_parityll"
-            | "__builtin_ffs"
-            | "__builtin_ffsl"
-            | "__builtin_ffsll" => Some(IrType::I32),
-            // Memory/string comparison builtins return int
-            "__builtin_memcmp" | "__builtin_strcmp" | "__builtin_strncmp" => Some(IrType::I32),
-            // Pointer-returning string/memory builtins (kernel fortify-string.h).
-            "__builtin_memchr" | "__builtin_strpbrk" | "__builtin_strncat"
-            | "__builtin_stpncpy" => Some(IrType::Ptr),
-            "__builtin_strspn" | "__builtin_strcspn" => Some(IrType::U64),
+            | "__builtin_parityll" => Some(IrType::I32),
             // 256-bit raw builtins return v8sf, which lccc represents as a
             // POINTER to the 32-byte result slot everywhere (sret convention).
             // The 128-bit raw builtins (maxps, minps, shufps, vextractf128_*)
@@ -673,53 +566,27 @@ impl Lowerer {
             | "__builtin_ia32_minps256"
             | "__builtin_ia32_andps256"
             | "__builtin_ia32_cmpps256" => Some(IrType::Ptr),
-            // I/O builtins return int
-            "__builtin_printf" | "__builtin_fprintf" | "__builtin_sprintf"
-            | "__builtin_snprintf" | "__builtin_puts" | "__builtin_putchar" => Some(IrType::I32),
             // Byte-swap builtins return the same-width unsigned type
             "__builtin_bswap16" => Some(IrType::U16),
             "__builtin_bswap32" => Some(IrType::U32),
             "__builtin_bswap64" => Some(IrType::U64),
-            // abs returns int
-            "__builtin_abs" => Some(IrType::I32),
             // Complex number component extraction builtins
-            "creal" | "__builtin_creal" | "cimag" | "__builtin_cimag" => Some(IrType::F64),
-            "crealf" | "__builtin_crealf" | "cimagf" | "__builtin_cimagf" => Some(IrType::F32),
-            "creall" | "__builtin_creall" | "cimagl" | "__builtin_cimagl" => Some(IrType::F128),
+            "creal" | "cimag" => Some(IrType::F64),
+            "crealf" | "cimagf" => Some(IrType::F32),
+            "creall" | "cimagl" => Some(IrType::F128),
             // Complex absolute value
-            "cabs" | "__builtin_cabs" => Some(IrType::F64),
-            "cabsf" | "__builtin_cabsf" => Some(IrType::F32),
-            "cabsl" | "__builtin_cabsl" => Some(IrType::F128),
+            "cabs" => Some(IrType::F64),
+            "cabsf" => Some(IrType::F32),
+            "cabsl" => Some(IrType::F128),
             // Complex argument
-            "carg" | "__builtin_carg" => Some(IrType::F64),
-            "cargf" | "__builtin_cargf" => Some(IrType::F32),
+            "carg" => Some(IrType::F64),
+            "cargf" => Some(IrType::F32),
             // CPU feature detection builtins return int
             "__builtin_cpu_init" => Some(IrType::I32),
             "__builtin_cpu_supports" => Some(IrType::I32),
             "__builtin_cpu_is" => Some(IrType::I32),
-            // Fortification builtins: return type matches the underlying libc function
-            // Memory/string functions return pointer (dest)
-            "__builtin___memcpy_chk"
-            | "__builtin___memmove_chk"
-            | "__builtin___memset_chk"
-            | "__builtin___strcpy_chk"
-            | "__builtin___strncpy_chk"
-            | "__builtin___strcat_chk"
-            | "__builtin___strncat_chk"
-            | "__builtin___mempcpy_chk"
-            | "__builtin___stpcpy_chk"
-            | "__builtin___stpncpy_chk" => Some(IrType::Ptr),
             // printf/fprintf/sprintf/snprintf return int
-            "__builtin___sprintf_chk"
-            | "__builtin___snprintf_chk"
-            | "__builtin___vsprintf_chk"
-            | "__builtin___vsnprintf_chk"
-            | "__builtin___printf_chk"
-            | "__builtin___fprintf_chk"
-            | "__builtin___vprintf_chk"
-            | "__builtin___vfprintf_chk"
-            | "__builtin_va_arg_pack"
-            | "__builtin_va_arg_pack_len" => Some(IrType::I32),
+            "__builtin_va_arg_pack" | "__builtin_va_arg_pack_len" => Some(IrType::I32),
             "__builtin_thread_pointer" => Some(IrType::Ptr),
             _ => crate::frontend::sema::builtins::gcc_compat_builtin_ctype(name)
                 .map(|ct| IrType::from_ctype(&ct)),

@@ -467,31 +467,65 @@ impl Lowerer {
         Operand::Value(result)
     }
 
-    /// Lower complex conjugate: conj(a+bi) = a + (-b)i
+    /// The complex conjugate of `inner` in its own complex type: GNU C's
+    /// `~z`.
     pub(super) fn lower_complex_conj(&mut self, inner: &Expr) -> Operand {
+        let ctype = self.expr_ctype(inner);
+        if !ctype.is_complex() {
+            return self.lower_expr(inner);
+        }
+        self.lower_complex_conj_as(inner, &ctype)
+    }
+
+    /// The complex conjugate of `inner` converted to the complex type
+    /// `target`: `conj`, `conjf` and `conjl`, each of which takes and yields
+    /// its own type whatever the argument is (`conjf(z)` of a
+    /// `double _Complex` is a `float _Complex`; `conj(x)` of a real `x` is
+    /// `x - 0.0i`).
+    ///
+    /// The argument's own type was used instead, and a real argument came
+    /// back as it was: the value of `conj(n)` was an `int` where every reader
+    /// expected the address of two `double`s, and reading through it was a
+    /// segmentation fault; `__builtin_conjf(x)` of a `double x = 2.9` was
+    /// 8.58993e+08.
+    pub(super) fn lower_complex_conj_as(&mut self, inner: &Expr, target: &CType) -> Operand {
         let inner_ctype = self.expr_ctype(inner);
-        if inner_ctype.is_complex() {
-            let ptr = self.lower_expr(inner);
-            let ptr_val = self.operand_to_value(ptr);
-            let comp_ty = Self::complex_component_ir_type(&inner_ctype);
-
-            let r = self.load_complex_real(ptr_val, &inner_ctype);
-            let i = self.load_complex_imag(ptr_val, &inner_ctype);
-
-            let neg_i = self.fresh_value();
-            self.emit(Instruction::UnaryOp {
-                dest: neg_i,
-                op: IrUnaryOp::Neg,
-                src: i,
-                ty: comp_ty,
-            });
-
-            let result = self.alloca_complex(&inner_ctype);
-            self.store_complex_parts(result, r, Operand::Value(neg_i), &inner_ctype);
-            Operand::Value(result)
+        let value = self.lower_expr(inner);
+        let converted = if !inner_ctype.is_complex() {
+            self.real_to_complex(value, &inner_ctype, target)
+        } else if inner_ctype != *target {
+            let ptr = self.operand_to_value(value);
+            self.complex_to_complex(ptr, &inner_ctype, target)
         } else {
-            // conj on a non-complex value just returns the value
-            self.lower_expr(inner)
+            value
+        };
+        let ptr_val = self.operand_to_value(converted);
+        let comp_ty = Self::complex_component_ir_type(target);
+
+        let r = self.load_complex_real(ptr_val, target);
+        let i = self.load_complex_imag(ptr_val, target);
+
+        let neg_i = self.fresh_value();
+        self.emit(Instruction::UnaryOp {
+            dest: neg_i,
+            op: IrUnaryOp::Neg,
+            src: i,
+            ty: comp_ty,
+        });
+
+        let result = self.alloca_complex(target);
+        self.store_complex_parts(result, r, Operand::Value(neg_i), target);
+        Operand::Value(result)
+    }
+
+    /// The complex type `conj`, `conjf` or `conjl` takes and yields, under
+    /// the plain name or the builtin's; `None` for every other name.
+    pub(super) fn complex_conj_ctype(name: &str) -> Option<CType> {
+        match name.strip_prefix("__builtin_").unwrap_or(name) {
+            "conj" => Some(CType::ComplexDouble),
+            "conjf" => Some(CType::ComplexFloat),
+            "conjl" => Some(CType::ComplexLongDouble),
+            _ => None,
         }
     }
 
@@ -643,23 +677,12 @@ impl Lowerer {
                         }
                         return CType::ComplexDouble;
                     }
-                    // conj/conjf/conjl preserve the argument's complex type, but
-                    // the registered function signature always says ComplexDouble.
-                    if matches!(
-                        name.as_str(),
-                        "conj"
-                            | "conjf"
-                            | "conjl"
-                            | "__builtin_conj"
-                            | "__builtin_conjf"
-                            | "__builtin_conjl"
-                    ) {
-                        if let Some(first_arg) = args.first() {
-                            let arg_ct = self.expr_ctype(first_arg);
-                            if arg_ct.is_complex() {
-                                return arg_ct;
-                            }
-                        }
+                    // conj/conjf/conjl, lowered here and not as calls: each
+                    // yields its own type whatever the argument's
+                    // (`lower_complex_conj_as`), and the signature seeded for
+                    // the plain names does not say which.
+                    if let Some(ct) = Self::complex_conj_ctype(name) {
+                        return ct;
                     }
                 }
                 // Fall through to get_expr_ctype for other function calls

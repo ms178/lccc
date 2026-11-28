@@ -110,6 +110,10 @@ pub struct Lowerer {
     /// Set of function names declared with __attribute__((noreturn)) or _Noreturn.
     /// After calls to these functions, emit Unreachable to avoid generating dead epilogue code.
     pub(super) noreturn_functions: FxHashSet<String>,
+    /// The library builtins this unit calls, each with the library function
+    /// its call is (`__builtin_sqrt`: `sqrt`): what the `__asm__` label of
+    /// the builtin's declaration would say (`declare_library_builtin`).
+    pub(super) library_builtins: FxHashMap<String, &'static str>,
     /// Set of function names declared with __attribute__((fastcall)).
     /// On i386, these use ecx/edx for the first two integer/pointer args.
     pub(super) fastcall_functions: FxHashSet<String>,
@@ -479,6 +483,7 @@ impl Lowerer {
             error_functions: FxHashSet::default(),
             diagnose_as_builtins: FxHashMap::default(),
             noreturn_functions: FxHashSet::default(),
+            library_builtins: FxHashMap::default(),
             fastcall_functions: FxHashSet::default(),
             regparm_functions: FxHashMap::default(),
             pure_functions: FxHashSet::default(),
@@ -1692,14 +1697,23 @@ impl Lowerer {
     /// Resolve a symbol reference: versioned .symver references first (glibc
     /// compat_symbol_reference), then __asm__("label") redirects, else the
     /// plain name.
+    ///
+    /// A library builtin is the library function, under the name the unit
+    /// gave that function: after glibc's `extern int sscanf(...)
+    /// __asm__("__isoc23_sscanf");` a `__builtin_sscanf` call is a call of
+    /// `__isoc23_sscanf` (GCC renames the builtin with the declaration,
+    /// `set_builtin_user_assembler_name`).
     pub(super) fn resolve_ref_name(&self, name: &str) -> String {
         if let Some(v) = self.symver_ref_map.get(name) {
             return v.clone();
         }
-        self.asm_label_map
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| name.to_string())
+        if let Some(label) = self.asm_label_map.get(name) {
+            return label.clone();
+        }
+        match self.library_builtins.get(name) {
+            Some(library_name) => self.resolve_ref_name(library_name),
+            None => name.to_string(),
+        }
     }
 
     /// Register function metadata (return type, param types, variadic, sret) for
@@ -1727,6 +1741,58 @@ impl Lowerer {
         }
         let sig = self.build_function_sig(name, ret_type_spec, ptr_count, params, variadic, is_kr);
         self.func_meta.sigs.insert(name.to_string(), sig);
+    }
+
+    /// The IR type the result of a call comes back as, for a function whose
+    /// return type is the scalar or complex type `ct` (an aggregate is
+    /// classified by `build_function_sig`).
+    ///
+    /// A complex value has no IR type of its own; the calling convention
+    /// decides what the call instruction yields:
+    ///
+    /// x86-64:
+    ///   _Complex double: real in xmm0 (F64), imag in xmm1 -> F64
+    ///   _Complex float: packed two F32 in xmm0 as F64 -> F64
+    ///   _Complex long double: real in x87 st(0) -> F128
+    ///
+    /// ARM64/RISC-V:
+    ///   _Complex double: real in d0 (F64), imag in d1 -> F64
+    ///   _Complex float: real in s0 (F32), imag in s1 -> F32
+    ///
+    /// i686:
+    ///   _Complex float (8 bytes): packed in eax:edx -> I64
+    ///   _Complex double (16 bytes), _Complex long double (24 bytes): the
+    ///   hidden-pointer convention, so the default `Ptr` stands
+    ///   _Float128/_Decimal128 (TFmode/TDmode, 16 bytes): class MEMORY -- GCC
+    ///   returns it through a hidden pointer (first stack arg, callee-popped
+    ///   with `ret $4`). The IR return becomes Ptr and the body stores the
+    ///   16-byte carrier through the sret buffer (try_sret_return). x86-64
+    ///   keeps the U128/xmm0:xmm1 return.
+    ///
+    /// One function for a declared function's signature and for a library
+    /// builtin asked about before its first call is lowered
+    /// (`builtin_return_type`): the two answers are one answer.
+    pub(super) fn call_result_ir_type(&self, ct: &CType) -> IrType {
+        if matches!(ct, CType::ComplexLongDouble) && self.returns_complex_long_double_in_regs() {
+            // x86-64: real part in x87 st(0); ARM64: real part in q0
+            IrType::F128
+        } else if matches!(ct, CType::ComplexDouble) && self.decomposes_complex_double() {
+            IrType::F64
+        } else if matches!(ct, CType::ComplexFloat) {
+            if self.uses_packed_complex_float() {
+                IrType::F64
+            } else if self.decomposes_complex_float() {
+                IrType::F32
+            } else {
+                IrType::I64
+            }
+        } else if (matches!(ct, CType::Float128) || *ct == CType::Decimal128)
+            && crate::common::types::target_is_32bit()
+        {
+            IrType::Ptr
+        } else {
+            IrType::from_ctype(ct)
+        }
     }
 
     /// The call-ABI signature of function `name` (return convention,
@@ -1770,61 +1836,9 @@ impl Lowerer {
             ct
         };
 
-        // Compute return type, wrapping with pointer levels if needed
-        let mut ret_ty = IrType::from_ctype(&full_ret_ctype);
-        // Complex return types need special IR type overrides based on target ABI:
-        //
-        // x86-64:
-        //   _Complex double: real in xmm0 (F64), imag in xmm1 -> IR ret type F64
-        //   _Complex float: packed two F32 in xmm0 as F64 -> IR ret type F64
-        //   _Complex long double: real in x87 st(0) -> IR ret type F128
-        //
-        // ARM64/RISC-V:
-        //   _Complex double: real in d0 (F64), imag in d1 -> IR ret type F64
-        //   _Complex float: real in s0 (F32), imag in s1 -> IR ret type F32
-        //
-        // i686:
-        //   _Complex float (8 bytes): packed in eax:edx -> IR ret type I64
-        //   _Complex double (16 bytes): sret hidden pointer (ret_ty stays Ptr)
-        //   _Complex long double (24 bytes): sret hidden pointer (ret_ty stays Ptr)
-        if ptr_count == 0 {
-            if matches!(full_ret_ctype, CType::ComplexLongDouble)
-                && self.returns_complex_long_double_in_regs()
-            {
-                // x86-64: real part in x87 st(0); ARM64: real part in q0
-                ret_ty = IrType::F128;
-            } else if matches!(full_ret_ctype, CType::ComplexDouble)
-                && self.decomposes_complex_double()
-            {
-                // x86-64/ARM64/RISC-V: _Complex double returns real in FP reg
-                ret_ty = IrType::F64;
-            } else if matches!(full_ret_ctype, CType::ComplexFloat) {
-                if self.uses_packed_complex_float() {
-                    // x86-64: packed two F32 in one xmm register as F64
-                    ret_ty = IrType::F64;
-                } else if self.decomposes_complex_float() {
-                    // ARM64/RISC-V: real in first FP register as F32
-                    ret_ty = IrType::F32;
-                } else {
-                    // i686: _Complex float (8 bytes) fits in eax:edx, pack as I64
-                    ret_ty = IrType::I64;
-                }
-            }
-            // i686: ComplexDouble (16 bytes) and ComplexLongDouble (24 bytes) keep
-            // ret_ty = IrType::Ptr (the default from_ctype mapping for complex types).
-            // They will be handled via sret below.
-            // i686: _Float128/_Decimal128 (TFmode/TDmode, 16 bytes) is class
-            // MEMORY — GCC returns it through a hidden pointer (first stack
-            // arg, callee-popped with `ret $4`). The IR return becomes Ptr and
-            // the body stores the 16-byte carrier through the sret buffer
-            // (try_sret_return). x86-64 keeps the U128/xmm0:xmm1 return.
-            else if (matches!(full_ret_ctype, CType::Float128)
-                || full_ret_ctype == CType::Decimal128)
-                && crate::common::types::target_is_32bit()
-            {
-                ret_ty = IrType::Ptr;
-            }
-        }
+        // The IR type the result travels as (complex values and the i686
+        // `_Float128` have a form of their own: `call_result_ir_type`).
+        let mut ret_ty = self.call_result_ir_type(&full_ret_ctype);
 
         // Track CTypes used to resolve aggregate and ext-vector call results.
         // Ext vectors can use scalar GP return registers on i686, so their
