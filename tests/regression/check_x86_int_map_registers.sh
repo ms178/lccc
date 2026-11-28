@@ -315,8 +315,8 @@ offset_problem() {
     n=$(printf '%s\n' "$text" | grep -c . || true)
     if [ "$n" != 2 ]; then
         echo "$n instructions where the packed operation and ret are 2"
-    elif ! printf '%s\n' "$text" | head -n 1 |
-        grep -qE "^[[:space:]]+v?p[a-z]+[[:space:]]+$3\(%rdi\), %[xy]mm0, %[xy]mm0\$"; then
+    elif ! grep -qE "^[[:space:]]+v?p[a-z]+[[:space:]]+$3\(%rdi\), %[xy]mm0, %[xy]mm0\$" \
+        <<<"${text%%$'\n'*}"; then
         echo "the operation does not read $3(%rdi)"
     fi
 }
